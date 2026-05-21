@@ -1,0 +1,51 @@
+# Slide template sidecar — one file per extractable slide.
+# Filename: slide_NN.yaml ↔ slide_NN.pptx.
+#
+# Describe what the slide is FOR (its purpose / shape), not its
+# specific text or images. The agent picks templates by intent,
+# then replaces all slot content at compose time.
+
+# --- Required descriptive fields ---
+
+# One sentence describing what this slide is FOR.
+# Under 20 words. Talk about purpose, not content.
+# Bad:  "Slide showing the X-1000 product photo with marketing tagline."
+# Good: "Hero product showcase with single bold claim."
+intent: ""
+
+# Tone of the slide as designed. Pick from the enum:
+#   formal | punchy | data-dense | warm | clinical | celebratory
+feel: ""
+
+# Slide-role tags. 1-4 entries from:
+#   opener | section_divider | content | data | quote | closing |
+#   product | team
+suitable_for: []
+
+# --- Workflow / optional ---
+
+status: pending     # pending | done | locked
+notes: ""           # free-form reviewer notes
+
+# --- Auto-populated structural fields (do not hand-edit) ---
+#
+# `layout` is best-effort inferred from placeholder geometry.
+# If it is wrong, edit it — the consumer agent uses this as
+# a hint when picking templates.
+
+id: ""
+layout: ""          # e.g. "title-left, image-right", "title-top, 4-quadrant"
+
+# Slots the consumer agent can fill. Stable ids inferred from
+# placeholder kind + position. `kind` is one of: text | bullets | image.
+slots:
+  - id: title
+    kind: text
+    max_chars: 60
+  # - id: hero
+  #   kind: image
+  #   aspect: "16:9"
+
+sources:
+  - deck: ""
+    slide: 0

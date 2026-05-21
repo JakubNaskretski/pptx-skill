@@ -1,0 +1,56 @@
+# Asset description sidecar — one file per visual asset.
+# Filename matches the asset binary: <sha1>.yaml ↔ <sha1>.<ext>.
+#
+# The consuming agent has NO vision capability — it picks assets
+# purely by reading these fields. Optimize for retrieval, not
+# captioning. Use neutral, literal language.
+
+# --- Required descriptive fields ---
+
+# One of: photo | icon | logo | illustration | screenshot
+kind: ""
+
+# What is literally visible. One neutral sentence, under 25 words.
+# Bad:  "A team celebrating a successful Q4 launch."
+# Good: "Four people standing around a laptop in an open office."
+subject: ""
+
+# Mood / visual style. Pick from the enum:
+#   formal | warm | clinical | punchy | playful | minimal | dramatic
+# If nothing fits, pick the closest and add a note in `notes`.
+feel: ""
+
+# Where the focal subject sits in the frame. Pick from the enum:
+#   centered | left-weighted | right-weighted | full-bleed |
+#   top-heavy | scattered
+# Helps the agent match the asset to slots with matching geometry.
+composition: ""
+
+# 1-3 dominant colors as plain words.
+# Example: [warm white, navy]
+colors: []
+
+# Slide-content types this asset is appropriate for. 1-4 tags.
+# Use existing tags where possible:
+#   team | hero | product | data | culture | event | abstract |
+#   decorative | closing | quote
+suitable_for: []
+
+# --- Workflow / optional ---
+
+# pending  → not yet described
+# done     → all required fields filled, auto-set by `validate`
+# locked   → frozen against re-ingest changes
+status: pending
+
+# Free-form reviewer notes — anything that doesn't fit the structured
+# fields. Ignored by the consumer agent's filter logic.
+notes: ""
+
+# --- Auto-populated structural fields (do not hand-edit) ---
+
+id: ""             # filled on ingest
+sha1: ""           # binary hash
+sources:           # which deck/slide(s) this asset came from
+  - deck: ""
+    slide: 0

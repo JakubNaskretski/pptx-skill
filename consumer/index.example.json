@@ -1,0 +1,46 @@
+{
+  "templates": [
+    {
+      "id": "deckQ3_03",
+      "intent": "Hero opener with single bold claim alongside a product image",
+      "feel": "punchy",
+      "suitable_for": ["opener", "product"],
+      "layout": "title-left, image-right",
+      "slots": [
+        { "id": "title", "kind": "text", "max_chars": 60 },
+        { "id": "hero", "kind": "image", "aspect": "16:9" }
+      ]
+    },
+    {
+      "id": "deckQ3_07",
+      "intent": "Three-column bulleted breakdown of risks or themes",
+      "feel": "data-dense",
+      "suitable_for": ["content"],
+      "layout": "title-top, three-column",
+      "slots": [
+        { "id": "title", "kind": "text", "max_chars": 60 },
+        { "id": "body", "kind": "bullets", "max_items": 3 }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "asset_b91f22",
+      "kind": "photo",
+      "subject": "Four people collaborating at a whiteboard in a sunlit office",
+      "feel": "warm",
+      "composition": "centered",
+      "colors": ["warm white", "navy", "soft yellow"],
+      "suitable_for": ["team", "culture"]
+    },
+    {
+      "id": "asset_a3f10c",
+      "kind": "illustration",
+      "subject": "Flat-style rocket lifting off, geometric shapes",
+      "feel": "playful",
+      "composition": "centered",
+      "colors": ["coral", "navy", "cream"],
+      "suitable_for": ["hero", "abstract"]
+    }
+  ]
+}

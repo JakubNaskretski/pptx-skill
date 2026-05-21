@@ -1,0 +1,24 @@
+# Authoring working state — transient, regenerated from source decks
+authoring/workspace/*
+!authoring/workspace/.gitkeep
+
+# Built consumer artifacts
+authoring/dist/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
