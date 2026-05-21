@@ -16,6 +16,35 @@ See [`PLAN.md`](PLAN.md) for the full design.
 
 ## Status
 
-Phase 0 — scaffolding only. Schemas, prompts, and the design plan are
-checked in. No working CLI code yet. Implementation is sequenced in
-PLAN.md → "Build sequencing".
+End-to-end v1 implemented: `ingest`, `status`, `next`, `prompt`,
+`validate`, `preview`, `build` on the authoring side; `list`, `get`,
+`compose` on the consumer side.
+
+## Quickstart
+
+```bash
+# 1. Install authoring deps (one-time).
+pip install -r authoring/requirements.txt
+
+# 2. Strip a deck into the workspace.
+python authoring/cli.py ingest path/to/your_deck.pptx
+
+# 3. Describe slides and assets at your own pace.
+python authoring/cli.py status
+python authoring/cli.py next --open          # opens YAML in $EDITOR
+python authoring/cli.py prompt --kind asset  # paste into a vision LLM
+
+# 4. Validate. Complete sidecars auto-promote pending → done.
+python authoring/cli.py validate
+
+# 5. (Optional) Generate PNG previews if LibreOffice is on $PATH.
+python authoring/cli.py preview
+
+# 6. Build the portable consumer artifact.
+python authoring/cli.py build
+# → authoring/dist/skill.zip
+```
+
+The zip is the deliverable to consuming agents. They use
+`reader.py list`, `get`, and `compose` against it — see
+[`consumer/SKILL.md`](consumer/SKILL.md).
