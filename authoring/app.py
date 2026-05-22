@@ -731,6 +731,22 @@ def _format_brief(brief: str) -> str:
         "- Text slot values: plain string, respect each slot's `max_chars`.\n"
         "- Bullets slot values: array of strings.\n"
         "- If no asset fits a slot, omit the slot rather than forcing one.\n"
+        "\n"
+        "## Bullets — DO NOT prepend bullet glyphs\n"
+        "\n"
+        "PowerPoint templates apply bullets via layout formatting. If you\n"
+        "prepend a literal `•`, `-`, or `*` to lines, the rendered slide\n"
+        "shows two bullets per line (e.g. `•• My point`).\n"
+        "\n"
+        "Correct ways to produce a bulleted list:\n"
+        "\n"
+        "- For a slot of `kind: bullets` — pass an array of plain strings.\n"
+        "  GOOD: `\"body\": [\"First point\", \"Second point\"]`\n"
+        "  BAD:  `\"body\": [\"• First point\", \"• Second point\"]`\n"
+        "- For a `kind: text` slot that visually behaves as bullets in the\n"
+        "  template — pass plain strings joined by `\\n`, NO leading glyph.\n"
+        "  GOOD: `\"subtitle\": \"First point\\nSecond point\"`\n"
+        "  BAD:  `\"subtitle\": \"• First point\\n• Second point\"`\n"
     )
 
 

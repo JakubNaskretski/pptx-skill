@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -110,11 +111,26 @@ def _find_shape_by_name(slide, name: str):
     return None
 
 
+_BULLET_PREFIX_RE = re.compile(r"^\s*[•·◦▪▫●◆■□*\-–—]\s+")
+
+
+def _strip_bullet_prefix(text: str) -> str:
+    """Strip leading bullet glyphs from each line.
+
+    Templates render bullets via layout formatting; if the caller also
+    prepended a glyph, the slide ends up with two bullets per line.
+    """
+    if not text:
+        return text
+    return "\n".join(_BULLET_PREFIX_RE.sub("", ln) for ln in text.split("\n"))
+
+
 def _fill_text_shape(shape, value: str) -> None:
     """Replace the shape's text frame content with `value`, keeping its first
     paragraph's font/style as the template."""
     if not shape.has_text_frame:
         return
+    value = _strip_bullet_prefix(str(value))
     tf = shape.text_frame
     # Capture the first run's formatting cues if available.
     first_para = tf.paragraphs[0] if tf.paragraphs else None
@@ -159,7 +175,7 @@ def _fill_bullets_shape(shape, values: list[str]) -> None:
         return
     first = True
     for value in values:
-        lines = str(value).split("\n")
+        lines = _strip_bullet_prefix(str(value)).split("\n")
         if first:
             p = tf.paragraphs[0]
             first = False
