@@ -857,5 +857,122 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
     )
 
 
+# --- package-app ----------------------------------------------------------
+#
+# Produces a zip containing ONLY the application code + scaffolding —
+# nothing organisation-specific. Use it to hand the tool to a teammate
+# without leaking KB content, built artifacts, source decks, or
+# org-tuned brand rules. Allowlist-based: anything not explicitly named
+# below is excluded.
+
+# Files included verbatim (path is relative to repo root). Globs allowed.
+PACKAGE_APP_ALLOWLIST = (
+    "README.md",
+    "PLAN.md",
+    ".gitignore",
+    "authoring/cli.py",
+    "authoring/app.py",
+    "authoring/requirements.txt",
+    "authoring/prompts/*.md",
+    "authoring/schemas/*.yaml",
+    "authoring/schemas/*.yml",
+    "consumer/SKILL.md",
+    "consumer/reader.py",
+    "consumer/requirements.txt",
+    "consumer/index.example.json",
+)
+
+
+@cli.command(name="package-app")
+@click.option("--out", "out_path", type=click.Path(path_type=Path), default=None,
+              help="Output zip path. Default: authoring/dist/pptx-skill-app.zip")
+def package_app(out_path: Path | None) -> None:
+    """Build a transferable zip of the app code only.
+
+    Never includes workspace/, dist/, source .pptx files, brand.md, or
+    other session/local-only files. Ships `brand.example.md` so the
+    recipient knows where to put their own brand rules.
+    """
+    REPO_ROOT = HERE.parent
+    out_path = out_path or (DIST / "pptx-skill-app.zip")
+    DIST.mkdir(parents=True, exist_ok=True)
+
+    seen: set[str] = set()
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pattern in PACKAGE_APP_ALLOWLIST:
+            matches = sorted(REPO_ROOT.glob(pattern))
+            if not matches:
+                continue
+            for src in matches:
+                if not src.is_file():
+                    continue
+                arc = src.relative_to(REPO_ROOT).as_posix()
+                if arc in seen:
+                    continue
+                seen.add(arc)
+                zf.write(src, arc)
+
+        # Brand stub goes in as brand.example.md so the recipient can copy
+        # it to brand.md and fill in. Always written from a clean template,
+        # never from the local (possibly org-customised) brand.md.
+        zf.writestr(
+            "authoring/brand.example.md",
+            _BRAND_STUB,
+        )
+
+        # Empty workspace dir + a README pointer for first-time users.
+        zf.writestr("authoring/workspace/.gitkeep", "")
+        zf.writestr("FIRST_RUN.md", _FIRST_RUN_NOTES)
+
+    size_kb = out_path.stat().st_size // 1024
+    click.echo(f"packaged {out_path} — {len(seen) + 3} file(s), {size_kb} KB")
+
+
+_BRAND_STUB = """# Brand & visual rules
+
+Copy this file to `authoring/brand.md` and fill in. The compose page
+auto-includes brand.md in every prompt bundle so the LLM sees these
+rules before reading the brief.
+
+Keep it short and prescriptive. Long preambles get ignored.
+
+## Palette
+
+- Primary: <e.g. #0A2540 navy>
+- Accent:  <e.g. #F26B38 orange>
+- Avoid:   <colors that look off-brand>
+
+## Voice
+
+- <e.g. "factual, no hype, third person">
+
+## Don'ts
+
+- <e.g. "no exclamation marks in headlines">
+- <e.g. "never use stock people-in-suits imagery">
+"""
+
+
+_FIRST_RUN_NOTES = """# First run
+
+This zip contains the pptx-skill app code only. No KB content, no
+built artifacts. Steps to get going on a fresh machine:
+
+1. Unzip somewhere on disk.
+2. `pip install -r authoring/requirements.txt`
+3. `cp authoring/brand.example.md authoring/brand.md` and edit to your
+   org's palette / voice / taboos.
+4. Drop a source deck somewhere and `python3 authoring/cli.py ingest path/to/deck.pptx`.
+5. Describe slides/assets via `python3 authoring/app.py` (compose page
+   served on http://127.0.0.1:5050) or hand-edit YAML in
+   `authoring/workspace/`.
+6. `python3 authoring/cli.py validate` and then `... build` to produce
+   the durable consumer skill.zip, or use the compose page to generate
+   per-deck agent prompt bundles.
+
+See README.md and PLAN.md for the design.
+"""
+
+
 if __name__ == "__main__":
     cli()

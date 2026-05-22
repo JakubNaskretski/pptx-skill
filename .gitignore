@@ -25,3 +25,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Local-only handover / session notes
+HANDOVER.md
