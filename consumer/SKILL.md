@@ -58,6 +58,20 @@ Slot keys must match the template's declared `slots` (call
 `get <template_id>` to inspect them). Image-slot values are asset ids;
 the reader resolves the binary path internally.
 
+### Bullets — do not prepend bullet glyphs
+
+PowerPoint templates apply bullets via layout formatting. Do **not**
+prepend `•`, `-`, or `*` to lines — you'll get double bullets in the
+rendered slide.
+
+- `kind: bullets` slot — array of plain strings. The template adds the
+  bullet character.
+- `kind: text` slot that displays as a list — multi-line string joined
+  by `\n`, no leading glyph.
+
+`compose` defensively strips leading bullet glyphs from each line, but
+correct input keeps your plan readable and avoids surprises.
+
 ## Filterable metadata
 
 Both templates and assets expose:
