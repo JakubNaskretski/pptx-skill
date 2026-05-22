@@ -30,6 +30,31 @@ composition: ""
 # Example: [warm white, navy]
 colors: []
 
+# The concept this asset is ABOUT — what THING it represents, not how it
+# looks. Most important field for retrieval beyond visual matching.
+# Examples:
+#   "ACME Bank brand mark"
+#   "sales-offer preparation workflow"
+#   "team collaboration"
+# Leave empty only if the asset is purely decorative (gradient, divider).
+depicts: ""
+
+# Where this asset is reusable. List of namespaced tokens telling the
+# downstream agent WHEN this asset is appropriate.
+#
+# Recognized prefixes (extend as the library grows):
+#   generic              — bare token; usable in any deck
+#   client:<slug>        — tied to a specific client/account
+#   industry:<slug>      — tied to a sector
+#   product:<slug>       — tied to a specific product/offering
+#   program:<slug>       — tied to an internal program/initiative
+#   topic:<slug>         — tied to a topic
+#
+# An asset can have multiple scopes — e.g. an event photo from an ACME
+# finance summit: [client:acme-bank, industry:finance].
+# Required: at least one entry. If unsure, use [generic].
+scope: []
+
 # Slide-content types this asset is appropriate for. 1-4 tags.
 # Use existing tags where possible:
 #   team | hero | product | data | culture | event | abstract |

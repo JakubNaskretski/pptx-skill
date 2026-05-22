@@ -2,6 +2,9 @@
 authoring/workspace/*
 !authoring/workspace/.gitkeep
 
+# Source decks (often sensitive client material) — never tracked
+*.pptx
+
 # Built consumer artifacts
 authoring/dist/
 *.zip
