@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json as json_mod
+import os
 import shutil
 import subprocess
 import sys
@@ -603,6 +604,41 @@ FILTER_DIMENSIONS = {
     "assets": ("kind", "feel", "composition", "suitable_for", "scope", "colors"),
 }
 
+BRAND_PATH = HERE / "brand.md"
+PRESETS_DIR = WORKSPACE / "_presets"
+_PRESET_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_\- ]{0,60}$")
+
+
+def _read_brand() -> str:
+    if BRAND_PATH.exists():
+        return BRAND_PATH.read_text(encoding="utf-8")
+    return ""
+
+
+def _write_brand(text: str) -> None:
+    BRAND_PATH.write_text(text, encoding="utf-8")
+
+
+def _preset_path(name: str) -> Path:
+    if not _PRESET_NAME_RE.match(name):
+        abort(400, "invalid preset name")
+    return PRESETS_DIR / f"{name}.md"
+
+
+def _list_presets() -> list[dict]:
+    if not PRESETS_DIR.exists():
+        return []
+    out: list[dict] = []
+    for p in sorted(PRESETS_DIR.glob("*.md")):
+        out.append({
+            "name": p.stem,
+            "preview": p.read_text(encoding="utf-8").strip().splitlines()[0:1] or [""],
+        })
+    # Flatten preview lists to a single-line string.
+    for item in out:
+        item["preview"] = item["preview"][0] if item["preview"] else ""
+    return out
+
 
 def _collect_descriptions() -> tuple[list[dict], list[dict]]:
     slides: list[dict] = []
@@ -705,6 +741,9 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("SKILL.md", _read_skill_md())
+        brand = _read_brand().strip()
+        if brand:
+            zf.writestr("brand.md", brand + "\n")
         zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
         zf.writestr("brief.md", _format_brief(brief))
     return buf.getvalue()
@@ -714,15 +753,14 @@ def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str
     clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
     clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
     index = cli_mod.build_index(clean_slides, clean_assets)
-    return (
-        "=== brief.md ===\n"
-        + _format_brief(brief)
-        + "\n\n=== SKILL.md ===\n"
-        + _read_skill_md()
-        + "\n\n=== index.json ===\n"
-        + json_mod.dumps(index, indent=2, ensure_ascii=False)
-        + "\n"
-    )
+    sections: list[str] = []
+    brand = _read_brand().strip()
+    if brand:
+        sections.append("=== brand.md ===\n" + brand)
+    sections.append("=== SKILL.md ===\n" + _read_skill_md())
+    sections.append("=== index.json ===\n" + json_mod.dumps(index, indent=2, ensure_ascii=False))
+    sections.append("=== brief.md ===\n" + _format_brief(brief))
+    return "\n\n".join(sections) + "\n"
 
 
 def _stage_compose_bundle(staging: Path) -> None:
@@ -807,6 +845,57 @@ def api_compose_text():
     brief = body.get("brief") or ""
     slides, assets = _filter_kb(filters)
     return jsonify({"text": _flat_prompt_text(slides, assets, brief)})
+
+
+@app.get("/api/compose/brand")
+def api_compose_brand_get():
+    return jsonify({"text": _read_brand(), "path": str(BRAND_PATH.relative_to(HERE))})
+
+
+@app.put("/api/compose/brand")
+def api_compose_brand_put():
+    body = request.get_json(force=True) or {}
+    text = body.get("text", "")
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    _write_brand(text)
+    return jsonify({"ok": True, "chars": len(text)})
+
+
+@app.get("/api/compose/presets")
+def api_compose_presets_list():
+    return jsonify({"presets": _list_presets()})
+
+
+@app.get("/api/compose/preset")
+def api_compose_preset_get():
+    name = request.args.get("name", "")
+    p = _preset_path(name)
+    if not p.exists():
+        abort(404, "preset not found")
+    return jsonify({"name": name, "text": p.read_text(encoding="utf-8")})
+
+
+@app.put("/api/compose/preset")
+def api_compose_preset_put():
+    body = request.get_json(force=True) or {}
+    name = body.get("name", "")
+    text = body.get("text", "")
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    p = _preset_path(name)
+    PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return jsonify({"ok": True, "name": name})
+
+
+@app.delete("/api/compose/preset")
+def api_compose_preset_delete():
+    name = request.args.get("name", "")
+    p = _preset_path(name)
+    if p.exists():
+        p.unlink()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/compose/run")
@@ -1663,6 +1752,37 @@ COMPOSE_HTML = r"""<!doctype html>
                        border-radius: 4px; padding: 10px; max-height: 220px;
                        overflow: auto; font-size: 11px; white-space: pre-wrap;
                        margin: 8px 0 0; }
+    details.filter-details { border: 1px solid #e0e0e0; border-radius: 4px;
+                             margin: 0 0 8px; background: #fcfcfc; }
+    details.filter-details > summary { padding: 8px 12px; cursor: pointer;
+                                        font-size: 13px; display: flex;
+                                        align-items: center; gap: 10px;
+                                        user-select: none; list-style: none; }
+    details.filter-details > summary::-webkit-details-marker { display: none; }
+    details.filter-details > summary::before { content: "▸"; font-size: 11px;
+                                                color: #888; transition: transform 0.15s; }
+    details.filter-details[open] > summary::before { transform: rotate(90deg);
+                                                      display: inline-block; }
+    details.filter-details > summary .fname { font-weight: 600; color: #333; }
+    details.filter-details > summary .fcount { color: #888; font-size: 12px;
+                                                margin-left: auto; }
+    details.filter-details > summary .fbtns { display: flex; gap: 4px; }
+    details.filter-details > summary .fbtn { font-size: 11px; color: #0066cc;
+                                              cursor: pointer; padding: 2px 6px;
+                                              border-radius: 3px; }
+    details.filter-details > summary .fbtn:hover { background: #eef4ff; }
+    details.filter-details .body { padding: 4px 12px 12px; }
+    .preset-row { display: flex; gap: 8px; align-items: center;
+                   margin-bottom: 10px; font-size: 13px; }
+    .preset-row select { padding: 6px 8px; border: 1px solid #ccc;
+                          border-radius: 4px; font-size: 13px; flex: 1; }
+    .preset-row .small { background: white; color: #0066cc;
+                          border: 1px solid #0066cc; padding: 6px 10px; }
+    .brand-editor textarea { min-height: 140px; font-family: ui-monospace,
+                              Menlo, monospace; font-size: 12px; }
+    .brand-summary { font-size: 12px; color: #666; }
+    .brand-summary code { background: #f0f0f0; padding: 1px 4px;
+                           border-radius: 3px; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -1673,6 +1793,21 @@ COMPOSE_HTML = r"""<!doctype html>
   </div>
 
   <div class="wrap">
+
+    <details class="step brand-editor" id="brandStep">
+      <summary style="cursor:pointer;list-style:none;">
+        <h2 style="display:inline;">Brand rules <span class="brand-summary" id="brandSummary"></span></h2>
+      </summary>
+      <div class="desc" style="margin-top:8px;">
+        Org-wide constraints (palette, voice, taboos). Auto-included in every
+        prompt bundle. Edits save to <code class="brand-summary">authoring/brand.md</code>.
+      </div>
+      <textarea id="brand" placeholder="# Palette&#10;- Primary: ...&#10;# Voice&#10;- ..."></textarea>
+      <div class="actions">
+        <button id="saveBrand">Save brand.md</button>
+      </div>
+      <div class="msg" id="brandMsg"></div>
+    </details>
 
     <div class="step">
       <h2>1. Filter the KB for this deck</h2>
@@ -1691,6 +1826,13 @@ COMPOSE_HTML = r"""<!doctype html>
       <h2>2. Describe the deck you want</h2>
       <div class="desc">
         Topic, audience, length, tone. Goes into the bundle as <code>brief.md</code>.
+      </div>
+      <div class="preset-row">
+        <span>Preset:</span>
+        <select id="presetSelect"><option value="">— none —</option></select>
+        <button class="small" id="loadPreset">Load</button>
+        <button class="small" id="savePreset">Save as…</button>
+        <button class="small" id="deletePreset">Delete</button>
       </div>
       <textarea id="brief" class="brief-area" placeholder="e.g. 4-slide thesis-defense summary for an academic committee. Formal feel. Include the swimlane diagram on the methodology slide."></textarea>
       <div class="actions">
@@ -1733,50 +1875,81 @@ function fieldLabel(f) {
   })[f] || f;
 }
 
+function buildDimension(parent, scope, field, vals) {
+  const det = document.createElement("details");
+  det.className = "filter-details";
+  det.dataset.scope = scope;
+  det.dataset.field = field;
+  const summary = document.createElement("summary");
+  summary.innerHTML =
+    `<span class="fname">${fieldLabel(field)}</span>` +
+    `<span class="fcount" data-role="count">0 / ${vals.length}</span>` +
+    `<span class="fbtns">` +
+    `  <span class="fbtn" data-act="all">all</span>` +
+    `  <span class="fbtn" data-act="clear">clear</span>` +
+    `</span>`;
+  det.appendChild(summary);
+  const body = document.createElement("div");
+  body.className = "body";
+  const chips = document.createElement("div");
+  chips.className = "chips";
+  vals.forEach((v) => {
+    const c = document.createElement("span");
+    c.className = "chip";
+    c.dataset.value = v;
+    c.textContent = v;
+    c.onclick = (e) => { e.stopPropagation(); toggle(scope, field, v, c, det); };
+    chips.appendChild(c);
+  });
+  body.appendChild(chips);
+  det.appendChild(body);
+  summary.querySelectorAll(".fbtn").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.act;
+      state[scope][field] = [];
+      if (act === "all") {
+        vals.forEach((v) => state[scope][field].push(v));
+      }
+      chips.querySelectorAll(".chip").forEach((c) => {
+        c.classList.toggle("on", state[scope][field].includes(c.dataset.value));
+      });
+      updateDimensionCount(det, scope, field, vals.length);
+      refreshCount();
+    };
+  });
+  updateDimensionCount(det, scope, field, vals.length);
+  parent.appendChild(det);
+}
+
+function updateDimensionCount(det, scope, field, total) {
+  const sel = (state[scope][field] || []).length;
+  det.querySelector('[data-role="count"]').textContent = `${sel} / ${total}`;
+}
+
 function renderFilters() {
   const tplEl = document.getElementById("tplFilters");
   const astEl = document.getElementById("astFilters");
   tplEl.innerHTML = "";
   astEl.innerHTML = "";
-  state.options.templates.options && tplFields.forEach((f) => {
-    const vals = state.options.templates.options[f] || [];
-    if (!vals.length) return;
-    const block = document.createElement("div");
-    block.className = "filter-block";
-    block.innerHTML = `<h3>${fieldLabel(f)}</h3><div class="chips" data-scope="templates" data-field="${f}"></div>`;
-    const chipsEl = block.querySelector(".chips");
-    vals.forEach((v) => {
-      const c = document.createElement("span");
-      c.className = "chip";
-      c.dataset.value = v;
-      c.textContent = v;
-      c.onclick = () => toggle("templates", f, v, c);
-      chipsEl.appendChild(c);
+  if (state.options.templates.options) {
+    tplFields.forEach((f) => {
+      const vals = state.options.templates.options[f] || [];
+      if (vals.length) buildDimension(tplEl, "templates", f, vals);
     });
-    tplEl.appendChild(block);
-  });
-  state.options.assets.options && astFields.forEach((f) => {
-    const vals = state.options.assets.options[f] || [];
-    if (!vals.length) return;
-    const block = document.createElement("div");
-    block.className = "filter-block";
-    block.innerHTML = `<h3>${fieldLabel(f)}</h3><div class="chips" data-scope="assets" data-field="${f}"></div>`;
-    const chipsEl = block.querySelector(".chips");
-    vals.forEach((v) => {
-      const c = document.createElement("span");
-      c.className = "chip";
-      c.dataset.value = v;
-      c.textContent = v;
-      c.onclick = () => toggle("assets", f, v, c);
-      chipsEl.appendChild(c);
+  }
+  if (state.options.assets.options) {
+    astFields.forEach((f) => {
+      const vals = state.options.assets.options[f] || [];
+      if (vals.length) buildDimension(astEl, "assets", f, vals);
     });
-    astEl.appendChild(block);
-  });
+  }
   document.getElementById("kbSummary").textContent =
     `KB: ${state.options.templates.total} templates · ${state.options.assets.total} assets`;
 }
 
-function toggle(scope, field, value, el) {
+function toggle(scope, field, value, el, det) {
   state[scope][field] = state[scope][field] || [];
   const i = state[scope][field].indexOf(value);
   if (i >= 0) {
@@ -1785,6 +1958,10 @@ function toggle(scope, field, value, el) {
   } else {
     state[scope][field].push(value);
     el.classList.add("on");
+  }
+  if (det) {
+    const total = det.querySelectorAll(".chip").length;
+    updateDimensionCount(det, scope, field, total);
   }
   refreshCount();
 }
@@ -1890,11 +2067,104 @@ document.getElementById("runCompose").onclick = async () => {
   showMsg("composeMsg", "downloaded " + a.download, true);
 };
 
+// --- brand ---
+
+async function loadBrand() {
+  const r = await fetch("/api/compose/brand");
+  const j = await r.json();
+  document.getElementById("brand").value = j.text || "";
+  updateBrandSummary(j.text || "");
+}
+
+function updateBrandSummary(text) {
+  const trimmed = (text || "").trim();
+  const el = document.getElementById("brandSummary");
+  if (!trimmed) {
+    el.innerHTML = "· <em>empty — not included in bundles</em>";
+  } else {
+    el.innerHTML = `· <code>${trimmed.length.toLocaleString()} chars</code> active`;
+  }
+}
+
+document.getElementById("brand").addEventListener("input", (e) => {
+  updateBrandSummary(e.target.value);
+});
+
+document.getElementById("saveBrand").onclick = async () => {
+  const text = document.getElementById("brand").value;
+  const r = await fetch("/api/compose/brand", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  const j = await r.json();
+  if (r.ok) {
+    showMsg("brandMsg", `saved (${j.chars} chars)`, true);
+    updateBrandSummary(text);
+  } else {
+    showMsg("brandMsg", j.error || "save failed", false);
+  }
+};
+
+// --- presets ---
+
+async function loadPresets() {
+  const r = await fetch("/api/compose/presets");
+  const j = await r.json();
+  const sel = document.getElementById("presetSelect");
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— none —</option>';
+  j.presets.forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.name;
+    o.textContent = p.name;
+    if (p.name === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+document.getElementById("loadPreset").onclick = async () => {
+  const name = document.getElementById("presetSelect").value;
+  if (!name) return;
+  const r = await fetch("/api/compose/preset?name=" + encodeURIComponent(name));
+  if (!r.ok) return;
+  const j = await r.json();
+  document.getElementById("brief").value = j.text;
+};
+
+document.getElementById("savePreset").onclick = async () => {
+  const text = document.getElementById("brief").value;
+  const name = prompt("Preset name (letters, numbers, _ - space):");
+  if (!name) return;
+  const r = await fetch("/api/compose/preset", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, text }),
+  });
+  if (r.ok) {
+    await loadPresets();
+    document.getElementById("presetSelect").value = name;
+  } else {
+    const j = await r.json().catch(() => ({}));
+    alert(j.error || "save failed");
+  }
+};
+
+document.getElementById("deletePreset").onclick = async () => {
+  const name = document.getElementById("presetSelect").value;
+  if (!name) return;
+  if (!confirm(`delete preset "${name}"?`)) return;
+  await fetch("/api/compose/preset?name=" + encodeURIComponent(name), { method: "DELETE" });
+  await loadPresets();
+};
+
 (async () => {
   const r = await fetch("/api/compose/options");
   state.options = await r.json();
   renderFilters();
   refreshCount();
+  loadBrand();
+  loadPresets();
 })();
 </script>
 </body>
@@ -1908,10 +2178,11 @@ def compose_page():
 
 
 def main():
-    url = "http://127.0.0.1:5000/"
+    port = int(os.environ.get("PPTX_SKILL_PORT", "5050"))
+    url = f"http://127.0.0.1:{port}/"
     Timer(1.2, lambda: webbrowser.open(url)).start()
     print(f"pptx-skill describe app → {url}")
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
