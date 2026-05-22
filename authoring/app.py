@@ -547,6 +547,14 @@ def api_batch_apply(batch_id):
     })
 
 
+@app.get("/api/batch/<batch_id>")
+def api_batch_info(batch_id):
+    mf = BATCHES_DIR / batch_id / "manifest.json"
+    if not mf.exists():
+        abort(404, "batch not found")
+    return jsonify(json_mod.loads(mf.read_text(encoding="utf-8")))
+
+
 @app.get("/api/batches")
 def api_batches_list():
     if not BATCHES_DIR.exists():
@@ -583,6 +591,275 @@ def preview():
     if binary is None:
         abort(404, "asset binary missing")
     return send_file(binary)
+
+
+# ---------------------------------------------------------------------------
+# Compose flow — filter KB, build prompt bundle, run compose from a plan
+# ---------------------------------------------------------------------------
+
+
+FILTER_DIMENSIONS = {
+    "templates": ("feel", "suitable_for"),
+    "assets": ("kind", "feel", "composition", "suitable_for", "scope", "colors"),
+}
+
+
+def _collect_descriptions() -> tuple[list[dict], list[dict]]:
+    slides: list[dict] = []
+    for p in cli_mod.iter_slide_yamls():
+        d = _safe_read(p)
+        if not d:
+            continue
+        d["_yaml_path"] = p
+        slides.append(d)
+    assets: list[dict] = []
+    for p in cli_mod.iter_asset_yamls():
+        d = _safe_read(p)
+        if not d:
+            continue
+        d["_yaml_path"] = p
+        assets.append(d)
+    return slides, assets
+
+
+def _collect_filter_options() -> dict:
+    slides, assets = _collect_descriptions()
+
+    def collect(items: list[dict], fields: tuple[str, ...]) -> dict:
+        out: dict[str, set[str]] = {f: set() for f in fields}
+        for it in items:
+            for f in fields:
+                v = it.get(f)
+                if v is None:
+                    continue
+                if isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, str) and x:
+                            out[f].add(x)
+                elif isinstance(v, str) and v:
+                    out[f].add(v)
+        return {k: sorted(v) for k, v in out.items()}
+
+    return {
+        "templates": {
+            "options": collect(slides, FILTER_DIMENSIONS["templates"]),
+            "total": len(slides),
+        },
+        "assets": {
+            "options": collect(assets, FILTER_DIMENSIONS["assets"]),
+            "total": len(assets),
+        },
+    }
+
+
+def _matches_filters(item: dict, filters: dict) -> bool:
+    for field, allowed in filters.items():
+        if not allowed:
+            continue
+        v = item.get(field)
+        if v is None:
+            return False
+        if isinstance(v, list):
+            if not any(x in allowed for x in v):
+                return False
+        elif v not in allowed:
+            return False
+    return True
+
+
+def _filter_kb(filters: dict) -> tuple[list[dict], list[dict]]:
+    slides, assets = _collect_descriptions()
+    tpl_filters = filters.get("templates") or {}
+    ast_filters = filters.get("assets") or {}
+    slides_out = [s for s in slides if _matches_filters(s, tpl_filters)]
+    assets_out = [a for a in assets if _matches_filters(a, ast_filters)]
+    return slides_out, assets_out
+
+
+def _read_skill_md() -> str:
+    return (cli_mod.CONSUMER / "SKILL.md").read_text(encoding="utf-8")
+
+
+def _format_brief(brief: str) -> str:
+    return (
+        "# Deck brief\n\n"
+        f"{brief.strip() or '(no brief supplied)'}\n\n"
+        "---\n\n"
+        "# Output rules\n\n"
+        "- Read SKILL.md for the three-command surface and plan format.\n"
+        "- Pick templates and assets ONLY from the attached `index.json`.\n"
+        "- Return ONLY a JSON array. No prose, no markdown fences.\n"
+        "- Each entry: {\"template\": \"<id>\", \"slots\": { ... }}.\n"
+        "- Slot keys must match the template's declared slot ids.\n"
+        "- Image slot values: an asset id from index.json (not a file path).\n"
+        "- Text slot values: plain string, respect each slot's `max_chars`.\n"
+        "- Bullets slot values: array of strings.\n"
+        "- If no asset fits a slot, omit the slot rather than forcing one.\n"
+    )
+
+
+def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str) -> bytes:
+    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
+    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
+    index = cli_mod.build_index(clean_slides, clean_assets)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("SKILL.md", _read_skill_md())
+        zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
+        zf.writestr("brief.md", _format_brief(brief))
+    return buf.getvalue()
+
+
+def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str:
+    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
+    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
+    index = cli_mod.build_index(clean_slides, clean_assets)
+    return (
+        "=== brief.md ===\n"
+        + _format_brief(brief)
+        + "\n\n=== SKILL.md ===\n"
+        + _read_skill_md()
+        + "\n\n=== index.json ===\n"
+        + json_mod.dumps(index, indent=2, ensure_ascii=False)
+        + "\n"
+    )
+
+
+def _stage_compose_bundle(staging: Path) -> None:
+    """Stage a minimal reader.py-compatible bundle (full KB) under `staging`."""
+    slides, assets = _collect_descriptions()
+    (staging / "reader.py").write_text(
+        (cli_mod.CONSUMER / "reader.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    tpl_dir = staging / "templates"
+    for sd in slides:
+        tid = sd["id"]
+        yaml_path: Path = sd["_yaml_path"]
+        slide_pptx = yaml_path.with_suffix(".pptx")
+        if not slide_pptx.exists():
+            continue
+        d = tpl_dir / tid
+        d.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(slide_pptx, d / "slide.pptx")
+        clean = {k: v for k, v in sd.items() if not k.startswith("_")}
+        (d / "meta.yaml").write_text(
+            yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+    ast_dir = staging / "assets"
+    ast_dir.mkdir(parents=True, exist_ok=True)
+    for ad in assets:
+        aid = ad["id"]
+        yaml_path: Path = ad["_yaml_path"]
+        binary = _asset_binary(yaml_path)
+        if binary is None:
+            continue
+        ext = binary.suffix.lstrip(".") or "bin"
+        shutil.copyfile(binary, ast_dir / f"{aid}.{ext}")
+        clean = {k: v for k, v in ad.items() if not k.startswith("_")}
+        (ast_dir / f"{aid}.yaml").write_text(
+            yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
+
+@app.get("/api/compose/options")
+def api_compose_options():
+    return jsonify(_collect_filter_options())
+
+
+@app.post("/api/compose/preview")
+def api_compose_preview():
+    body = request.get_json(force=True) or {}
+    filters = body.get("filters") or {}
+    slides, assets = _filter_kb(filters)
+    return jsonify({
+        "templates": len(slides),
+        "assets": len(assets),
+        "template_ids": [s["id"] for s in slides],
+        "asset_ids": [a["id"] for a in assets],
+    })
+
+
+@app.post("/api/compose/bundle")
+def api_compose_bundle():
+    body = request.get_json(force=True) or {}
+    filters = body.get("filters") or {}
+    brief = body.get("brief") or ""
+    slides, assets = _filter_kb(filters)
+    if not slides and not assets:
+        return jsonify({"error": "filters match nothing — broaden them"}), 400
+    blob = _build_prompt_bundle_zip(slides, assets, brief)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return send_file(
+        io.BytesIO(blob),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"prompt-bundle-{ts}.zip",
+    )
+
+
+@app.post("/api/compose/text")
+def api_compose_text():
+    body = request.get_json(force=True) or {}
+    filters = body.get("filters") or {}
+    brief = body.get("brief") or ""
+    slides, assets = _filter_kb(filters)
+    return jsonify({"text": _flat_prompt_text(slides, assets, brief)})
+
+
+@app.post("/api/compose/run")
+def api_compose_run():
+    body = request.get_json(force=True) or {}
+    plan = body.get("plan")
+    if not isinstance(plan, list) or not plan:
+        return jsonify({"error": "plan must be a non-empty JSON array"}), 400
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="pptx-compose-") as tmpdir:
+        staging = Path(tmpdir) / "bundle"
+        staging.mkdir(parents=True, exist_ok=True)
+        _stage_compose_bundle(staging)
+        plan_path = staging / "plan.json"
+        plan_path.write_text(json_mod.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        out_path = staging / "out.pptx"
+        try:
+            result = subprocess.run(
+                [sys.executable, "reader.py", "compose", "plan.json", "out.pptx"],
+                cwd=str(staging),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "compose timed out"}), 500
+        if result.returncode != 0 or not out_path.exists():
+            return jsonify({
+                "error": "compose failed",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }), 500
+        try:
+            summary = json_mod.loads(result.stdout)
+        except Exception:
+            summary = {"stdout": result.stdout}
+        # Persist out.pptx outside the temp dir so we can stream it after
+        # cleanup of the staging dir.
+        persisted = WORKSPACE / "_compose_out"
+        persisted.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_persisted = persisted / f"deck-{ts}.pptx"
+        shutil.copyfile(out_path, out_persisted)
+
+    return send_file(
+        out_persisted,
+        mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        as_attachment=True,
+        download_name=out_persisted.name,
+        max_age=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +963,21 @@ INDEX_HTML = r"""<!doctype html>
     .placeholder { color: #888; padding: 40px 16px; text-align: center;
                    font-size: 13px; }
 
+    .batch-thumbs { padding: 20px; display: grid; align-content: start;
+                     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+                     gap: 12px; overflow-y: auto; max-height: 100%; width: 100%; }
+    .batch-thumbs .bt { background: white; border-radius: 4px; padding: 6px;
+                         box-shadow: 0 1px 4px rgba(0,0,0,0.25); text-align: center;
+                         min-width: 0; }
+    .batch-thumbs .bt img { width: 100%; height: 100px; object-fit: contain;
+                             background: #f8f8f8; border-radius: 2px; display: block; }
+    .batch-thumbs .bt .lbl { font-size: 11px; color: #555; margin-top: 4px;
+                              font-family: ui-monospace, Menlo, monospace;
+                              white-space: nowrap; overflow: hidden;
+                              text-overflow: ellipsis; }
+    .batch-thumbs-empty { color: #666; padding: 40px 20px; text-align: center;
+                           font-size: 13px; }
+
     .view-toggle { padding: 8px 14px; border-bottom: 1px solid #ddd;
                    display: flex; gap: 6px; }
     .view-toggle button { flex: 1; padding: 6px 8px; border: 1px solid #ccc;
@@ -728,6 +1020,8 @@ INDEX_HTML = r"""<!doctype html>
     <header>
       <strong>pptx-skill</strong>
       <span id="counts" style="color:#888;font-size:11px;margin-left:6px;"></span>
+      <a href="/compose" style="float:right;font-size:11px;color:#0066cc;
+         text-decoration:none;">Compose →</a>
     </header>
     <div class="view-toggle">
       <button data-view="items" class="active">Single</button>
@@ -1077,10 +1371,49 @@ function applyView() {
   document.getElementById("kindTabs").style.display = inItems ? "" : "none";
   document.getElementById("filterRow").style.display = inItems ? "" : "none";
   document.getElementById("list").style.display = inItems ? "" : "none";
-  document.getElementById("preview").hidden = !inItems;
   document.getElementById("panel").hidden = !inItems;
   document.getElementById("batchView").hidden = inItems;
-  if (!inItems) loadBatches();
+  if (inItems) {
+    const pane = document.getElementById("preview");
+    if (current) {
+      pane.innerHTML =
+        `<img src="/preview?yaml=${encodeURIComponent(current.yaml)}&t=${Date.now()}" alt="preview">`;
+    } else {
+      pane.innerHTML = '<span class="empty">Pick an item from the sidebar</span>';
+    }
+  } else {
+    loadBatches().then(() => renderBatchThumbnails(currentBatchId));
+  }
+}
+
+async function renderBatchThumbnails(batchId) {
+  const pane = document.getElementById("preview");
+  if (!batchId) {
+    pane.innerHTML =
+      '<div class="batch-thumbs-empty">Generate or select a batch to see its items.</div>';
+    return;
+  }
+  pane.innerHTML = '<div class="batch-thumbs-empty">loading…</div>';
+  try {
+    const r = await fetch("/api/batch/" + encodeURIComponent(batchId));
+    if (!r.ok) throw new Error("batch fetch failed");
+    const m = await r.json();
+    const items = m.items || {};
+    if (!Object.keys(items).length) {
+      pane.innerHTML = '<div class="batch-thumbs-empty">Batch is empty.</div>';
+      return;
+    }
+    const cards = Object.entries(items).map(([k, v]) =>
+      `<div class="bt" title="${escapeHtml(v)}">
+        <img src="/preview?yaml=${encodeURIComponent(v)}" alt="${escapeHtml(k)}" loading="lazy">
+        <div class="lbl">${escapeHtml(k)} · ${escapeHtml(v.split("/").pop().replace(/\.yaml$/, ""))}</div>
+       </div>`
+    ).join("");
+    pane.innerHTML = `<div class="batch-thumbs">${cards}</div>`;
+  } catch (e) {
+    pane.innerHTML =
+      '<div class="batch-thumbs-empty">Could not load batch (' + escapeHtml(e.message) + ').</div>';
+  }
 }
 function setView(next) {
   view = next;
@@ -1188,6 +1521,7 @@ async function batchGenerate() {
 
   await loadBatches(currentBatchId);
   refreshPendingHint();
+  renderBatchThumbnails(currentBatchId);
   window.location.href = j.download_url;
 }
 
@@ -1247,8 +1581,12 @@ document.getElementById("batchSelect").addEventListener("change", e => {
   if (currentBatchId) localStorage.setItem("describe.batchId", currentBatchId);
   else localStorage.removeItem("describe.batchId");
   refreshBatchLabel();
+  if (view === "batch") renderBatchThumbnails(currentBatchId);
 });
-document.getElementById("batchRefreshBtn").addEventListener("click", () => loadBatches());
+document.getElementById("batchRefreshBtn").addEventListener("click", async () => {
+  await loadBatches();
+  if (view === "batch") renderBatchThumbnails(currentBatchId);
+});
 document.getElementById("hideDone").addEventListener("change", renderList);
 document.getElementById("saveBtn").addEventListener("click", () => save(true));
 document.getElementById("saveOnly").addEventListener("click", () => save(false));
@@ -1269,6 +1607,304 @@ loadItems();
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
+
+
+COMPOSE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pptx-skill — compose</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           margin: 0; background: #f7f7f7; color: #222; }
+    .top { background: white; border-bottom: 1px solid #ddd; padding: 12px 24px;
+           display: flex; align-items: center; gap: 16px; }
+    .top strong { font-size: 16px; }
+    .top a { color: #0066cc; text-decoration: none; font-size: 13px; }
+    .wrap { max-width: 880px; margin: 24px auto; padding: 0 24px; }
+    .step { background: white; border: 1px solid #e0e0e0; border-radius: 6px;
+            padding: 20px 24px; margin-bottom: 16px; }
+    .step h2 { margin: 0 0 4px; font-size: 16px; }
+    .step .desc { color: #666; font-size: 13px; margin-bottom: 14px; }
+    .filter-block { margin-bottom: 14px; }
+    .filter-block h3 { font-size: 12px; text-transform: uppercase;
+                       letter-spacing: 0.5px; color: #555; margin: 0 0 6px;
+                       font-weight: 600; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { background: #f0f0f0; border: 1px solid #ddd; border-radius: 999px;
+            padding: 4px 10px; font-size: 12px; cursor: pointer;
+            user-select: none; }
+    .chip.on { background: #0066cc; color: white; border-color: #0066cc; }
+    .chip:hover { border-color: #0066cc; }
+    .count-row { background: #eef4ff; border: 1px solid #c8dcf5; border-radius: 4px;
+                  padding: 8px 12px; font-size: 13px; color: #234;
+                  margin: 10px 0 0; }
+    textarea { width: 100%; padding: 10px; border: 1px solid #ccc;
+               border-radius: 4px; font-size: 13px; resize: vertical;
+               font-family: ui-monospace, Menlo, monospace; }
+    .brief-area { min-height: 90px; font-family: inherit; }
+    .plan-area { min-height: 200px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    button { padding: 8px 14px; border: 1px solid #0066cc; background: #0066cc;
+             color: white; border-radius: 4px; cursor: pointer; font-size: 13px;
+             font-weight: 500; }
+    button.ghost { background: white; color: #0066cc; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .msg { font-size: 12px; padding: 8px 10px; border-radius: 4px;
+           margin-top: 10px; display: none; }
+    .msg.ok { background: #e8f5e9; color: #1b5e20; border: 1px solid #c8e6c9;
+              display: block; }
+    .msg.err { background: #ffe9e9; color: #a00; border: 1px solid #f5b8b8;
+               display: block; }
+    .group-label { font-size: 13px; font-weight: 600; color: #333;
+                   margin: 12px 0 6px; }
+    pre.preview-text { background: #f8f8f8; border: 1px solid #ddd;
+                       border-radius: 4px; padding: 10px; max-height: 220px;
+                       overflow: auto; font-size: 11px; white-space: pre-wrap;
+                       margin: 8px 0 0; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <strong>pptx-skill</strong>
+    <a href="/">← describe</a>
+    <span style="color:#999;font-size:12px;margin-left:auto;" id="kbSummary"></span>
+  </div>
+
+  <div class="wrap">
+
+    <div class="step">
+      <h2>1. Filter the KB for this deck</h2>
+      <div class="desc">
+        Pick tags to narrow what the agent sees. Empty = no filter on that field.
+        Within a field, multiple selections mean OR.
+      </div>
+      <div class="group-label">Templates</div>
+      <div id="tplFilters"></div>
+      <div class="group-label">Assets</div>
+      <div id="astFilters"></div>
+      <div class="count-row" id="countRow">matching: …</div>
+    </div>
+
+    <div class="step">
+      <h2>2. Describe the deck you want</h2>
+      <div class="desc">
+        Topic, audience, length, tone. Goes into the bundle as <code>brief.md</code>.
+      </div>
+      <textarea id="brief" class="brief-area" placeholder="e.g. 4-slide thesis-defense summary for an academic committee. Formal feel. Include the swimlane diagram on the methodology slide."></textarea>
+      <div class="actions">
+        <button id="dlBundle">Download bundle (.zip)</button>
+        <button id="copyText" class="ghost">Copy as text</button>
+        <button id="showText" class="ghost">Preview text</button>
+      </div>
+      <div class="msg" id="bundleMsg"></div>
+      <pre class="preview-text" id="previewText" hidden></pre>
+    </div>
+
+    <div class="step">
+      <h2>3. Paste the agent's plan and compose</h2>
+      <div class="desc">
+        Paste the JSON array the LLM returns. We run <code>reader.py compose</code>
+        and hand you the .pptx.
+      </div>
+      <textarea id="plan" class="plan-area" placeholder='[{"template":"…","slots":{"title":"…"}}]'></textarea>
+      <div class="actions">
+        <button id="runCompose">Compose deck (.pptx)</button>
+      </div>
+      <div class="msg" id="composeMsg"></div>
+    </div>
+
+  </div>
+
+<script>
+const tplFields = ["feel", "suitable_for"];
+const astFields = ["kind", "feel", "composition", "suitable_for", "scope", "colors"];
+const state = { templates: {}, assets: {} };
+
+function fieldLabel(f) {
+  return ({
+    feel: "feel",
+    suitable_for: "suitable for",
+    kind: "kind",
+    composition: "composition",
+    scope: "scope",
+    colors: "colors",
+  })[f] || f;
+}
+
+function renderFilters() {
+  const tplEl = document.getElementById("tplFilters");
+  const astEl = document.getElementById("astFilters");
+  tplEl.innerHTML = "";
+  astEl.innerHTML = "";
+  state.options.templates.options && tplFields.forEach((f) => {
+    const vals = state.options.templates.options[f] || [];
+    if (!vals.length) return;
+    const block = document.createElement("div");
+    block.className = "filter-block";
+    block.innerHTML = `<h3>${fieldLabel(f)}</h3><div class="chips" data-scope="templates" data-field="${f}"></div>`;
+    const chipsEl = block.querySelector(".chips");
+    vals.forEach((v) => {
+      const c = document.createElement("span");
+      c.className = "chip";
+      c.dataset.value = v;
+      c.textContent = v;
+      c.onclick = () => toggle("templates", f, v, c);
+      chipsEl.appendChild(c);
+    });
+    tplEl.appendChild(block);
+  });
+  state.options.assets.options && astFields.forEach((f) => {
+    const vals = state.options.assets.options[f] || [];
+    if (!vals.length) return;
+    const block = document.createElement("div");
+    block.className = "filter-block";
+    block.innerHTML = `<h3>${fieldLabel(f)}</h3><div class="chips" data-scope="assets" data-field="${f}"></div>`;
+    const chipsEl = block.querySelector(".chips");
+    vals.forEach((v) => {
+      const c = document.createElement("span");
+      c.className = "chip";
+      c.dataset.value = v;
+      c.textContent = v;
+      c.onclick = () => toggle("assets", f, v, c);
+      chipsEl.appendChild(c);
+    });
+    astEl.appendChild(block);
+  });
+  document.getElementById("kbSummary").textContent =
+    `KB: ${state.options.templates.total} templates · ${state.options.assets.total} assets`;
+}
+
+function toggle(scope, field, value, el) {
+  state[scope][field] = state[scope][field] || [];
+  const i = state[scope][field].indexOf(value);
+  if (i >= 0) {
+    state[scope][field].splice(i, 1);
+    el.classList.remove("on");
+  } else {
+    state[scope][field].push(value);
+    el.classList.add("on");
+  }
+  refreshCount();
+}
+
+async function refreshCount() {
+  const r = await fetch("/api/compose/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filters: { templates: state.templates, assets: state.assets } }),
+  });
+  const j = await r.json();
+  document.getElementById("countRow").textContent =
+    `matching: ${j.templates} template(s), ${j.assets} asset(s)`;
+}
+
+function currentFilters() {
+  return { templates: state.templates, assets: state.assets };
+}
+
+function showMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.className = "msg " + (ok ? "ok" : "err");
+  el.textContent = text;
+}
+
+document.getElementById("dlBundle").onclick = async () => {
+  showMsg("bundleMsg", "building…", true);
+  const r = await fetch("/api/compose/bundle", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filters: currentFilters(), brief: document.getElementById("brief").value }),
+  });
+  if (!r.ok) { showMsg("bundleMsg", (await r.json()).error || "bundle failed", false); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const cd = r.headers.get("Content-Disposition") || "";
+  const m = cd.match(/filename="?([^";]+)"?/);
+  a.download = m ? m[1] : "prompt-bundle.zip";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showMsg("bundleMsg", "downloaded " + a.download, true);
+};
+
+async function fetchFlat() {
+  const r = await fetch("/api/compose/text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filters: currentFilters(), brief: document.getElementById("brief").value }),
+  });
+  return (await r.json()).text || "";
+}
+
+document.getElementById("copyText").onclick = async () => {
+  showMsg("bundleMsg", "preparing…", true);
+  const text = await fetchFlat();
+  try {
+    await navigator.clipboard.writeText(text);
+    showMsg("bundleMsg", `copied ${text.length.toLocaleString()} chars to clipboard`, true);
+  } catch (e) {
+    showMsg("bundleMsg", "clipboard blocked — use Preview text and copy manually", false);
+  }
+};
+
+document.getElementById("showText").onclick = async () => {
+  const el = document.getElementById("previewText");
+  if (!el.hidden) { el.hidden = true; return; }
+  el.textContent = await fetchFlat();
+  el.hidden = false;
+};
+
+document.getElementById("runCompose").onclick = async () => {
+  const raw = document.getElementById("plan").value.trim();
+  if (!raw) { showMsg("composeMsg", "paste a plan first", false); return; }
+  let plan;
+  try { plan = JSON.parse(raw); }
+  catch (e) { showMsg("composeMsg", "invalid JSON: " + e.message, false); return; }
+  showMsg("composeMsg", "composing…", true);
+  const r = await fetch("/api/compose/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    showMsg("composeMsg", (j.error || "compose failed") + (j.stderr ? " — " + j.stderr.slice(0, 300) : ""), false);
+    return;
+  }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const cd = r.headers.get("Content-Disposition") || "";
+  const m = cd.match(/filename="?([^";]+)"?/);
+  a.download = m ? m[1] : "deck.pptx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showMsg("composeMsg", "downloaded " + a.download, true);
+};
+
+(async () => {
+  const r = await fetch("/api/compose/options");
+  state.options = await r.json();
+  renderFilters();
+  refreshCount();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/compose")
+def compose_page():
+    return render_template_string(COMPOSE_HTML)
 
 
 def main():
