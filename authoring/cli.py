@@ -1009,6 +1009,32 @@ def _atom_too_small(shape, slide_w: int, slide_h: int, min_frac: float = 0.005) 
     return (w * h) / slide_area < min_frac
 
 
+# v4.1: Designers commonly wrap multiple callouts/pictures in a Group
+# shape (PowerPoint's "Group" menu item) so they can be moved as a unit.
+# A flat iteration over slide.shapes encounters the GROUP but never
+# descends — the children silently disappear from the atom catalog and
+# the picture catalog. We descend up to MAX_GROUP_DEPTH levels; past 4
+# levels is almost always abused groups (someone using groups as a
+# layer system) and the atom semantics aren't interesting.
+_MAX_GROUP_DEPTH = 4
+
+
+def _iter_shapes_recursive(container, _depth: int = 0):
+    """Yield leaf shapes from a slide or group, descending into nested groups.
+
+    The container's own GroupShape elements are NOT yielded — groups
+    are containers, not atoms in their own right. Stops descending
+    past ``_MAX_GROUP_DEPTH`` to bound pathologically nested decks.
+    """
+    for shape in container.shapes:
+        if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+            if _depth + 1 >= _MAX_GROUP_DEPTH:
+                continue
+            yield from _iter_shapes_recursive(shape, _depth + 1)
+        else:
+            yield shape
+
+
 def _extract_table_atom(shape, deck_stem: str, slide_number: int, assets_dir: Path) -> str | None:
     table = shape.table
     xml = _serialize_shape_xml(shape)
@@ -1158,15 +1184,16 @@ def extract_structured_atoms(
     Captures tables, charts, smartart, auto-shapes (callouts), freeforms.
     Skips pictures (extract_picture_assets handles them), textual
     placeholders (those are template slots, not addressable atoms),
-    any shape already promoted to a slot (`slot_shape_ids`), groups
-    (recursion deferred), and atoms below ~0.5% slide area
-    (decorative hairlines / single-pixel dots).
+    any shape already promoted to a slot (`slot_shape_ids`), and atoms
+    below ~0.5% slide area (decorative hairlines / single-pixel dots).
+    Descends into Group shapes up to ``_MAX_GROUP_DEPTH`` levels so
+    grouped callouts aren't silently lost.
 
     Returns list of asset ids.
     """
     slot_shape_ids = slot_shape_ids or set()
     extracted: list[str] = []
-    for shape in list(slide.shapes):
+    for shape in list(_iter_shapes_recursive(slide)):
         # Shapes that detect_slots claimed as template slots aren't
         # addressable as standalone atoms — the agent fills them via
         # the slot interface.
@@ -1231,10 +1258,13 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
       - any SVG sibling (asvg:svgBlip) as a separate vector asset with
         kind="vector" and recolor_targets seeded from fill/stroke colours
 
+    v4.1: descends into Group shapes up to ``_MAX_GROUP_DEPTH`` levels
+    so grouped pictures aren't lost.
+
     Returns the list of asset ids extracted (raster + any siblings).
     """
     extracted: list[str] = []
-    for shape in list(slide.shapes):
+    for shape in list(_iter_shapes_recursive(slide)):
         if not _shape_is_picture(shape):
             continue
         try:

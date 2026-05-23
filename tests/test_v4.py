@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO / "authoring"))
 sys.path.insert(0, str(REPO / "consumer"))
 
 from pptx import Presentation  # noqa: E402
+from pptx.enum.shapes import MSO_SHAPE  # noqa: E402
 from pptx.util import Inches  # noqa: E402
 
 import cli as cli_mod  # noqa: E402
@@ -422,6 +423,96 @@ class TestFontRemap(unittest.TestCase):
         el = etree.fromstring(self._wrap('<a:latin typeface="Helvetica"/>'))
         self.assertEqual(reader_mod._apply_font_remap(el, {}), 0)
         self.assertEqual(el[0].get("typeface"), "Helvetica")
+
+
+# ---------------------------------------------------------------------------
+# v4.1 — extract_structured_atoms / extract_picture_assets group recursion
+# ---------------------------------------------------------------------------
+
+
+class TestGroupRecursion(unittest.TestCase):
+    def _add_callout(self, container, left_in: int, top_in: int):
+        return container.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(left_in), Inches(top_in), Inches(2), Inches(1),
+        )
+
+    def test_iter_descends_into_group(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        grp = slide.shapes.add_group_shape()
+        self._add_callout(grp, 1, 1)
+        self._add_callout(grp, 4, 1)
+        leafs = list(cli_mod._iter_shapes_recursive(slide))
+        # Title placeholder + 2 grouped callouts; no GROUP itself.
+        kinds = [str(getattr(s, "shape_type", "")) for s in leafs]
+        self.assertEqual(sum("AUTO_SHAPE" in k for k in kinds), 2)
+        self.assertFalse(any("GROUP" in k for k in kinds))
+
+    def test_iter_descends_into_nested_groups(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        outer = slide.shapes.add_group_shape()
+        inner = outer.shapes.add_group_shape()
+        self._add_callout(inner, 1, 1)
+        leafs = list(cli_mod._iter_shapes_recursive(slide))
+        autos = [s for s in leafs if "AUTO_SHAPE" in str(getattr(s, "shape_type", ""))]
+        self.assertEqual(len(autos), 1)
+
+    def test_iter_depth_limit_skips_too_deep_shapes(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        # Build _MAX_GROUP_DEPTH+2 nested groups, shape at the bottom.
+        container = slide.shapes
+        for _ in range(cli_mod._MAX_GROUP_DEPTH + 2):
+            container = container.add_group_shape().shapes
+        container.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(1), Inches(1), Inches(2), Inches(1),
+        )
+        leafs = list(cli_mod._iter_shapes_recursive(slide))
+        autos = [s for s in leafs if "AUTO_SHAPE" in str(getattr(s, "shape_type", ""))]
+        self.assertEqual(autos, [], "shape below depth limit should be skipped")
+
+    def test_extract_structured_atoms_descends_into_groups(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        grp = slide.shapes.add_group_shape()
+        self._add_callout(grp, 1, 1)
+        self._add_callout(grp, 4, 1)
+        with tempfile.TemporaryDirectory() as d:
+            ids = cli_mod.extract_structured_atoms(
+                slide, deck_stem="syn_group", slide_number=1,
+                assets_dir=Path(d),
+                slide_w=prs.slide_width, slide_h=prs.slide_height,
+            )
+            # Two grouped callouts should both surface as callout atoms.
+            self.assertEqual(len(ids), 2)
+            # Each id should have a .xml fragment + .yaml stub on disk.
+            for aid in ids:
+                sha = aid.replace("asset_", "")
+                # sha-prefix only — find the full filename via glob.
+                xmls = list(Path(d).glob(f"{sha}*.xml"))
+                yamls = list(Path(d).glob(f"{sha}*.yaml"))
+                self.assertEqual(len(xmls), 1, f"missing xml for {aid}")
+                self.assertEqual(len(yamls), 1, f"missing yaml for {aid}")
+
+    def test_extract_structured_atoms_mixes_grouped_and_flat(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        # Flat callout.
+        self._add_callout(slide, 1, 1)
+        # Grouped callout pair.
+        grp = slide.shapes.add_group_shape()
+        self._add_callout(grp, 4, 1)
+        self._add_callout(grp, 7, 1)
+        with tempfile.TemporaryDirectory() as d:
+            ids = cli_mod.extract_structured_atoms(
+                slide, deck_stem="syn_mixed", slide_number=1,
+                assets_dir=Path(d),
+                slide_w=prs.slide_width, slide_h=prs.slide_height,
+            )
+            self.assertEqual(len(ids), 3)
 
 
 if __name__ == "__main__":
