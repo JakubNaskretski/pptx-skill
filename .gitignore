@@ -28,3 +28,9 @@ Thumbs.db
 
 # Local-only handover / session notes
 HANDOVER.md
+
+# Local test inputs / sample bundles — keep private decks + reference
+# bundles out of the repo. Source .pptx is already covered by *.pptx,
+# but the rest of a sample prompt-bundle (index.json, brand.md, brief.md,
+# theme.yaml) is not — this catches the whole directory.
+TestData/
