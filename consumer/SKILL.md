@@ -57,10 +57,10 @@ Pick a pre-described template, fill its slots.
 Slot keys must match the template's declared `slots` (call
 `get <template_id>` to inspect them).
 
-### Mode 2 — compose from atoms (v4, NOT YET FULLY HONORED)
+### Mode 2 — compose from atoms (v4)
 
-Assemble a slide from atoms on a (largely) blank canvas. Use when
-no template fits but you want to reuse captured atoms.
+Assemble a slide from atoms on a blank canvas. Use when no template
+fits but you want to reuse captured atoms.
 
 ```json
 {
@@ -69,7 +69,7 @@ no template fits but you want to reuse captured atoms.
   "shapes": [
     {"kind": "text", "value": "Pipeline view",
      "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.1,
-     "font_role": "major", "color_role": "primary"},
+     "bold": true},
     {"atom": "asset_cb3a", "kind": "callout",
      "x": 0.05, "y": 0.2, "w": 0.4, "h": 0.4,
      "recolor": {"#ff0000": "accent"}},
@@ -80,11 +80,23 @@ no template fits but you want to reuse captured atoms.
 }
 ```
 
-**Status (current build):** compose-mode entries are accepted at
-plan-validation time but **skipped at compose** with a warning. Full
-support lands when the engine learns `_place_atom` /
-`_compose_custom_slide`. Until then, stick to template mode if you
-need the slide to render.
+**Status (current build):**
+- `kind: text` shapes render as plain textboxes; `bold` is honored.
+  `font_role` / `color_role` are accepted but warn (not yet honored).
+- Atom placements with `x/y/w/h` (fractions of slide) work for
+  pictures, vectors, tables, callouts, and freeforms. `recolor`
+  rewrites `<a:srgbClr>` fills in the atom; role tokens (`accent`,
+  `primary`, `text`, `background`) resolve against the host
+  template's theme colors.
+- Tables accept an optional `cells` override (same semantics as a
+  `kind: table` slot).
+- Chart and SmartArt atoms are **skipped with a warning** —
+  related-parts copying is deferred. Use the picture export of those
+  atoms instead (if you have one).
+- The host deck is the first template-mode entry's pptx (so its
+  master / theme apply). If the plan is all compose-mode entries,
+  the first template in the bundle (alphabetical) becomes scratch
+  host and its original slide is dropped.
 
 ## Slot value polymorphism (v4)
 

@@ -589,6 +589,336 @@ def _copy_slide_into(dest_prs: Presentation, src_slide_pptx: Path):
 
 
 # ---------------------------------------------------------------------------
+# Compose-mode (v4) — custom slides assembled from atoms + native shapes
+# ---------------------------------------------------------------------------
+
+
+def _frac_to_emu(spec: dict, key: str, total_emu: int, fallback: float) -> int:
+    v = spec.get(key)
+    if not isinstance(v, (int, float)) or v < 0:
+        v = fallback
+    return int(total_emu * float(v))
+
+
+def _set_atom_geometry(el, x_emu: int, y_emu: int, w_emu: int, h_emu: int) -> None:
+    """Rewrite (or insert) the offset+extent on a captured shape's XML.
+
+    Tables and other GraphicFrame atoms use a direct ``p:xfrm`` child.
+    Auto-shapes / freeforms (``p:sp``) use ``p:spPr/a:xfrm``. We handle
+    both shapes silently — if neither path exists the atom keeps its
+    source geometry rather than crashing.
+    """
+    try:
+        from pptx.oxml.ns import qn
+        from lxml import etree
+    except ImportError:
+        return
+    xfrm = el.find(qn("p:xfrm"))
+    if xfrm is None:
+        sp_pr = el.find(qn("p:spPr"))
+        if sp_pr is not None:
+            xfrm = sp_pr.find(qn("a:xfrm"))
+            if xfrm is None:
+                xfrm = etree.SubElement(sp_pr, qn("a:xfrm"))
+    if xfrm is None:
+        return
+    off = xfrm.find(qn("a:off"))
+    if off is None:
+        off = etree.SubElement(xfrm, qn("a:off"))
+    off.set("x", str(x_emu))
+    off.set("y", str(y_emu))
+    ext = xfrm.find(qn("a:ext"))
+    if ext is None:
+        ext = etree.SubElement(xfrm, qn("a:ext"))
+    ext.set("cx", str(w_emu))
+    ext.set("cy", str(h_emu))
+
+
+def _apply_recolor_xml(el, recolor: dict, deck_theme: dict | None = None) -> tuple[int, list[str]]:
+    """Rewrite ``<a:srgbClr val="...">`` matches per a recolor map.
+
+    Keys are source hex codes (with or without '#'). Values can be:
+      - another hex code → direct substitution
+      - a colour-role token ('primary', 'accent', 'text', 'background'
+        or any clrScheme slot) → resolved against ``deck_theme`` if
+        provided; warns and skips if unresolvable.
+    Returns ``(substitutions_applied, warnings)``.
+    """
+    try:
+        from pptx.oxml.ns import qn
+    except ImportError:
+        return 0, []
+    warnings: list[str] = []
+    palette = (deck_theme or {}).get("palette") or {}
+    aliases = (deck_theme or {}).get("aliases") or {}
+
+    def _resolve_target(raw: str) -> str | None:
+        if not isinstance(raw, str):
+            return None
+        s = raw.strip().lstrip("#").upper()
+        if len(s) == 6 and all(c in "0123456789ABCDEF" for c in s):
+            return s
+        # role / clrScheme token
+        token = raw.strip().lower()
+        alias_target = aliases.get(token)
+        hex_val = palette.get(alias_target) if alias_target else palette.get(token)
+        if not hex_val:
+            return None
+        return hex_val.lstrip("#").upper()
+
+    norm_map: dict[str, str] = {}
+    for src, tgt in recolor.items():
+        if not isinstance(src, str):
+            continue
+        src_n = src.strip().lstrip("#").upper()
+        if len(src_n) != 6:
+            warnings.append(f"recolor source {src!r} is not a 6-digit hex; skipping")
+            continue
+        tgt_n = _resolve_target(tgt)
+        if tgt_n is None:
+            warnings.append(
+                f"recolor target {tgt!r} could not be resolved (need hex or known role); skipping"
+            )
+            continue
+        norm_map[src_n] = tgt_n
+
+    if not norm_map:
+        return 0, warnings
+
+    applied = 0
+    for clr in el.findall(".//" + qn("a:srgbClr")):
+        val = (clr.get("val") or "").upper()
+        if val in norm_map:
+            clr.set("val", norm_map[val])
+            applied += 1
+    return applied, warnings
+
+
+def _place_atom(
+    slide,
+    spec: dict,
+    slide_w_emu: int,
+    slide_h_emu: int,
+    host_theme: dict | None = None,
+) -> list[str]:
+    """Place one atom on a slide at a fractional bbox.
+
+    Supported spec keys:
+      atom              asset id (required)
+      x, y, w, h        fractions of slide; default to a top-left 40x30% box
+      kind              optional override; defaults to the asset's stored kind
+      recolor           {src_hex: target_hex_or_role} — rewrites srgbClr fills
+      cells             list-of-lists (kind=table only) — post-place cell fill
+
+    Picture atoms (raster/vector) re-import via ``add_picture`` so the
+    image part lives in the host package. XML atoms (table, callout,
+    freeform) graft as fragments. Charts / smartart are NOT yet
+    placeable — they reference external parts that need a related-parts
+    copy pass; we warn + skip rather than emit a half-broken slide.
+    """
+    warnings: list[str] = []
+    aid = spec.get("atom")
+    if not isinstance(aid, str) or not aid:
+        warnings.append(f"compose-mode shape missing 'atom' id: {spec!r}")
+        return warnings
+
+    meta_p = asset_meta_path(aid)
+    bin_p = asset_path(aid)
+    if not meta_p.exists() or bin_p is None:
+        warnings.append(f"compose-mode: asset {aid!r} not found in bundle")
+        return warnings
+    meta = yaml.safe_load(meta_p.read_text(encoding="utf-8")) or {}
+    kind = spec.get("kind") or meta.get("kind") or ""
+
+    x_emu = _frac_to_emu(spec, "x", slide_w_emu, 0.05)
+    y_emu = _frac_to_emu(spec, "y", slide_h_emu, 0.05)
+    w_emu = _frac_to_emu(spec, "w", slide_w_emu, 0.4)
+    h_emu = _frac_to_emu(spec, "h", slide_h_emu, 0.3)
+
+    if bin_p.suffix.lower() != ".xml":
+        # Picture / vector — straightforward add_picture path.
+        try:
+            new_pic = slide.shapes.add_picture(
+                str(bin_p), x_emu, y_emu, width=w_emu, height=h_emu
+            )
+            new_pic.name = aid
+        except Exception as e:
+            warnings.append(f"compose-mode: failed to place picture {aid!r}: {e}")
+            return warnings
+        if spec.get("recolor"):
+            warnings.append(
+                f"compose-mode {aid!r}: recolor on picture atoms not yet honored"
+            )
+        return warnings
+
+    # XML atom path — graft as fragment.
+    if kind in ("chart", "smartart"):
+        warnings.append(
+            f"compose-mode: {kind} atom {aid!r} not yet placeable "
+            f"(related-parts copying deferred); skipping"
+        )
+        return warnings
+
+    # Use pptx's parser so the element wraps with the right custom
+    # class (CT_GraphicalObjectFrame, CT_Shape, …); a raw lxml element
+    # would crash SlideShapeFactory's `has_ph_elm` check on lookup.
+    try:
+        from pptx.oxml import parse_xml
+    except ImportError:
+        warnings.append(f"compose-mode: pptx.oxml unavailable; cannot graft atom {aid!r}")
+        return warnings
+
+    try:
+        new_el = parse_xml(bin_p.read_bytes())
+    except Exception as e:
+        warnings.append(f"compose-mode: atom {aid!r} XML failed to parse: {e}")
+        return warnings
+
+    _set_atom_geometry(new_el, x_emu, y_emu, w_emu, h_emu)
+
+    recolor = spec.get("recolor")
+    if isinstance(recolor, dict) and recolor:
+        applied, ws = _apply_recolor_xml(new_el, recolor, host_theme)
+        warnings.extend(ws)
+        if applied == 0 and not ws:
+            warnings.append(
+                f"compose-mode: recolor for {aid!r} matched 0 colours in atom XML"
+            )
+
+    slide.shapes._spTree.append(new_el)
+
+    if kind == "table" and spec.get("cells") is not None:
+        new_shape = slide.shapes[-1]
+        cells = spec.get("cells")
+        if isinstance(cells, list) and all(isinstance(r, list) for r in cells):
+            warnings.extend(_fill_table_shape(new_shape, cells))
+        else:
+            warnings.append(
+                f"compose-mode: atom {aid!r} 'cells' must be list-of-lists; skipping fill"
+            )
+
+    return warnings
+
+
+def _place_native_text(slide, spec: dict, slide_w_emu: int, slide_h_emu: int) -> list[str]:
+    """Add a native textbox at fractional position from a compose-mode shape spec.
+
+    Supported spec keys (in addition to x/y/w/h):
+      value or text     text to render
+      bold              bool
+      font_role         informational — warns (not yet honored)
+      color_role        informational — warns (not yet honored)
+    """
+    warnings: list[str] = []
+    text = spec.get("value", spec.get("text", ""))
+    if not isinstance(text, str):
+        text = str(text)
+
+    x_emu = _frac_to_emu(spec, "x", slide_w_emu, 0.05)
+    y_emu = _frac_to_emu(spec, "y", slide_h_emu, 0.05)
+    w_emu = _frac_to_emu(spec, "w", slide_w_emu, 0.5)
+    h_emu = _frac_to_emu(spec, "h", slide_h_emu, 0.1)
+
+    try:
+        tb = slide.shapes.add_textbox(x_emu, y_emu, w_emu, h_emu)
+    except Exception as e:
+        warnings.append(f"compose-mode text: failed to add textbox: {e}")
+        return warnings
+    tb.text_frame.text = _strip_bullet_prefix(text)
+
+    if spec.get("bold"):
+        for p in tb.text_frame.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+
+    for k in ("font_role", "color_role"):
+        if spec.get(k):
+            warnings.append(
+                f"compose-mode text: {k}={spec[k]!r} not yet honored"
+            )
+    return warnings
+
+
+def _compose_custom_slide(
+    dest_prs: Presentation,
+    entry: dict,
+    host_theme: dict | None = None,
+):
+    """Append a blank slide and populate from ``entry.shapes``.
+
+    Each shape spec is one of:
+      - ``{"atom": <id>, ...}``  → routed to ``_place_atom``
+      - ``{"kind": "text", "value": "...", ...}``  → routed to
+        ``_place_native_text``
+
+    Returns ``(new_slide, warnings)``.
+    """
+    warnings: list[str] = []
+
+    dest_layout = None
+    best_count = None
+    for layout in dest_prs.slide_layouts:
+        try:
+            count = len(layout.placeholders)
+        except Exception:
+            count = 99
+        if best_count is None or count < best_count:
+            best_count = count
+            dest_layout = layout
+    if dest_layout is None:
+        dest_layout = dest_prs.slide_layouts[0]
+
+    new_slide = dest_prs.slides.add_slide(dest_layout)
+    # Clean canvas — drop any layout-inherited placeholders.
+    for shp in list(new_slide.shapes):
+        shp._element.getparent().remove(shp._element)
+
+    slide_w_emu = dest_prs.slide_width
+    slide_h_emu = dest_prs.slide_height
+
+    shapes = entry.get("shapes") or []
+    for spec in shapes:
+        if not isinstance(spec, dict):
+            warnings.append(f"compose-mode entry: bad shape spec {spec!r}")
+            continue
+        if "atom" in spec:
+            warnings.extend(_place_atom(new_slide, spec, slide_w_emu, slide_h_emu, host_theme))
+        elif spec.get("kind") == "text":
+            warnings.extend(_place_native_text(new_slide, spec, slide_w_emu, slide_h_emu))
+        else:
+            warnings.append(
+                f"compose-mode entry: shape spec lacks 'atom' or kind=text: {spec!r}"
+            )
+
+    return new_slide, warnings
+
+
+def _drop_first_slide(prs: Presentation) -> None:
+    """Remove the host's original first slide after appending plan slides.
+
+    Used when a compose-mode entry is the first plan entry — we still
+    need a host pptx (for its theme/master), but we don't want its
+    original first slide to leak into the output.
+    """
+    try:
+        from pptx.oxml.ns import qn
+    except ImportError:
+        return
+    sld_id_list = prs.slides._sldIdLst
+    sld_ids = list(sld_id_list)
+    if not sld_ids:
+        return
+    first = sld_ids[0]
+    rid = first.get(qn("r:id"))
+    sld_id_list.remove(first)
+    if rid:
+        try:
+            prs.part.drop_rel(rid)
+        except KeyError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -644,6 +974,24 @@ def cmd_get(args: argparse.Namespace) -> None:
     raise SystemExit(f"id not found: {target}")
 
 
+def _load_host_theme(template_meta: dict) -> dict:
+    """Best-effort host-theme dict for the recolor map's role resolution.
+
+    Template meta carries ``theme_colors`` ({primary, accent, text,
+    background} resolved hex) and originating deck info. We assemble
+    a palette/aliases shape compatible with ``_apply_recolor_xml``.
+    """
+    palette: dict = {}
+    aliases: dict = {}
+    tc = template_meta.get("theme_colors") or {}
+    for role, hex_val in tc.items():
+        if not hex_val:
+            continue
+        palette[role] = hex_val
+        aliases[role] = role
+    return {"palette": palette, "aliases": aliases}
+
+
 def cmd_compose(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
     out_path = Path(args.out)
@@ -654,76 +1002,88 @@ def cmd_compose(args: argparse.Namespace) -> None:
     if not isinstance(plan, list) or not plan:
         raise SystemExit("plan must be a non-empty JSON array")
 
-    # v4: filter out compose-mode entries — full handling lands in
-    # Phase D. Keep one warning per skipped entry so the agent sees
-    # what wasn't honored. Template-mode entries pass through unchanged.
     plan_warnings: list[str] = []
-    template_plan: list[dict] = []
+    # Walk the plan once; each surviving entry is tagged 'template' or 'compose'.
+    valid_entries: list[tuple[str, dict]] = []
     for entry in plan:
         if not isinstance(entry, dict):
             plan_warnings.append(f"skipping non-object plan entry: {entry!r}")
             continue
         if entry.get("compose"):
-            plan_warnings.append(
-                f"compose-mode entry skipped (Phase D will implement): "
-                f"layout={entry.get('layout', '?')!r}, "
-                f"shapes={len(entry.get('shapes') or [])}"
-            )
+            valid_entries.append(("compose", entry))
             continue
-        if "template" not in entry:
-            plan_warnings.append(f"skipping entry with no `template` field: {entry!r}")
+        if "template" in entry:
+            valid_entries.append(("template", entry))
             continue
-        template_plan.append(entry)
-
-    if not template_plan:
-        raise SystemExit(
-            "plan has no template-mode entries to compose "
-            "(compose-mode entries skipped pending Phase D)"
+        plan_warnings.append(
+            f"skipping entry without 'template' or 'compose': {entry!r}"
         )
 
-    # Resolve template metadata for slot kind hints.
+    if not valid_entries:
+        raise SystemExit("plan has no valid entries (need 'template' or 'compose')")
+
     def template_meta(tid: str) -> dict:
         m = template_dir(tid) / "meta.yaml"
         if not m.exists():
             raise SystemExit(f"template not found: {tid}")
         return yaml.safe_load(m.read_text(encoding="utf-8")) or {}
 
-    # Start from the first template's deck as host so its master/theme applies.
-    first_tid = template_plan[0]["template"]
-    first_pptx = template_dir(first_tid) / "slide.pptx"
-    if not first_pptx.exists():
-        raise SystemExit(f"missing slide.pptx for {first_tid}")
+    # Host pick: first template-mode entry wins. If the whole plan is
+    # compose-mode, fall back to the first template alphabetically so
+    # we still have a master/theme to render against.
+    first_template_entry = next(
+        (e for kind, e in valid_entries if kind == "template"), None
+    )
+    if first_template_entry is not None:
+        host_tid = first_template_entry["template"]
+        host_claims_first_slide = valid_entries[0][0] == "template" and (
+            valid_entries[0][1]["template"] == host_tid
+        )
+    else:
+        idx = load_index()
+        templates = idx.get("templates") or []
+        if not templates:
+            raise SystemExit("no templates in bundle to serve as compose host")
+        host_tid = sorted(t["id"] for t in templates)[0]
+        host_claims_first_slide = False
 
-    # Copy host into a tempfile so we don't mutate the bundle.
+    host_pptx = template_dir(host_tid) / "slide.pptx"
+    if not host_pptx.exists():
+        raise SystemExit(f"missing slide.pptx for {host_tid}")
+
+    host_theme = _load_host_theme(template_meta(host_tid))
+
     with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
-        shutil.copyfile(first_pptx, tmp.name)
+        shutil.copyfile(host_pptx, tmp.name)
         host_path = Path(tmp.name)
 
     try:
         dest_prs = Presentation(str(host_path))
-
         warnings: list[str] = list(plan_warnings)
 
-        # Fill slots on the host's existing first slide.
-        first_meta = template_meta(first_tid)
-        first_slots_by_id = {s["id"]: s for s in first_meta.get("slots", [])}
-        first_slide = dest_prs.slides[0]
-        for slot_id, value in (template_plan[0].get("slots") or {}).items():
-            kind_hint = first_slots_by_id.get(slot_id, {}).get("kind")
-            warnings.extend(_apply_slot_value(first_slide, slot_id, value, kind_hint))
+        for i, (kind, entry) in enumerate(valid_entries):
+            if kind == "template":
+                tid = entry["template"]
+                if i == 0 and host_claims_first_slide:
+                    slide = dest_prs.slides[0]
+                else:
+                    src_pptx = template_dir(tid) / "slide.pptx"
+                    if not src_pptx.exists():
+                        raise SystemExit(f"missing slide.pptx for {tid}")
+                    slide = _copy_slide_into(dest_prs, src_pptx)
+                meta = template_meta(tid)
+                slots_by_id = {s["id"]: s for s in meta.get("slots", [])}
+                for slot_id, value in (entry.get("slots") or {}).items():
+                    kind_hint = slots_by_id.get(slot_id, {}).get("kind")
+                    warnings.extend(_apply_slot_value(slide, slot_id, value, kind_hint))
+            else:
+                _, ws = _compose_custom_slide(dest_prs, entry, host_theme)
+                warnings.extend(ws)
 
-        # Append subsequent slides.
-        for entry in template_plan[1:]:
-            tid = entry["template"]
-            src_pptx = template_dir(tid) / "slide.pptx"
-            if not src_pptx.exists():
-                raise SystemExit(f"missing slide.pptx for {tid}")
-            new_slide = _copy_slide_into(dest_prs, src_pptx)
-            meta = template_meta(tid)
-            slots_by_id = {s["id"]: s for s in meta.get("slots", [])}
-            for slot_id, value in (entry.get("slots") or {}).items():
-                kind_hint = slots_by_id.get(slot_id, {}).get("kind")
-                warnings.extend(_apply_slot_value(new_slide, slot_id, value, kind_hint))
+        # If the host's existing first slide wasn't claimed by an entry,
+        # it's leftover scaffolding — drop it.
+        if not host_claims_first_slide:
+            _drop_first_slide(dest_prs)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         dest_prs.save(str(out_path))
@@ -735,7 +1095,7 @@ def cmd_compose(args: argparse.Namespace) -> None:
 
     result = {
         "output": str(out_path),
-        "slides": len(template_plan),
+        "slides": len(valid_entries),
         "plan_entries": len(plan),
         "warnings": warnings,
     }
