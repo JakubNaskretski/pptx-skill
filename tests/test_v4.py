@@ -1,4 +1,4 @@
-"""Tests for pptx-skill v4 phases D3–D5 and E.
+"""Tests for pptx-skill v4 phases D3–D5, E, and v4.1 (font remap + groups).
 
 Run from repo root: ``python3 -m unittest tests.test_v4``
 
@@ -329,6 +329,99 @@ class TestComposeRoundTrip(unittest.TestCase):
         t = placed[0].table
         self.assertEqual(t.cell(0, 0).text.strip(), "roundtrip-A")
         self.assertEqual(t.cell(0, 1).text.strip(), "roundtrip-B")
+
+
+# ---------------------------------------------------------------------------
+# v4.1 — surgical theme-font remap (D5 extension)
+# ---------------------------------------------------------------------------
+
+
+class TestFontRemap(unittest.TestCase):
+    DML = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    def _wrap(self, *inner: str) -> bytes:
+        return (
+            f'<root xmlns:a="{self.DML}">' + "".join(inner) + "</root>"
+        ).encode("utf-8")
+
+    def test_build_remap_only_includes_differing_roles(self):
+        # major matches, minor differs → remap only contains the minor entry.
+        src = {"fonts": {"major": "Aptos Display", "minor": "Helvetica"}}
+        host = {"fonts": {"major": "Aptos Display", "minor": "Aptos"}}
+        self.assertEqual(
+            reader_mod._build_font_remap(src, host),
+            {"helvetica": "Aptos"},
+        )
+
+    def test_build_remap_distinct_major_minor(self):
+        src = {"fonts": {"major": "Helvetica", "minor": "Century Gothic"}}
+        host = {"fonts": {"major": "Aptos Display", "minor": "Aptos"}}
+        self.assertEqual(
+            reader_mod._build_font_remap(src, host),
+            {"helvetica": "Aptos Display", "century gothic": "Aptos"},
+        )
+
+    def test_build_remap_empty_when_fonts_match(self):
+        src = {"fonts": {"major": "Aptos Display", "minor": "Aptos"}}
+        host = {"fonts": {"major": "aptos display", "minor": "APTOS"}}
+        self.assertEqual(reader_mod._build_font_remap(src, host), {})
+
+    def test_build_remap_empty_when_either_side_missing_fonts(self):
+        self.assertEqual(reader_mod._build_font_remap({}, {"fonts": {"major": "X"}}), {})
+        self.assertEqual(reader_mod._build_font_remap({"fonts": {"major": "X"}}, {}), {})
+        self.assertEqual(reader_mod._build_font_remap(None, None), {})
+
+    def test_apply_remap_rewrites_explicit_latin(self):
+        from lxml import etree
+        el = etree.fromstring(self._wrap('<a:latin typeface="Helvetica Neue"/>'))
+        n = reader_mod._apply_font_remap(el, {"helvetica neue": "Inter"})
+        self.assertEqual(n, 1)
+        self.assertEqual(el[0].get("typeface"), "Inter")
+
+    def test_apply_remap_preserves_one_off_explicit_font(self):
+        """A non-theme explicit font (Courier code snippet, etc.) survives unchanged."""
+        from lxml import etree
+        el = etree.fromstring(self._wrap('<a:latin typeface="Courier New"/>'))
+        n = reader_mod._apply_font_remap(el, {"helvetica neue": "Inter"})
+        self.assertEqual(n, 0)
+        self.assertEqual(el[0].get("typeface"), "Courier New")
+
+    def test_apply_remap_skips_theme_refs(self):
+        """+mj-lt and +mn-lt already self-resolve; never rewrite them."""
+        from lxml import etree
+        el = etree.fromstring(self._wrap(
+            '<a:latin typeface="+mj-lt"/>',
+            '<a:latin typeface="+mn-lt"/>',
+        ))
+        n = reader_mod._apply_font_remap(el, {"+mj-lt": "Inter", "helvetica": "Inter"})
+        self.assertEqual(n, 0)
+        self.assertEqual(el[0].get("typeface"), "+mj-lt")
+        self.assertEqual(el[1].get("typeface"), "+mn-lt")
+
+    def test_apply_remap_handles_ea_and_cs(self):
+        from lxml import etree
+        el = etree.fromstring(self._wrap(
+            '<a:latin typeface="Helvetica"/>',
+            '<a:ea typeface="Helvetica"/>',
+            '<a:cs typeface="Helvetica"/>',
+        ))
+        n = reader_mod._apply_font_remap(el, {"helvetica": "Aptos"})
+        self.assertEqual(n, 3)
+        for node in el:
+            self.assertEqual(node.get("typeface"), "Aptos")
+
+    def test_apply_remap_case_insensitive_match(self):
+        from lxml import etree
+        el = etree.fromstring(self._wrap('<a:latin typeface="HELVETICA"/>'))
+        n = reader_mod._apply_font_remap(el, {"helvetica": "Aptos"})
+        self.assertEqual(n, 1)
+        self.assertEqual(el[0].get("typeface"), "Aptos")
+
+    def test_apply_remap_returns_zero_on_empty_remap(self):
+        from lxml import etree
+        el = etree.fromstring(self._wrap('<a:latin typeface="Helvetica"/>'))
+        self.assertEqual(reader_mod._apply_font_remap(el, {}), 0)
+        self.assertEqual(el[0].get("typeface"), "Helvetica")
 
 
 if __name__ == "__main__":

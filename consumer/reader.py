@@ -623,6 +623,75 @@ def _apply_scheme_remap(el, remap: dict[str, str]) -> int:
     return count
 
 
+# ---------------------------------------------------------------------------
+# v4.1 — surgical theme-font remap (D5 extension)
+# ---------------------------------------------------------------------------
+#
+# Theme refs like <a:latin typeface="+mj-lt"/> already self-resolve to the
+# host's major font after a cross-deck copy. Explicit typefaces don't —
+# they survive the copy verbatim. Keynote-exported decks are the common
+# offender: Keynote bakes "Helvetica Neue" in as an explicit typeface
+# even though it IS that deck's theme major font. On a host whose theme
+# major is e.g. Inter, the copied text then stubbornly renders Helvetica.
+#
+# Surgical policy: only rewrite an explicit typeface when it matches the
+# *source* deck theme's major or minor. Anything else (Courier code,
+# Comic Sans header) is preserved — assume the author meant it.
+
+def _build_font_remap(
+    source_theme: dict | None, host_theme: dict | None
+) -> dict[str, str]:
+    """Build a typeface remap aligning source major/minor to host's.
+
+    Returns ``{lowercased_source_typeface: host_typeface}`` for the
+    major and minor roles only when both sides have a font defined and
+    they differ. One-off explicit fonts (i.e. typefaces that don't
+    match the source theme's major/minor) are intentionally *not* in
+    the remap and survive the copy unchanged.
+    """
+    if not source_theme or not host_theme:
+        return {}
+    src_fonts = source_theme.get("fonts") or {}
+    host_fonts = host_theme.get("fonts") or {}
+    remap: dict[str, str] = {}
+    for role in ("major", "minor"):
+        src = (src_fonts.get(role) or "").strip()
+        host = (host_fonts.get(role) or "").strip()
+        if not src or not host:
+            continue
+        if src.lower() == host.lower():
+            continue
+        remap[src.lower()] = host
+    return remap
+
+
+def _apply_font_remap(el, remap: dict[str, str]) -> int:
+    """Rewrite ``<a:latin|ea|cs typeface="..."/>`` per remap; returns count.
+
+    Only touches explicit typefaces. Theme refs (typefaces starting
+    with ``+`` like ``+mj-lt``) self-resolve at render time and are
+    skipped. Matching is case-insensitive; the substituted value
+    preserves the host theme's casing.
+    """
+    if not remap:
+        return 0
+    try:
+        from pptx.oxml.ns import qn
+    except ImportError:
+        return 0
+    count = 0
+    for tag in ("a:latin", "a:ea", "a:cs"):
+        for node in el.findall(".//" + qn(tag)):
+            typeface = (node.get("typeface") or "").strip()
+            if not typeface or typeface.startswith("+"):
+                continue
+            host = remap.get(typeface.lower())
+            if host and host != typeface:
+                node.set("typeface", host)
+                count += 1
+    return count
+
+
 def _copy_slide_into(
     dest_prs: Presentation,
     src_slide_pptx: Path,
@@ -664,6 +733,7 @@ def _copy_slide_into(
         shp._element.getparent().remove(shp._element)
 
     remap = _build_scheme_remap(source_theme, host_theme)
+    font_remap = _build_font_remap(source_theme, host_theme)
 
     # Copy shapes from source. For pictures, re-add via add_picture so the
     # image part is imported into the destination package.
@@ -695,6 +765,8 @@ def _copy_slide_into(
         el = copy.deepcopy(shape._element)
         if remap:
             _apply_scheme_remap(el, remap)
+        if font_remap:
+            _apply_font_remap(el, font_remap)
         new_slide.shapes._spTree.append(el)
 
     return new_slide
@@ -898,6 +970,12 @@ def _place_atom(
         scheme_remap = _build_scheme_remap(asset_deck_theme, host_theme)
         if scheme_remap:
             _apply_scheme_remap(new_el, scheme_remap)
+        # v4.1: rewrite explicit typefaces that match the source's
+        # major/minor → host's major/minor. Preserves intentional
+        # one-off fonts (Courier, etc.).
+        font_remap = _build_font_remap(asset_deck_theme, host_theme)
+        if font_remap:
+            _apply_font_remap(new_el, font_remap)
 
     recolor = spec.get("recolor")
     if isinstance(recolor, dict) and recolor:
