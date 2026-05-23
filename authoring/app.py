@@ -660,6 +660,39 @@ def _format_brief(brief: str) -> str:
         "- Bullets slot values: array of strings.\n"
         "- If no asset fits a slot, omit the slot rather than forcing one.\n"
         "\n"
+        "## v4 capabilities — what's new\n"
+        "\n"
+        "- Each template carries `theme_colors` and `fonts` showing the\n"
+        "  source deck's actual palette + theme fonts. Pick templates\n"
+        "  whose theme is close to brand policy when possible.\n"
+        "- Each template has `inventory` listing structured atoms it\n"
+        "  carries (tables, callouts, charts, smartart). Picking the\n"
+        "  template brings those atoms along for free.\n"
+        "- Asset kinds now include `vector`, `table`, `chart`, `callout`,\n"
+        "  `freeform`, `smartart` — filter on them via `kind=table` etc.\n"
+        "- Each asset has `colors_hex` (actual hex from binary inspection)\n"
+        "  alongside the human-readable `colors` words.\n"
+        "\n"
+        "## Slot value polymorphism — accepted but partially honored\n"
+        "\n"
+        "Slot values can be more than plain strings/arrays/asset ids:\n"
+        "  - {\"text\": \"…\", \"color_role\": \"accent\", \"bold\": true}\n"
+        "  - {\"runs\": [{\"text\": \"X\", \"bold\": true}, {\"text\": \" Y\"}]}\n"
+        "  - {\"asset\": \"asset_<id>\", \"recolor\": {\"#ff0000\": \"accent\"}}\n"
+        "\n"
+        "Current build: styling fields are accepted without crashing but\n"
+        "DROPPED at compose time with a one-line warning. Phase D will\n"
+        "honor them. Until then, prefer plain strings/arrays/asset ids\n"
+        "unless you have a specific reason to flag styling intent.\n"
+        "\n"
+        "## Compose-mode entries — accepted but skipped\n"
+        "\n"
+        "Plan entries of shape {\"compose\": true, \"layout\": \"…\",\n"
+        "\"shapes\": [...]} let you assemble a slide from atoms. The\n"
+        "engine currently SKIPS these entries with a warning (full\n"
+        "support lands in Phase D). For a slide to render today it\n"
+        "must use {\"template\": \"…\", \"slots\": {...}} shape.\n"
+        "\n"
         "## Bullets — DO NOT prepend bullet glyphs\n"
         "\n"
         "PowerPoint templates apply bullets via layout formatting. If you\n"
@@ -690,6 +723,22 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
             zf.writestr("brand.md", brand + "\n")
         zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
         zf.writestr("brief.md", _format_brief(brief))
+        # v4: per-deck theme.yaml. Filtered KB may have culled some
+        # decks entirely — only ship themes whose deck still has at
+        # least one template in the bundle (so the agent's bundle
+        # mirrors what they actually see).
+        decks_in_bundle = {
+            (s.get("sources") or [{}])[0].get("deck", "")
+            for s in clean_slides
+        }
+        decks_in_bundle.discard("")
+        for theme_yaml in sorted((cli_mod.WORKSPACE / "decks").glob("*/theme.yaml")):
+            if theme_yaml.parent.name not in decks_in_bundle:
+                continue
+            zf.writestr(
+                f"decks/{theme_yaml.parent.name}/theme.yaml",
+                theme_yaml.read_text(encoding="utf-8"),
+            )
     return buf.getvalue()
 
 

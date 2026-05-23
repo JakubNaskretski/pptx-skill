@@ -245,6 +245,52 @@ def _replace_image_shape(slide, shape, image_path: Path) -> None:
     new_pic.name = name
 
 
+def _degrade_styled_value(value: Any) -> tuple[Any, list[str]]:
+    """Reduce a v4-styled slot value to its v3-compatible primitive.
+
+    The agent can emit (per SKILL.md v4):
+      - {"text": "...", "color_role": "...", "bold": true, ...}
+      - {"runs": [{"text": "X", "bold": true}, {"text": " Y"}]}
+      - {"asset": "asset_<id>", "recolor": {"#ff0000": "accent"}}
+
+    Full handling (colour overrides, per-run formatting, image recolour)
+    lands in Phase D — until then we extract the primitive payload and
+    emit a one-line warning about what's being dropped. Existing
+    string/list/asset_id values pass through unchanged.
+    """
+    if not isinstance(value, dict):
+        return value, []
+
+    warnings: list[str] = []
+    if "runs" in value and isinstance(value["runs"], list):
+        text = "".join(
+            str(r.get("text", "")) for r in value["runs"] if isinstance(r, dict)
+        )
+        warnings.append(
+            f"per-run formatting not yet honored — flattened to plain text {text!r}"
+        )
+        return text, warnings
+    if "asset" in value:
+        aid = str(value["asset"])
+        ignored = sorted(k for k in value if k != "asset")
+        if ignored:
+            warnings.append(
+                f"image overrides not yet honored — ignoring {ignored}"
+            )
+        return aid, warnings
+    if "text" in value:
+        text = str(value["text"])
+        ignored = sorted(k for k in value if k != "text")
+        if ignored:
+            warnings.append(
+                f"text styling not yet honored — ignoring {ignored}"
+            )
+        return text, warnings
+
+    warnings.append(f"unrecognised slot value shape: {value!r}")
+    return value, warnings
+
+
 def _apply_slot_value(slide, slot_id: str, value: Any, kind_hint: str | None) -> list[str]:
     """Apply one slot. Returns a list of warning strings (not fatal)."""
     warnings: list[str] = []
@@ -252,6 +298,19 @@ def _apply_slot_value(slide, slot_id: str, value: Any, kind_hint: str | None) ->
     if shape is None:
         warnings.append(f"slot '{slot_id}' not found on slide (no shape with that name)")
         return warnings
+
+    # v4: degrade styled/per-run/image-override dicts to v3 primitives.
+    # Bullets lists may carry styled dicts per item — degrade each one.
+    if isinstance(value, list):
+        flat: list = []
+        for item in value:
+            primitive, item_warns = _degrade_styled_value(item)
+            flat.append(primitive)
+            warnings.extend(item_warns)
+        value = flat
+    else:
+        value, scalar_warns = _degrade_styled_value(value)
+        warnings.extend(scalar_warns)
 
     kind = kind_hint
     if kind is None:
@@ -425,6 +484,33 @@ def cmd_compose(args: argparse.Namespace) -> None:
     if not isinstance(plan, list) or not plan:
         raise SystemExit("plan must be a non-empty JSON array")
 
+    # v4: filter out compose-mode entries — full handling lands in
+    # Phase D. Keep one warning per skipped entry so the agent sees
+    # what wasn't honored. Template-mode entries pass through unchanged.
+    plan_warnings: list[str] = []
+    template_plan: list[dict] = []
+    for entry in plan:
+        if not isinstance(entry, dict):
+            plan_warnings.append(f"skipping non-object plan entry: {entry!r}")
+            continue
+        if entry.get("compose"):
+            plan_warnings.append(
+                f"compose-mode entry skipped (Phase D will implement): "
+                f"layout={entry.get('layout', '?')!r}, "
+                f"shapes={len(entry.get('shapes') or [])}"
+            )
+            continue
+        if "template" not in entry:
+            plan_warnings.append(f"skipping entry with no `template` field: {entry!r}")
+            continue
+        template_plan.append(entry)
+
+    if not template_plan:
+        raise SystemExit(
+            "plan has no template-mode entries to compose "
+            "(compose-mode entries skipped pending Phase D)"
+        )
+
     # Resolve template metadata for slot kind hints.
     def template_meta(tid: str) -> dict:
         m = template_dir(tid) / "meta.yaml"
@@ -433,7 +519,7 @@ def cmd_compose(args: argparse.Namespace) -> None:
         return yaml.safe_load(m.read_text(encoding="utf-8")) or {}
 
     # Start from the first template's deck as host so its master/theme applies.
-    first_tid = plan[0]["template"]
+    first_tid = template_plan[0]["template"]
     first_pptx = template_dir(first_tid) / "slide.pptx"
     if not first_pptx.exists():
         raise SystemExit(f"missing slide.pptx for {first_tid}")
@@ -446,18 +532,18 @@ def cmd_compose(args: argparse.Namespace) -> None:
     try:
         dest_prs = Presentation(str(host_path))
 
-        warnings: list[str] = []
+        warnings: list[str] = list(plan_warnings)
 
         # Fill slots on the host's existing first slide.
         first_meta = template_meta(first_tid)
         first_slots_by_id = {s["id"]: s for s in first_meta.get("slots", [])}
         first_slide = dest_prs.slides[0]
-        for slot_id, value in (plan[0].get("slots") or {}).items():
+        for slot_id, value in (template_plan[0].get("slots") or {}).items():
             kind_hint = first_slots_by_id.get(slot_id, {}).get("kind")
             warnings.extend(_apply_slot_value(first_slide, slot_id, value, kind_hint))
 
         # Append subsequent slides.
-        for entry in plan[1:]:
+        for entry in template_plan[1:]:
             tid = entry["template"]
             src_pptx = template_dir(tid) / "slide.pptx"
             if not src_pptx.exists():
@@ -479,7 +565,8 @@ def cmd_compose(args: argparse.Namespace) -> None:
 
     result = {
         "output": str(out_path),
-        "slides": len(plan),
+        "slides": len(template_plan),
+        "plan_entries": len(plan),
         "warnings": warnings,
     }
     json.dump(result, sys.stdout, indent=2, ensure_ascii=False)

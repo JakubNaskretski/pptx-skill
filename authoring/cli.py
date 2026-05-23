@@ -1879,33 +1879,50 @@ def _ext_for(blob_path: Path) -> str:
     return blob_path.suffix.lstrip(".") or "bin"
 
 
+def _template_index_entry(s: dict) -> dict:
+    out = {
+        "id": s["id"],
+        "intent": s.get("intent", ""),
+        "feel": s.get("feel", ""),
+        "suitable_for": s.get("suitable_for", []),
+        "layout": s.get("layout", ""),
+        "slots": s.get("slots", []),
+    }
+    # v4: include the auto-extracted theme snapshot + atom inventory
+    # when present. Omit empties so v3-era templates stay terse.
+    for key in ("theme_colors", "fonts", "inventory"):
+        v = s.get(key)
+        if v:
+            out[key] = v
+    return out
+
+
+def _asset_index_entry(a: dict) -> dict:
+    out = {
+        "id": a["id"],
+        "kind": a.get("kind", ""),
+        "subject": a.get("subject", ""),
+        "depicts": a.get("depicts", ""),
+        "feel": a.get("feel", ""),
+        "composition": a.get("composition", ""),
+        "colors": a.get("colors", []),
+        "scope": a.get("scope", []),
+        "suitable_for": a.get("suitable_for", []),
+    }
+    # v4: structured colour + kind-specific blocks. All optional —
+    # only emit when present so the index stays focused on retrievable
+    # fields.
+    for key in ("colors_hex", "recolor_targets", "table", "chart", "shape", "smartart"):
+        v = a.get(key)
+        if v:
+            out[key] = v
+    return out
+
+
 def build_index(slides: list[dict], assets: list[dict]) -> dict:
     return {
-        "templates": [
-            {
-                "id": s["id"],
-                "intent": s.get("intent", ""),
-                "feel": s.get("feel", ""),
-                "suitable_for": s.get("suitable_for", []),
-                "layout": s.get("layout", ""),
-                "slots": s.get("slots", []),
-            }
-            for s in slides
-        ],
-        "assets": [
-            {
-                "id": a["id"],
-                "kind": a.get("kind", ""),
-                "subject": a.get("subject", ""),
-                "depicts": a.get("depicts", ""),
-                "feel": a.get("feel", ""),
-                "composition": a.get("composition", ""),
-                "colors": a.get("colors", []),
-                "scope": a.get("scope", []),
-                "suitable_for": a.get("suitable_for", []),
-            }
-            for a in assets
-        ],
+        "templates": [_template_index_entry(s) for s in slides],
+        "assets": [_asset_index_entry(a) for a in assets],
     }
 
 
@@ -1969,6 +1986,13 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
             brand_text = brand_md.read_text(encoding="utf-8").strip()
             if brand_text:
                 zf.writestr("brand.md", brand_text + "\n")
+
+        # v4: per-deck theme.yaml (palette + fonts). Informational for
+        # the agent. Skipped silently for any deck without one (pre-v4
+        # ingest output).
+        for theme_yaml in sorted((WORKSPACE / "decks").glob("*/theme.yaml")):
+            deck_name = theme_yaml.parent.name
+            zf.write(theme_yaml, f"decks/{deck_name}/theme.yaml")
 
         for sd in slides_meta:
             tid = sd["id"]
