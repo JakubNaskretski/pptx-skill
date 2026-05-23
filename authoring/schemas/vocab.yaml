@@ -1,0 +1,71 @@
+# Controlled vocabulary — single source of truth.
+#
+# Anything that enumerates `feel` / `suitable_for` / `kind` /
+# `composition` should read from this file:
+#   - authoring/cli.py            loads at import time
+#   - authoring/app.py            exposes via /api/vocab to the UI
+#   - authoring/prompts/*.md      human-edited; validate checks drift
+#   - consumer/SKILL.md           hand-maintained mirror; keep in sync
+#
+# Slide-feel and asset-feel are deliberately DIFFERENT sets. Slides
+# don't get `playful`/`minimal`/`dramatic`; assets don't get
+# `data-dense`/`celebratory`. Do not merge them — an agent filtering
+# `feel=playful` on slides will silently return zero results.
+
+slide:
+  feel:
+    - formal
+    - punchy
+    - data-dense
+    - warm
+    - clinical
+    - celebratory
+  suitable_for:
+    - opener
+    - section_divider
+    - content
+    - data
+    - quote
+    - closing
+    - product
+    - team
+
+asset:
+  kind:
+    - photo
+    - icon
+    - logo
+    - illustration
+    - screenshot
+  feel:
+    - formal
+    - warm
+    - clinical
+    - punchy
+    - playful
+    - minimal
+    - dramatic
+  composition:
+    - centered
+    - left-weighted
+    - right-weighted
+    - full-bleed
+    - top-heavy
+    - scattered
+  suitable_for:
+    - team
+    - hero
+    - product
+    - data
+    - culture
+    - event
+    - abstract
+    - decorative
+    - closing
+    - quote
+  scope_prefixes:
+    - client
+    - industry
+    - product
+    - program
+    - topic

@@ -70,10 +70,20 @@ def asset_meta_path(aid: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def parse_filter(s: str | None) -> dict[str, str]:
+UNSET_SENTINEL = "none"
+
+
+def parse_filter(s: str | None) -> dict[str, list[str]]:
+    """Parse `k1=v1,k2=v2|v3` into {k1: [v1], k2: [v2, v3]}.
+
+    Pipe (`|`) expresses OR within a key. The literal value `none`
+    matches items where the field is missing or empty — useful to
+    include un-tagged items (`feel=warm|none`) or to audit them
+    explicitly (`feel=none`).
+    """
     if not s:
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, list[str]] = {}
     for chunk in s.split(","):
         chunk = chunk.strip()
         if not chunk:
@@ -81,20 +91,36 @@ def parse_filter(s: str | None) -> dict[str, str]:
         if "=" not in chunk:
             raise SystemExit(f"bad --filter token (need key=value): {chunk!r}")
         k, v = chunk.split("=", 1)
-        out[k.strip()] = v.strip()
+        out[k.strip()] = [x.strip() for x in v.split("|") if x.strip()]
     return out
 
 
-def matches_filter(item: dict, flt: dict[str, str]) -> bool:
-    for k, want in flt.items():
-        if k not in item:
+def _field_is_unset(got: Any) -> bool:
+    if got is None:
+        return True
+    if isinstance(got, (str, list, dict)) and not got:
+        return True
+    return False
+
+
+def matches_filter(item: dict, flt: dict[str, list[str]]) -> bool:
+    for k, wants in flt.items():
+        unset_ok = UNSET_SENTINEL in wants
+        explicit = [w for w in wants if w != UNSET_SENTINEL]
+        if k not in item or _field_is_unset(item.get(k)):
+            if unset_ok:
+                continue
+            return False
+        if not explicit:
+            # Filter was `k=none` only and the field IS set → exclude.
             return False
         got = item[k]
         if isinstance(got, list):
-            if want not in [str(x) for x in got]:
+            got_strs = [str(x) for x in got]
+            if not any(w in got_strs for w in explicit):
                 return False
         else:
-            if str(got) != want:
+            if str(got) not in explicit:
                 return False
     return True
 

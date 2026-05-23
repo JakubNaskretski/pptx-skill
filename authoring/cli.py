@@ -15,12 +15,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote
+from xml.etree import ElementTree as ET
 
 import click
 import yaml
@@ -72,8 +75,6 @@ def aspect_ratio(width: int, height: int) -> str:
         "1:1": 1.0,
         "3:4": 3 / 4,
         "9:16": 9 / 16,
-        "3:2": 3 / 2,
-        "2:3": 2 / 3,
     }
     best, best_err = "free", 0.10  # tolerance
     for name, target in candidates.items():
@@ -83,10 +84,16 @@ def aspect_ratio(width: int, height: int) -> str:
     return best
 
 
-def position_quadrant(left: int, top: int, slide_w: int, slide_h: int) -> str:
-    """Coarse position: left/center/right + top/middle/bottom."""
-    cx = left + 0  # we use top-left for orientation
-    cy = top + 0
+def position_quadrant(
+    left: int, top: int, width: int, height: int, slide_w: int, slide_h: int
+) -> str:
+    """Coarse position: left/center/right + top/middle/bottom.
+
+    Uses the shape's visual center, not its top-left, so a wide shape
+    spanning the slide doesn't get mislabelled by its anchor corner.
+    """
+    cx = left + width // 2
+    cy = top + height // 2
     if cx < slide_w / 3:
         h = "left"
     elif cx < 2 * slide_w / 3:
@@ -242,7 +249,9 @@ def infer_layout(slide, slots: list[dict], renames: dict, slide_w: int, slide_h:
             continue
         left = shape.left or 0
         top = shape.top or 0
-        pos = position_quadrant(left, top, slide_w, slide_h)
+        width = shape.width or 0
+        height = shape.height or 0
+        pos = position_quadrant(left, top, width, height, slide_w, slide_h)
         parts.append(f"{sid}@{pos}")
     return ", ".join(parts) if parts else "freeform"
 
@@ -253,6 +262,10 @@ def write_slide_fragment(src_path: Path, slide_idx: int, out_path: Path, renames
     The fragment keeps its slide masters/layouts so it can be re-composed.
     `renames` maps shape_id -> name we want to set so the consumer can
     locate slots at compose time.
+
+    After python-pptx writes the package, we garbage-collect orphan
+    parts (other slides' media, layouts no slide references, etc.) so
+    each fragment carries only what its slide actually needs.
     """
     prs = Presentation(str(src_path))
 
@@ -266,7 +279,9 @@ def write_slide_fragment(src_path: Path, slide_idx: int, out_path: Path, renames
                 except Exception:
                     pass
 
-    # Drop every other slide.
+    # Drop every other slide from sldIdLst + the package relationship.
+    # KeyError is the only python-pptx-documented failure for drop_rel
+    # (rId already gone); anything else is real and should surface.
     sld_id_list = prs.slides._sldIdLst
     sld_ids = list(sld_id_list)
     for i, sld_id in enumerate(sld_ids):
@@ -276,11 +291,237 @@ def write_slide_fragment(src_path: Path, slide_idx: int, out_path: Path, renames
         sld_id_list.remove(sld_id)
         try:
             prs.part.drop_rel(rId)
-        except Exception:
+        except KeyError:
             pass
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(out_path))
+
+    # Prune orphans introduced by python-pptx's "leave parts behind" model.
+    prune_unreachable_parts(out_path)
+
+
+# --- Fragment GC: keep only parts reachable from /_rels/.rels ---------------
+#
+# python-pptx's save() prunes unused layout *rels* when it writes a
+# fragment (e.g. all the layouts other slides used) but leaves orphan
+# `<p:sldLayoutId>` entries inside the master XML. Those orphans then
+# point to rIds that no longer exist — and python-pptx (and PowerPoint)
+# blow up when iterating the master's layouts. It also leaves any other
+# orphan parts (notes themes, dropped images, etc.) inside the zip.
+#
+# This pass:
+#  1. For each master, removes `<p:sldLayoutId>` entries whose r:id is
+#     no longer in the master's rels file.
+#  2. Walks /_rels/.rels through every part's rels, collecting the
+#     closure of reachable parts.
+#  3. Filters `[Content_Types].xml` Override entries to match.
+#  4. Rewrites the zip with only reachable parts.
+
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def _rels_path_for(part_path: str) -> str:
+    dir_part, _, name = part_path.rpartition("/")
+    return f"{dir_part}/_rels/{name}.rels" if dir_part else f"_rels/{name}.rels"
+
+
+def _resolve_rel(rels_path: str, target: str) -> str:
+    target = unquote(target)
+    if rels_path == "_rels/.rels":
+        base = ""
+    else:
+        base = posixpath.dirname(posixpath.dirname(rels_path))
+    if target.startswith("/"):
+        return posixpath.normpath(target.lstrip("/"))
+    return posixpath.normpath(posixpath.join(base, target)) if base else target
+
+
+def _parse_rels(xml_bytes: bytes) -> list[tuple[str, str]]:
+    """Return list of (target, type) for non-External relationships."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return []
+    out: list[tuple[str, str]] = []
+    for rel in root.findall(f"{{{_REL_NS}}}Relationship"):
+        if rel.get("TargetMode") == "External":
+            continue
+        out.append((rel.get("Target", ""), rel.get("Type", "")))
+    return out
+
+
+_PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+# `r:` inside document XML (slideMaster.xml, presentation.xml, etc.)
+# binds to officeDocument/relationships — distinct from the package
+# /relationships namespace used by .rels files themselves.
+_DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _valid_rids(rels_xml: bytes) -> set[str]:
+    """Return the Id set declared by a rels file."""
+    try:
+        root = ET.fromstring(rels_xml)
+    except ET.ParseError:
+        return set()
+    return {rel.get("Id", "") for rel in root.findall(f"{{{_REL_NS}}}Relationship")}
+
+
+def _layouts_used_by_slides(zf: zipfile.ZipFile, names: list[str]) -> set[str]:
+    """Layouts referenced via rels by any slide still in the package."""
+    used: set[str] = set()
+    names_set = set(names)
+    for name in names:
+        if not (name.startswith("ppt/slides/slide") and name.endswith(".xml")):
+            continue
+        rels_path = _rels_path_for(name)
+        if rels_path not in names_set:
+            continue
+        for target, rtype in _parse_rels(zf.read(rels_path)):
+            if rtype.endswith("/slideLayout"):
+                used.add(_resolve_rel(rels_path, target))
+    return used
+
+
+def _prune_master_rels(rels_xml: bytes, rels_path: str, kept_layouts: set[str]) -> bytes:
+    """Drop slideLayout rels not in kept_layouts. Returns rels_xml unchanged
+    if nothing to drop (identity-comparable)."""
+    try:
+        root = ET.fromstring(rels_xml)
+    except ET.ParseError:
+        return rels_xml
+    changed = False
+    for rel in list(root.findall(f"{{{_REL_NS}}}Relationship")):
+        if not rel.get("Type", "").endswith("/slideLayout"):
+            continue
+        if _resolve_rel(rels_path, rel.get("Target", "")) not in kept_layouts:
+            root.remove(rel)
+            changed = True
+    if not changed:
+        return rels_xml
+    ET.register_namespace("", _REL_NS)
+    return b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + \
+        ET.tostring(root, encoding="utf-8")
+
+
+def _repair_master_xml(master_xml: bytes, valid_rids: set[str]) -> bytes:
+    """Drop <p:sldLayoutId> entries whose r:id is no longer in the master's
+    rels. python-pptx trims unused layouts from the rels file when it
+    saves a fragment, but leaves orphan sldLayoutId entries in the master
+    XML — which then break loading because each sldLayoutId is resolved
+    via its rId."""
+    try:
+        root = ET.fromstring(master_xml)
+    except ET.ParseError:
+        return master_xml
+    rid_attr = f"{{{_DOC_REL_NS}}}id"
+    changed = False
+    for lst in root.findall(f"{{{_PML_NS}}}sldLayoutIdLst"):
+        for entry in list(lst.findall(f"{{{_PML_NS}}}sldLayoutId")):
+            if entry.get(rid_attr) not in valid_rids:
+                lst.remove(entry)
+                changed = True
+    if not changed:
+        return master_xml
+    ET.register_namespace("p", _PML_NS)
+    ET.register_namespace("a", _DML_NS)
+    ET.register_namespace("r", _DOC_REL_NS)
+    return b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + \
+        ET.tostring(root, encoding="utf-8")
+
+
+def _master_xml_path_for_rels(rels_path: str) -> str:
+    # 'ppt/slideMasters/_rels/slideMaster1.xml.rels'
+    # -> 'ppt/slideMasters/slideMaster1.xml'
+    parent = posixpath.dirname(posixpath.dirname(rels_path))
+    name = posixpath.basename(rels_path)
+    if name.endswith(".rels"):
+        name = name[: -len(".rels")]
+    return f"{parent}/{name}"
+
+
+def prune_unreachable_parts(pptx_path: Path) -> tuple[int, int]:
+    """Rewrite a .pptx in place, keeping only parts reachable from the
+    package root rels. Returns (kept, removed) part counts."""
+    with zipfile.ZipFile(pptx_path, "r") as zf:
+        all_names = list(zf.namelist())
+        name_set = set(all_names)
+
+        # Active pruning + orphan repair for each master.
+        # 1. Drop slideLayout rels not used by any surviving slide.
+        # 2. Then drop <p:sldLayoutId> entries in the master XML pointing
+        #    to rIds that no longer exist (covers both our prune AND any
+        #    orphans python-pptx left behind from its own save logic).
+        kept_layouts = _layouts_used_by_slides(zf, all_names)
+        rewritten: dict[str, bytes] = {}
+        for name in all_names:
+            if "/slideMasters/_rels/" not in name or not name.endswith(".rels"):
+                continue
+            master_xml_path = _master_xml_path_for_rels(name)
+            if master_xml_path not in name_set:
+                continue
+
+            original_rels = zf.read(name)
+            new_rels = _prune_master_rels(original_rels, name, kept_layouts)
+            if new_rels is not original_rels:
+                rewritten[name] = new_rels
+
+            valid = _valid_rids(new_rels)
+            original_master = zf.read(master_xml_path)
+            repaired = _repair_master_xml(original_master, valid)
+            if repaired is not original_master:
+                rewritten[master_xml_path] = repaired
+
+        reachable: set[str] = set()
+        for keep in ("[Content_Types].xml", "_rels/.rels"):
+            if keep in name_set:
+                reachable.add(keep)
+
+        queue: list[str] = ["_rels/.rels"]
+        seen_rels: set[str] = set()
+        while queue:
+            rels_path = queue.pop(0)
+            if rels_path in seen_rels or rels_path not in name_set:
+                continue
+            seen_rels.add(rels_path)
+            reachable.add(rels_path)
+            xml = rewritten.get(rels_path, zf.read(rels_path))
+            for target, _ in _parse_rels(xml):
+                resolved = _resolve_rel(rels_path, target)
+                if resolved in name_set and resolved not in reachable:
+                    reachable.add(resolved)
+                    part_rels = _rels_path_for(resolved)
+                    if part_rels in name_set and part_rels not in seen_rels:
+                        queue.append(part_rels)
+
+        try:
+            ct_root = ET.fromstring(zf.read("[Content_Types].xml"))
+            for override in list(ct_root.findall(f"{{{_CT_NS}}}Override")):
+                pn = override.get("PartName", "").lstrip("/")
+                if pn not in reachable:
+                    ct_root.remove(override)
+            ET.register_namespace("", _CT_NS)
+            new_ct = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + \
+                ET.tostring(ct_root, encoding="utf-8")
+        except ET.ParseError:
+            new_ct = zf.read("[Content_Types].xml")
+
+        tmp_path = pptx_path.with_suffix(pptx_path.suffix + ".pruning")
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf_out:
+            for name in all_names:
+                if name not in reachable:
+                    continue
+                if name == "[Content_Types].xml":
+                    zf_out.writestr(name, new_ct)
+                elif name in rewritten:
+                    zf_out.writestr(name, rewritten[name])
+                else:
+                    zf_out.writestr(name, zf.read(name))
+
+    tmp_path.replace(pptx_path)
+    return len(reachable), len(name_set) - len(reachable)
 
 
 def write_slide_yaml_stub(out_path: Path, slide_id: str, layout: str, slots: list[dict], deck_stem: str, slide_number: int) -> None:
@@ -374,24 +615,24 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
 
 
 SLIDE_REQUIRED = ("intent", "feel", "suitable_for")
-SLIDE_FEEL_ENUM = {"formal", "punchy", "data-dense", "warm", "clinical", "celebratory"}
-SLIDE_SUITABLE_ENUM = {
-    "opener", "section_divider", "content", "data", "quote",
-    "closing", "product", "team",
-}
-
 ASSET_REQUIRED = ("kind", "subject", "feel", "composition", "colors", "scope", "suitable_for")
-ASSET_KIND_ENUM = {"photo", "icon", "logo", "illustration", "screenshot"}
-ASSET_FEEL_ENUM = {"formal", "warm", "clinical", "punchy", "playful", "minimal", "dramatic"}
-ASSET_COMPOSITION_ENUM = {
-    "centered", "left-weighted", "right-weighted",
-    "full-bleed", "top-heavy", "scattered",
-}
-ASSET_SUITABLE_ENUM = {
-    "team", "hero", "product", "data", "culture", "event",
-    "abstract", "decorative", "closing", "quote",
-}
-ASSET_SCOPE_PREFIXES = {"client", "industry", "product", "program", "topic"}
+
+VOCAB_PATH = SCHEMAS / "vocab.yaml"
+
+
+def _load_vocab() -> dict:
+    with VOCAB_PATH.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+VOCAB = _load_vocab()
+SLIDE_FEEL_ENUM = set(VOCAB["slide"]["feel"])
+SLIDE_SUITABLE_ENUM = set(VOCAB["slide"]["suitable_for"])
+ASSET_KIND_ENUM = set(VOCAB["asset"]["kind"])
+ASSET_FEEL_ENUM = set(VOCAB["asset"]["feel"])
+ASSET_COMPOSITION_ENUM = set(VOCAB["asset"]["composition"])
+ASSET_SUITABLE_ENUM = set(VOCAB["asset"]["suitable_for"])
+ASSET_SCOPE_PREFIXES = set(VOCAB["asset"]["scope_prefixes"])
 
 
 def _missing_or_empty(data: dict, keys: Iterable[str]) -> list[str]:
@@ -621,12 +862,41 @@ def prompt(kind: str) -> None:
 # --- validate --------------------------------------------------------------
 
 
+def check_prompt_drift() -> list[str]:
+    """Warn if a vocab enum value is missing from its prompt markdown."""
+    pairs = [
+        (PROMPTS / "describe_slide.md", "slide.feel", VOCAB["slide"]["feel"]),
+        (PROMPTS / "describe_slide.md", "slide.suitable_for", VOCAB["slide"]["suitable_for"]),
+        (PROMPTS / "describe_asset.md", "asset.kind", VOCAB["asset"]["kind"]),
+        (PROMPTS / "describe_asset.md", "asset.feel", VOCAB["asset"]["feel"]),
+        (PROMPTS / "describe_asset.md", "asset.composition", VOCAB["asset"]["composition"]),
+        (PROMPTS / "describe_asset.md", "asset.suitable_for", VOCAB["asset"]["suitable_for"]),
+    ]
+    errs: list[str] = []
+    for path, label, values in pairs:
+        if not path.exists():
+            errs.append(f"{path.name}: missing prompt file")
+            continue
+        text = path.read_text(encoding="utf-8")
+        missing = [v for v in values if v not in text]
+        if missing:
+            errs.append(
+                f"{path.name}: {label} missing value(s) {missing} "
+                f"(update prompt to match schemas/vocab.yaml)"
+            )
+    return errs
+
+
 @cli.command()
 def validate() -> None:
     """Schema-check every YAML; auto-promote complete ones to done."""
     failures: list[tuple[Path, list[str]]] = []
     promoted = 0
     total = 0
+
+    drift = check_prompt_drift()
+    if drift:
+        failures.append((VOCAB_PATH, drift))
 
     for p in iter_slide_yamls():
         total += 1
@@ -671,15 +941,135 @@ def validate() -> None:
         sys.exit(1)
 
 
+# --- slide rendering -------------------------------------------------------
+#
+# Slide fragments are rendered to PNGs by the first available backend.
+# Priority: PowerPoint COM (Windows, best fidelity if installed) →
+# LibreOffice headless (any OS) → macOS Quick Look. Both `cli.py preview`
+# and the bulk-batch flow in `app.py` go through `render_slide_to_png`.
+
+
+def _render_via_powerpoint_com(slide_pptx: Path, out_png: Path, size: int) -> bool:
+    if sys.platform != "win32":
+        return False
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        return False
+    # PowerShell accepts forward slashes on Windows, sidesteps quoting.
+    src = str(slide_pptx.resolve()).replace("\\", "/")
+    dst = str(out_png.resolve()).replace("\\", "/")
+    height = int(size * 9 / 16)  # assume 16:9; aspect drift fine for thumbnails
+    script = (
+        '$ErrorActionPreference = "Stop"; '
+        '$pp = New-Object -ComObject PowerPoint.Application; '
+        f'$deck = $pp.Presentations.Open("{src}", $true, $true, $false); '
+        f'$deck.Slides.Item(1).Export("{dst}", "PNG", {size}, {height}); '
+        '$deck.Close(); $pp.Quit();'
+    )
+    try:
+        subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return out_png.exists()
+
+
+def _render_via_libreoffice(slide_pptx: Path, out_png: Path, size: int) -> bool:
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return False
+    out_dir = out_png.parent
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--convert-to", "png",
+             "--outdir", str(out_dir), str(slide_pptx)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    produced = out_dir / f"{slide_pptx.stem}.png"
+    if produced != out_png and produced.exists():
+        produced.replace(out_png)
+    return out_png.exists()
+
+
+def _render_via_qlmanage(slide_pptx: Path, out_png: Path, size: int) -> bool:
+    if sys.platform != "darwin":
+        return False
+    ql = shutil.which("qlmanage")
+    if not ql:
+        return False
+    out_dir = out_png.parent
+    try:
+        subprocess.run(
+            [ql, "-t", "-s", str(size), "-o", str(out_dir), str(slide_pptx)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    # qlmanage writes <name>.pptx.png; normalise to <stem>.png.
+    produced = out_dir / f"{slide_pptx.name}.png"
+    if produced != out_png and produced.exists():
+        produced.replace(out_png)
+    return out_png.exists()
+
+
+_RENDERERS = (
+    ("PowerPoint COM (Windows)", _render_via_powerpoint_com),
+    ("LibreOffice (soffice)", _render_via_libreoffice),
+    ("macOS Quick Look (qlmanage)", _render_via_qlmanage),
+)
+
+
+def render_slide_to_png(
+    slide_pptx: Path, out_png: Path | None = None, size: int = 1200
+) -> Path | None:
+    """Render a single-slide .pptx to a PNG. Returns the PNG path on
+    success, None if no backend could produce one. Cached by mtime."""
+    if out_png is None:
+        out_png = slide_pptx.with_suffix(".png")
+    if out_png.exists() and out_png.stat().st_mtime >= slide_pptx.stat().st_mtime:
+        return out_png
+    for _name, fn in _RENDERERS:
+        if fn(slide_pptx, out_png, size):
+            return out_png
+    return None
+
+
+def available_renderers() -> list[str]:
+    """Human-readable list of slide-rendering backends that *look* usable
+    (binaries on PATH; doesn't verify PowerPoint is actually installed)."""
+    out: list[str] = []
+    if sys.platform == "win32" and (shutil.which("powershell") or shutil.which("pwsh")):
+        out.append("PowerPoint COM (Windows; requires PowerPoint installed)")
+    if shutil.which("soffice") or shutil.which("libreoffice"):
+        out.append("LibreOffice (soffice)")
+    if sys.platform == "darwin" and shutil.which("qlmanage"):
+        out.append("macOS Quick Look (qlmanage)")
+    return out
+
+
 # --- preview ---------------------------------------------------------------
 
 
 @cli.command()
 def preview() -> None:
-    """Best-effort PNG thumbnails of slide fragments via LibreOffice."""
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        click.echo("preview: LibreOffice not installed — skipping", err=True)
+    """Best-effort PNG thumbnails of slide fragments. Tries PowerPoint
+    (Windows), LibreOffice, then macOS Quick Look in order."""
+    if not available_renderers():
+        click.echo(
+            "preview: no slide renderer available — install LibreOffice, "
+            "or use PowerPoint on Windows",
+            err=True,
+        )
         return
 
     decks = WORKSPACE / "decks"
@@ -690,28 +1080,8 @@ def preview() -> None:
     n_built = 0
     n_failed = 0
     for slide_pptx in sorted(decks.glob("*/slides/slide_*.pptx")):
-        out_dir = slide_pptx.parent
-        png_target = slide_pptx.with_suffix(".png")
-        if png_target.exists() and png_target.stat().st_mtime >= slide_pptx.stat().st_mtime:
-            continue
-        # LibreOffice exits 0 even when it can't load the source. Verify
-        # the output file actually appeared before counting it as built.
-        try:
-            subprocess.run(
-                [
-                    soffice, "--headless", "--convert-to", "png",
-                    "--outdir", str(out_dir), str(slide_pptx),
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
-        except (subprocess.SubprocessError, OSError) as e:
-            click.echo(f"preview: failed for {slide_pptx.name}: {e}", err=True)
-            n_failed += 1
-            continue
-        if png_target.exists():
+        png = render_slide_to_png(slide_pptx)
+        if png is not None:
             n_built += 1
         else:
             n_failed += 1
@@ -799,6 +1169,7 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
     reader_src = CONSUMER / "reader.py"
     skill_md = CONSUMER / "SKILL.md"
     consumer_reqs = CONSUMER / "requirements.txt"
+    brand_md = HERE / "brand.md"
     if not reader_src.exists() or not skill_md.exists():
         raise click.ClickException(
             "consumer/reader.py or SKILL.md missing — cannot build zip"
@@ -812,6 +1183,10 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
         if consumer_reqs.exists():
             zf.writestr("requirements.txt", consumer_reqs.read_text(encoding="utf-8"))
         zf.writestr("index.json", json.dumps(index, indent=2, ensure_ascii=False))
+        if brand_md.exists():
+            brand_text = brand_md.read_text(encoding="utf-8").strip()
+            if brand_text:
+                zf.writestr("brand.md", brand_text + "\n")
 
         for sd in slides_meta:
             tid = sd["id"]

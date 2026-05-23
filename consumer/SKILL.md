@@ -21,6 +21,9 @@ file.
 
 ## Agent workflow
 
+0. **Read brand rules.** If `brand.md` is present, read it once up
+   front. It carries palette / voice / style constraints that should
+   shape every text choice and template pick.
 1. **Plan the deck.** Decide slide sequence: opener → content → closer.
 2. **Find templates.** `list --filter suitable_for=opener,feel=punchy`
    returns matching items.
@@ -77,24 +80,35 @@ correct input keeps your plan readable and avoids surprises.
 Both templates and assets expose:
 
 - `intent` (templates) / `subject` (assets) — what it is
-- `feel` — `formal`, `punchy`, `data-dense`, `warm`, `clinical`,
-  `minimal`, `playful`, `dramatic`, `celebratory`
-- `suitable_for` — `opener`, `section_divider`, `content`, `data`,
-  `quote`, `closing`, `product`, `team`, `hero`, `culture`, `event`,
-  `abstract`, `decorative`
+- `feel` — slide-feel and asset-feel are **separate** sets:
+  - templates: `formal`, `punchy`, `data-dense`, `warm`, `clinical`,
+    `celebratory`
+  - assets: `formal`, `warm`, `clinical`, `punchy`, `playful`,
+    `minimal`, `dramatic`
+- `suitable_for` — also split by kind:
+  - templates: `opener`, `section_divider`, `content`, `data`,
+    `quote`, `closing`, `product`, `team`
+  - assets: `team`, `hero`, `product`, `data`, `culture`, `event`,
+    `abstract`, `decorative`, `closing`, `quote`
 - `kind` (assets) — `photo`, `icon`, `logo`, `illustration`,
   `screenshot`
 - `composition` (assets) — `centered`, `left-weighted`,
   `right-weighted`, `full-bleed`, `top-heavy`, `scattered`
 - `colors` (assets) — dominant palette words
 
-`--filter` accepts comma-separated `key=value` pairs. List values
-match if any element equals the filter value.
+`--filter` accepts comma-separated `key=value` pairs. List-valued
+fields match if any element equals the filter value. Within a
+single key, `|` expresses OR: `feel=warm|formal` matches either.
+The literal value `none` matches items where the field is missing
+or empty — use it to include un-tagged items (`feel=warm|none`)
+or to find them explicitly (`feel=none`). By default, missing or
+empty fields do *not* match an explicit value.
 
 ## Files
 
 ```
 SKILL.md              this file
+brand.md              optional — palette/voice/style rules to apply when composing
 index.json            flat list of all templates + assets + tags
 templates/<id>/
   slide.pptx          reusable slide fragment

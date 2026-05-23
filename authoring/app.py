@@ -82,28 +82,7 @@ def _items() -> dict:
 
 
 def _ensure_slide_png(slide_pptx: Path) -> Path | None:
-    png = slide_pptx.with_suffix(".png")
-    if png.exists() and png.stat().st_mtime >= slide_pptx.stat().st_mtime:
-        return png
-    ql = shutil.which("qlmanage")
-    if not ql:
-        return None
-    try:
-        subprocess.run(
-            [ql, "-t", "-s", "1200", "-o", str(slide_pptx.parent), str(slide_pptx)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return None
-    # qlmanage writes <stem>.pptx.png — rename to <stem>.png so it matches
-    # the convention used by `cli.py preview` and `cli.py build`.
-    produced = slide_pptx.parent / f"{slide_pptx.name}.png"
-    if produced.exists():
-        produced.replace(png)
-    return png if png.exists() else None
+    return cli_mod.render_slide_to_png(slide_pptx)
 
 
 def _asset_binary(yaml_path: Path) -> Path | None:
@@ -135,9 +114,12 @@ def _descriptive_yaml(data: dict, kind: str) -> str:
 
 
 def _strip_yaml_fence(txt: str) -> str:
+    """Strip ```yaml / ```json / bare ``` code fences from LLM output."""
     txt = txt.strip()
     if txt.startswith("```yaml"):
         txt = txt[len("```yaml"):].lstrip()
+    elif txt.startswith("```json"):
+        txt = txt[len("```json"):].lstrip()
     elif txt.startswith("```"):
         txt = txt[3:].lstrip()
     if txt.endswith("```"):
@@ -247,110 +229,50 @@ def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
     item_name = "image" if kind == "asset" else "slide preview"
     if kind == "asset":
         sample_block = (
-            '"01":\n'
-            '  kind: photo\n'
-            '  subject: "..."\n'
-            '  depicts: "..."\n'
-            '  feel: warm\n'
-            '  composition: centered\n'
-            '  colors: [navy, white]\n'
-            '  scope: [generic]\n'
-            '  suitable_for: [team]\n'
-            '  notes: ""\n'
-            '\n'
-            '"02":\n'
-            '  kind: photo\n'
-            '  # ... same fields ...\n'
+            '{\n'
+            '  "01": {\n'
+            '    "kind": "photo",\n'
+            '    "subject": "...",\n'
+            '    "depicts": "...",\n'
+            '    "feel": "warm",\n'
+            '    "composition": "centered",\n'
+            '    "colors": ["navy", "white"],\n'
+            '    "scope": ["generic"],\n'
+            '    "suitable_for": ["team"],\n'
+            '    "notes": ""\n'
+            '  },\n'
+            '  "02": { "kind": "photo", "...": "same fields" }\n'
+            '}\n'
         )
     else:
         sample_block = (
-            '"01":\n'
-            '  intent: "..."\n'
-            '  feel: formal\n'
-            '  suitable_for: [opener]\n'
-            '  notes: ""\n'
-            '\n'
-            '"02":\n'
-            '  intent: "..."\n'
-            '  # ... same fields ...\n'
+            '{\n'
+            '  "01": {\n'
+            '    "intent": "...",\n'
+            '    "feel": "formal",\n'
+            '    "suitable_for": ["opener"],\n'
+            '    "notes": ""\n'
+            '  },\n'
+            '  "02": { "intent": "...", "...": "same fields" }\n'
+            '}\n'
         )
     return (
         f"# Bulk describe batch — {n} {item_name}s\n\n"
         f"You will see {n} {item_name}s numbered 01 through {n:02d}. For each, "
         f"produce a description following the schema in the second half of "
         f"this file.\n\n"
-        f"## CRITICAL — Output format rules\n\n"
-        f"Return ONE YAML mapping. The top-level keys MUST be the quoted "
-        f"2-digit ids: `\"01\"`, `\"02\"`, ..., `\"{n:02d}\"`.\n\n"
-        f"**Every per-item field MUST be indented by exactly 2 spaces under "
-        f"its id.** Failure to indent breaks the parser and the response "
-        f"will be unusable.\n\n"
-        f"### CORRECT (note the 2-space indent before each field):\n\n"
-        f"```yaml\n{sample_block}```\n\n"
-        f"### INCORRECT — do NOT do this:\n\n"
-        f"```yaml\n"
-        f'"01":\n'
-        f'intent: "..."     # WRONG — must be indented under "01"\n'
-        f'feel: formal      # WRONG\n'
-        f'"02":\n'
-        f'intent: "..."     # WRONG\n'
-        f"```\n\n"
+        f"## Output format\n\n"
+        f"Return ONE JSON object. Top-level keys are the quoted 2-digit ids "
+        f"(`\"01\"`, `\"02\"`, ..., `\"{n:02d}\"`); each value is an object "
+        f"holding that item's fields.\n\n"
+        f"```json\n{sample_block}```\n\n"
         f"Return EXACTLY {n} entries, one per item. Do NOT skip any. Output "
-        f"ONLY the YAML mapping. No commentary, no markdown code fences, no "
+        f"ONLY the JSON object. No commentary, no markdown code fences, no "
         f"prose before or after.\n\n"
         f"---\n\n"
         f"## Per-item description schema\n\n"
         f"{per_item_prompt}\n"
     )
-
-
-_FLAT_ID_RE = None
-
-
-def _recover_flat_batch_yaml(raw_text: str) -> str:
-    """LLMs often emit per-item fields at column 0 instead of indented under
-    each id key. Detect that pattern and re-indent before parsing.
-
-    Returns either the original text (no fixup needed) or a re-indented
-    version that PyYAML can parse correctly.
-    """
-    import re
-    global _FLAT_ID_RE
-    if _FLAT_ID_RE is None:
-        _FLAT_ID_RE = re.compile(r'^"?(\d{1,4})"?\s*:\s*$')
-    lines = raw_text.split("\n")
-    id_lines = [i for i, ln in enumerate(lines) if _FLAT_ID_RE.match(ln)]
-    if len(id_lines) < 2:
-        return raw_text
-    # Need recovery if any non-blank, non-id line between id lines starts at col 0
-    needs = False
-    in_block = False
-    for ln in lines:
-        if _FLAT_ID_RE.match(ln):
-            in_block = True
-            continue
-        if not in_block or ln.strip() == "":
-            continue
-        if not ln.startswith((" ", "\t")):
-            needs = True
-            break
-    if not needs:
-        return raw_text
-    out = []
-    in_block = False
-    for ln in lines:
-        if _FLAT_ID_RE.match(ln):
-            in_block = True
-            out.append(ln)
-            continue
-        if not in_block:
-            out.append(ln)
-            continue
-        if ln.strip() == "" or ln.startswith((" ", "\t")):
-            out.append(ln)
-            continue
-        out.append("  " + ln)
-    return "\n".join(out)
 
 
 @app.post("/api/batch/create")
@@ -404,10 +326,17 @@ def api_batch_create():
                         continue
                     png = _ensure_slide_png(slide_pptx)
                     if png is None:
-                        if not shutil.which("qlmanage"):
-                            reason = "qlmanage not available (install macOS or run preview manually)"
+                        available = cli_mod.available_renderers()
+                        if not available:
+                            reason = (
+                                "no slide renderer available — install "
+                                "LibreOffice, or use PowerPoint on Windows"
+                            )
                         else:
-                            reason = "qlmanage failed to render this slide"
+                            reason = (
+                                f"slide rendering failed (tried: "
+                                f"{', '.join(available)})"
+                            )
                         skipped.append({"yaml": rel, "reason": reason})
                         continue
                     key = f"{added + 1:02d}"
@@ -503,13 +432,12 @@ def api_batch_apply(batch_id):
 
     body = request.get_json(force=True) or {}
     txt = _strip_yaml_fence(body.get("text", ""))
-    txt = _recover_flat_batch_yaml(txt)
     try:
-        parsed = yaml.safe_load(txt) if txt else None
+        parsed = json_mod.loads(txt) if txt else None
     except Exception as e:
-        return jsonify({"error": f"YAML parse error: {e}"}), 400
+        return jsonify({"error": f"JSON parse error: {e}"}), 400
     if not isinstance(parsed, (dict, list)):
-        return jsonify({"error": "expected a YAML mapping or list at top level"}), 400
+        return jsonify({"error": "expected a JSON object or array at top level"}), 400
 
     items_dict = _find_items_dict(parsed) or {}
     found_keys = [str(k) for k in items_dict.keys()]
@@ -863,6 +791,11 @@ def api_compose_text():
     return jsonify({"text": _flat_prompt_text(slides, assets, brief)})
 
 
+@app.get("/api/vocab")
+def api_vocab():
+    return jsonify(cli_mod.VOCAB)
+
+
 @app.get("/api/compose/brand")
 def api_compose_brand_get():
     return jsonify({"text": _read_brand(), "path": str(BRAND_PATH.relative_to(HERE))})
@@ -1151,7 +1084,7 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Bulk describe</h2>
       <p style="color:#666;font-size:13px;margin-top:0;">
         Package the next N pending items into a zip you can hand to a vision
-        LLM. The model returns one YAML mapping; paste it back below to apply
+        LLM. The model returns one JSON object; paste it back below to apply
         all descriptions at once.
       </p>
       <div class="inline">
@@ -1173,7 +1106,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="card">
       <h2>Apply LLM response</h2>
       <p style="color:#666;font-size:12px;">
-        Paste the YAML mapping the LLM returned. Items are matched by id
+        Paste the JSON object the LLM returned. Items are matched by id
         (<code>"01"</code>, <code>"02"</code>, …) against the selected
         batch's saved manifest. Each entry is validated independently;
         entries that pass auto-promote to <code>done</code>.
@@ -1185,7 +1118,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="ghost" id="batchRefreshBtn">↻</button>
         <span id="batchTargetLabel" style="color:#888;font-size:12px;"></span>
       </div>
-      <textarea id="batchYaml" placeholder='"01":&#10;  kind: photo&#10;  subject: ...&#10;&#10;"02":&#10;  ...'></textarea>
+      <textarea id="batchYaml" placeholder='{&#10;  "01": { "kind": "photo", "subject": "..." },&#10;  "02": { ... }&#10;}'></textarea>
       <div class="btnrow" style="margin-top:10px;">
         <button class="primary" id="batchApplyBtn">Apply batch</button>
       </div>
@@ -1229,12 +1162,27 @@ INDEX_HTML = r"""<!doctype html>
   </section>
 
 <script>
-const SLIDE_FEEL = ["formal","punchy","data-dense","warm","clinical","celebratory"];
-const SLIDE_TAGS = ["opener","section_divider","content","data","quote","closing","product","team"];
-const ASSET_KIND = ["photo","icon","logo","illustration","screenshot"];
-const ASSET_FEEL = ["formal","warm","clinical","punchy","playful","minimal","dramatic"];
-const ASSET_COMP = ["centered","left-weighted","right-weighted","full-bleed","top-heavy","scattered"];
-const ASSET_TAGS = ["team","hero","product","data","culture","event","abstract","decorative","closing","quote"];
+// Controlled vocab — fetched from /api/vocab on load (single source:
+// authoring/schemas/vocab.yaml). Populated by `loadVocab()` before any
+// form is built; do not edit inline.
+let SLIDE_FEEL = [];
+let SLIDE_TAGS = [];
+let ASSET_KIND = [];
+let ASSET_FEEL = [];
+let ASSET_COMP = [];
+let ASSET_TAGS = [];
+
+async function loadVocab() {
+  const r = await fetch("/api/vocab");
+  if (!r.ok) throw new Error("vocab load failed");
+  const v = await r.json();
+  SLIDE_FEEL = v.slide.feel;
+  SLIDE_TAGS = v.slide.suitable_for;
+  ASSET_KIND = v.asset.kind;
+  ASSET_FEEL = v.asset.feel;
+  ASSET_COMP = v.asset.composition;
+  ASSET_TAGS = v.asset.suitable_for;
+}
 
 let activeTab = "slides";
 let items = {slides: [], assets: []};
@@ -1636,7 +1584,7 @@ async function batchApply() {
     return;
   }
   const text = document.getElementById("batchYaml").value;
-  if (!text.trim()) { alert("Paste the LLM's YAML first."); return; }
+  if (!text.trim()) { alert("Paste the LLM's JSON first."); return; }
   const r = await fetch("/api/batch/" + currentBatchId + "/apply", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -1702,7 +1650,10 @@ document.querySelectorAll(".mode-toggle button").forEach(b => {
 
 applyMode();
 applyView();
-loadItems();
+loadVocab().then(loadItems).catch(err => {
+  document.getElementById("msg").innerHTML = "vocab load failed: " + err.message;
+  loadItems();
+});
 </script>
 </body>
 </html>
