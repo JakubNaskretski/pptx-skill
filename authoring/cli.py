@@ -736,6 +736,10 @@ def write_asset_yaml_stub(
     kind: str | None = None,
     colors_hex: list | None = None,
     recolor_targets: list | None = None,
+    table: dict | None = None,
+    chart: dict | None = None,
+    shape: dict | None = None,
+    smartart: dict | None = None,
 ) -> None:
     """Write an asset sidecar in canonical-order YAML.
 
@@ -800,10 +804,18 @@ def write_asset_yaml_stub(
     elif "recolor_targets" in existing:
         out["recolor_targets"] = existing["recolor_targets"]
 
-    # Preserve any kind-specific blocks already populated (table/chart/
-    # shape/smartart will be filled in B4). Never strip them.
-    for key in ("table", "chart", "shape", "smartart"):
-        if key in existing:
+    # Kind-specific blocks: prefer fresh input from ingest, else
+    # preserve whatever was already there (human edits + prior ingest
+    # data both survive when this re-ingest doesn't supply the block).
+    for key, value in (
+        ("table", table),
+        ("chart", chart),
+        ("shape", shape),
+        ("smartart", smartart),
+    ):
+        if value is not None:
+            out[key] = value
+        elif key in existing:
             out[key] = existing[key]
 
     write_yaml(out_path, out)
@@ -907,6 +919,280 @@ def _extract_svg_colors(svg_bytes: bytes, n: int = 5) -> list[str]:
         if len(seen) >= n:
             break
     return seen
+
+
+# v4: structured-atom capture for non-picture, non-text-placeholder
+# shape kinds — tables, charts, callouts/auto-shapes, freeforms,
+# smartart. Each becomes its own asset record with a kind-specific
+# descriptive block and the shape XML serialised as the "binary".
+#
+# CAVEAT: the saved XML is a *fragment* — it references theme/style/
+# chart-data parts that live elsewhere in the source pptx. Phase D
+# compose will need to pull those related parts in when instantiating
+# an atom on a foreign slide. For B4 the goal is *addressability*
+# (agent can list/filter/describe them), not yet *usability*.
+
+
+def _serialize_shape_xml(shape) -> bytes:
+    """Serialize a shape's lxml element to bytes for hashing + storage."""
+    try:
+        from lxml import etree as lxml_etree
+        return lxml_etree.tostring(shape._element, pretty_print=False)
+    except (ImportError, AttributeError):
+        return b""
+
+
+def _shape_atom_sha(xml_bytes: bytes) -> str:
+    return hashlib.sha1(xml_bytes).hexdigest()
+
+
+def _shape_is_smartart(shape) -> bool:
+    """SmartArt shows up as a GraphicFrame with diagram-typed graphicData."""
+    try:
+        el = shape._element
+    except AttributeError:
+        return False
+    for gd in el.findall(f".//{{{_DML_NS}}}graphicData"):
+        if "diagram" in (gd.get("uri", "") or ""):
+            return True
+    return False
+
+
+def _safe_enum_short_name(value) -> str:
+    """Convert a pptx enum member to a short lowercase token, or ''.
+
+    Example: MSO_SHAPE.ROUNDED_RECTANGLE -> 'rounded_rectangle'.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    return s.rsplit(".", 1)[-1].lower() if "." in s else s.lower()
+
+
+def _shape_is_recolorable(shape) -> bool:
+    """True if the shape has a solid colour fill that compose could rewrite."""
+    try:
+        fill = shape.fill
+        ftype = fill.type
+    except (AttributeError, ValueError):
+        return False
+    return ftype is not None and str(ftype).endswith("SOLID")
+
+
+def _atom_too_small(shape, slide_w: int, slide_h: int, min_frac: float = 0.005) -> bool:
+    """Filter out trivially small geometric atoms (decorative dots, hairlines)."""
+    w = getattr(shape, "width", 0) or 0
+    h = getattr(shape, "height", 0) or 0
+    slide_area = slide_w * slide_h
+    if slide_area <= 0:
+        return False
+    return (w * h) / slide_area < min_frac
+
+
+def _extract_table_atom(shape, deck_stem: str, slide_number: int, assets_dir: Path) -> str | None:
+    table = shape.table
+    xml = _serialize_shape_xml(shape)
+    if not xml:
+        return None
+    sha = _shape_atom_sha(xml)
+    asset_id = f"asset_{sha[:8]}"
+
+    rows_list = list(table.rows)
+    cols_list = list(table.columns)
+    cells: list[list[str]] = []
+    for r in rows_list:
+        cells.append([(c.text or "").strip() for c in r.cells])
+
+    headers = cells[0] if cells else []
+    sample_cells = cells[1:min(4, len(cells))]
+
+    bin_path = assets_dir / f"{sha}.xml"
+    yaml_path = assets_dir / f"{sha}.yaml"
+    if not bin_path.exists():
+        bin_path.write_bytes(xml)
+    write_asset_yaml_stub(
+        yaml_path, asset_id, sha, deck_stem, slide_number,
+        kind="table",
+        table={
+            "rows": len(rows_list),
+            "cols": len(cols_list),
+            "headers": headers,
+            "sample_cells": sample_cells,
+        },
+    )
+    return asset_id
+
+
+def _extract_chart_atom(shape, deck_stem: str, slide_number: int, assets_dir: Path) -> str | None:
+    chart = shape.chart
+    xml = _serialize_shape_xml(shape)
+    if not xml:
+        return None
+    sha = _shape_atom_sha(xml)
+    asset_id = f"asset_{sha[:8]}"
+
+    chart_type = ""
+    try:
+        chart_type = _safe_enum_short_name(chart.chart_type)
+    except (AttributeError, ValueError):
+        pass
+    series_count = 0
+    try:
+        series_count = len(list(chart.series))
+    except (AttributeError, ValueError):
+        pass
+    categories_count = 0
+    try:
+        plots = list(chart.plots)
+        if plots:
+            categories_count = len(list(plots[0].categories))
+    except (AttributeError, ValueError, IndexError):
+        pass
+
+    bin_path = assets_dir / f"{sha}.xml"
+    yaml_path = assets_dir / f"{sha}.yaml"
+    if not bin_path.exists():
+        bin_path.write_bytes(xml)
+    write_asset_yaml_stub(
+        yaml_path, asset_id, sha, deck_stem, slide_number,
+        kind="chart",
+        chart={
+            "type": chart_type,
+            "series_count": series_count,
+            "categories_count": categories_count,
+        },
+    )
+    return asset_id
+
+
+def _extract_geometric_atom(
+    shape,
+    deck_stem: str,
+    slide_number: int,
+    assets_dir: Path,
+    kind: str,
+) -> str | None:
+    """Save a callout (auto-shape) or freeform as a kind-specific asset."""
+    xml = _serialize_shape_xml(shape)
+    if not xml:
+        return None
+    sha = _shape_atom_sha(xml)
+    asset_id = f"asset_{sha[:8]}"
+
+    geometry = ""
+    if kind == "callout":
+        try:
+            geometry = _safe_enum_short_name(shape.auto_shape_type)
+        except (AttributeError, ValueError):
+            pass
+
+    bin_path = assets_dir / f"{sha}.xml"
+    yaml_path = assets_dir / f"{sha}.yaml"
+    if not bin_path.exists():
+        bin_path.write_bytes(xml)
+    write_asset_yaml_stub(
+        yaml_path, asset_id, sha, deck_stem, slide_number,
+        kind=kind,
+        shape={"geometry": geometry, "is_recolorable": _shape_is_recolorable(shape)},
+    )
+    return asset_id
+
+
+def _extract_smartart_atom(shape, deck_stem: str, slide_number: int, assets_dir: Path) -> str | None:
+    xml = _serialize_shape_xml(shape)
+    if not xml:
+        return None
+    sha = _shape_atom_sha(xml)
+    asset_id = f"asset_{sha[:8]}"
+
+    el = shape._element
+    nodes = [(t.text or "").strip() for t in el.findall(f".//{{{_DML_NS}}}t")]
+    nodes = [n for n in nodes if n]
+
+    # Layout name lives in the data-model part (dgm:dataModel) which
+    # isn't in the slide XML — leave empty for B4. Phase D can resolve
+    # it when instantiating the atom.
+    bin_path = assets_dir / f"{sha}.xml"
+    yaml_path = assets_dir / f"{sha}.yaml"
+    if not bin_path.exists():
+        bin_path.write_bytes(xml)
+    write_asset_yaml_stub(
+        yaml_path, asset_id, sha, deck_stem, slide_number,
+        kind="smartart",
+        smartart={"layout": "", "nodes": nodes},
+    )
+    return asset_id
+
+
+def extract_structured_atoms(
+    slide,
+    deck_stem: str,
+    slide_number: int,
+    assets_dir: Path,
+    slide_w: int,
+    slide_h: int,
+) -> list[str]:
+    """Save non-picture, non-text-placeholder shapes as typed atom assets.
+
+    Captures tables, charts, smartart, auto-shapes (callouts), freeforms.
+    Skips pictures (extract_picture_assets handles them), textual
+    placeholders (those are template slots, not addressable atoms),
+    groups (recursion deferred), and atoms below ~0.5% slide area
+    (decorative hairlines / single-pixel dots).
+
+    Returns list of asset ids.
+    """
+    extracted: list[str] = []
+    for shape in list(slide.shapes):
+        if _shape_is_picture(shape):
+            continue
+        # Skip text/image placeholders — those drive template slots,
+        # they aren't reusable atoms in their own right.
+        if getattr(shape, "is_placeholder", False):
+            ph_type = shape.placeholder_format.type
+            if ph_type in PLACEHOLDER_TEXTUAL or ph_type == PP_PLACEHOLDER.PICTURE:
+                continue
+
+        # Order matters: SmartArt is a GraphicFrame with diagram URI;
+        # tables and charts are also GraphicFrames distinguished by
+        # has_table / has_chart. Check the more specific ones first.
+        try:
+            if getattr(shape, "has_table", False):
+                a = _extract_table_atom(shape, deck_stem, slide_number, assets_dir)
+                if a:
+                    extracted.append(a)
+                continue
+            if getattr(shape, "has_chart", False):
+                a = _extract_chart_atom(shape, deck_stem, slide_number, assets_dir)
+                if a:
+                    extracted.append(a)
+                continue
+        except (AttributeError, ValueError):
+            pass
+
+        if _shape_is_smartart(shape):
+            a = _extract_smartart_atom(shape, deck_stem, slide_number, assets_dir)
+            if a:
+                extracted.append(a)
+            continue
+
+        stype = getattr(shape, "shape_type", None)
+        if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
+            if _atom_too_small(shape, slide_w, slide_h):
+                continue
+            a = _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "callout")
+            if a:
+                extracted.append(a)
+            continue
+        if stype == MSO_SHAPE_TYPE.FREEFORM:
+            if _atom_too_small(shape, slide_w, slide_h):
+                continue
+            a = _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "freeform")
+            if a:
+                extracted.append(a)
+            continue
+
+    return extracted
 
 
 def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir: Path) -> list[str]:
@@ -1242,6 +1528,15 @@ def ingest(deck: Path) -> None:
         slide_yaml = slides_dir / f"slide_{slide_number:02d}.yaml"
 
         write_slide_fragment(original, idx, slide_pptx, renames)
+        # Extract atoms BEFORE writing the slide yaml so we can populate
+        # inventory with the structured-atom ids this template carries
+        # (so the agent knows "picking this template gives you these
+        # atoms for free, or you can address them individually in
+        # compose mode").
+        extract_picture_assets(slide, deck_stem, slide_number, assets_dir)
+        atom_ids = extract_structured_atoms(
+            slide, deck_stem, slide_number, assets_dir, slide_w, slide_h
+        )
         write_slide_yaml_stub(
             slide_yaml,
             slide_id,
@@ -1251,8 +1546,8 @@ def ingest(deck: Path) -> None:
             slide_number,
             theme_colors=slide_theme_colors,
             fonts=slide_fonts,
+            inventory=atom_ids,
         )
-        extract_picture_assets(slide, deck_stem, slide_number, assets_dir)
 
     click.echo(f"Ingested {deck.name}: {n_slides} slide(s) → {slides_dir}")
 
