@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -692,41 +693,209 @@ def write_slide_yaml_stub(
     write_yaml(out_path, out)
 
 
-def write_asset_yaml_stub(out_path: Path, asset_id: str, sha1: str, deck_stem: str, slide_number: int) -> None:
-    if out_path.exists():
-        existing = read_yaml(out_path)
-        # Append source if new.
-        sources = existing.get("sources") or []
-        if not any(s.get("deck") == deck_stem and s.get("slide") == slide_number for s in sources):
-            sources.append({"deck": deck_stem, "slide": slide_number})
-            existing["sources"] = sources
-        existing["id"] = asset_id
-        existing["sha1"] = sha1
-        write_yaml(out_path, existing)
-        return
+_ASSET_DESCRIPTIVE_DEFAULTS = {
+    "kind": "",
+    "subject": "",
+    "depicts": "",
+    "feel": "",
+    "composition": "",
+    "colors": [],
+    "scope": [],
+    "suitable_for": [],
+    "status": "pending",
+    "notes": "",
+}
 
-    stub = {
-        "kind": "",
-        "subject": "",
-        "depicts": "",
-        "feel": "",
-        "composition": "",
-        "colors": [],
-        "scope": [],
-        "suitable_for": [],
-        "status": "pending",
-        "notes": "",
+
+def write_asset_yaml_stub(
+    out_path: Path,
+    asset_id: str,
+    sha1: str,
+    deck_stem: str,
+    slide_number: int,
+    *,
+    kind: str | None = None,
+    colors_hex: list | None = None,
+    recolor_targets: list | None = None,
+) -> None:
+    """Write an asset sidecar in canonical-order YAML.
+
+    Structural fields (id, sha1, colors_hex, recolor_targets, sources)
+    are refreshed when the ingest layer supplies new values. Descriptive
+    fields (kind/subject/depicts/feel/composition/colors/scope/
+    suitable_for/status/notes) are preserved verbatim across re-ingest.
+
+    The `kind` kwarg seeds the field only on first ingest — never
+    overwrites a hand-edited value. Pass it when ingest knows the kind
+    (e.g. "vector" for an SVG sibling).
+    """
+    existing: dict = {}
+    if out_path.exists():
+        try:
+            existing = read_yaml(out_path)
+        except Exception:
+            existing = {}
+
+    descriptive = {
+        k: existing.get(k, default) for k, default in _ASSET_DESCRIPTIVE_DEFAULTS.items()
+    }
+    if kind is not None and not descriptive["kind"]:
+        descriptive["kind"] = kind
+
+    # Source list: append-only across re-ingests.
+    sources = list(existing.get("sources") or [])
+    if not any(
+        s.get("deck") == deck_stem and s.get("slide") == slide_number for s in sources
+    ):
+        sources.append({"deck": deck_stem, "slide": slide_number})
+
+    # colors_hex: preserve previous extraction if the new pass returned
+    # nothing (e.g. PIL absent, or unsupported format) so we don't clobber.
+    if colors_hex:
+        out_colors_hex = colors_hex
+    else:
+        out_colors_hex = list(existing.get("colors_hex") or [])
+
+    out = {
+        "kind": descriptive["kind"],
+        "subject": descriptive["subject"],
+        "depicts": descriptive["depicts"],
+        "feel": descriptive["feel"],
+        "composition": descriptive["composition"],
+        "colors": descriptive["colors"],
+        "colors_hex": out_colors_hex,
+        "scope": descriptive["scope"],
+        "suitable_for": descriptive["suitable_for"],
+        "status": descriptive["status"],
+        "notes": descriptive["notes"],
         "id": asset_id,
         "sha1": sha1,
-        "sources": [{"deck": deck_stem, "slide": slide_number}],
+        "sources": sources,
     }
-    write_yaml(out_path, stub)
+
+    if recolor_targets is not None:
+        out["recolor_targets"] = recolor_targets
+    elif "recolor_targets" in existing:
+        out["recolor_targets"] = existing["recolor_targets"]
+
+    # Preserve any kind-specific blocks already populated (table/chart/
+    # shape/smartart will be filled in B4). Never strip them.
+    for key in ("table", "chart", "shape", "smartart"):
+        if key in existing:
+            out[key] = existing[key]
+
+    write_yaml(out_path, out)
+
+
+# v4: dominant-color extraction (raster) + SVG sibling extraction.
+#
+# Raster: PIL quantize to a small palette, sort by frequency, dedupe
+# near-identicals (per-channel tolerance). Returns hex strings.
+#
+# SVG sibling: PPTX stores SVG `Picture` shapes with BOTH a raster
+# fallback (<a:blip>) and the vector source (<asvg:svgBlip>) inside
+# the same <p:pic>. python-pptx's shape.image returns the raster;
+# this digs the SVG part out via the rel id.
+
+_ASVG_NS = "http://schemas.microsoft.com/office/drawing/2016/SVG/main"
+
+_SVG_COLOR_RE = re.compile(rb'(?:fill|stroke)\s*=\s*["\']?(#[0-9a-fA-F]{6})')
+
+
+def _color_close(a: str, b: str, tol: int = 16) -> bool:
+    """True if two #RRGGBB strings are within `tol` per channel."""
+    try:
+        ai = int(a.lstrip("#"), 16)
+        bi = int(b.lstrip("#"), 16)
+    except ValueError:
+        return False
+    ar, ag, ab = (ai >> 16) & 0xFF, (ai >> 8) & 0xFF, ai & 0xFF
+    br, bg, bb_ = (bi >> 16) & 0xFF, (bi >> 8) & 0xFF, bi & 0xFF
+    return abs(ar - br) <= tol and abs(ag - bg) <= tol and abs(ab - bb_) <= tol
+
+
+def _extract_dominant_colors_hex(blob_path: Path, n: int = 3) -> list[str]:
+    """Return up to `n` dominant colors as #RRGGBB strings.
+
+    Quantizes to 8 colours after a fast thumbnail downsample, sorts
+    palette entries by pixel frequency, and dedupes near-identicals
+    (per-channel tolerance via _color_close).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    try:
+        img = Image.open(blob_path)
+        if img.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((150, 150))
+        quant = img.quantize(colors=8, kmeans=0)
+        palette = quant.getpalette() or []
+        counts = sorted(quant.getcolors() or [], reverse=True)  # [(count, idx), ...]
+        out: list[str] = []
+        for _count, idx in counts:
+            if len(out) >= n:
+                break
+            base = idx * 3
+            if base + 3 > len(palette):
+                continue
+            r, g, b = palette[base], palette[base + 1], palette[base + 2]
+            hexstr = f"#{r:02X}{g:02X}{b:02X}"
+            if any(_color_close(hexstr, prev) for prev in out):
+                continue
+            out.append(hexstr)
+        return out
+    except Exception:
+        return []
+
+
+def _extract_svg_sibling(shape) -> tuple[bytes | None, str]:
+    """If the Picture shape carries an asvg:svgBlip sibling, return
+    (svg_bytes, "svg"). Else (None, "")."""
+    try:
+        sp = shape._element
+    except AttributeError:
+        return None, ""
+    svg_blips = sp.findall(f".//{{{_ASVG_NS}}}svgBlip")
+    if not svg_blips:
+        return None, ""
+    embed = svg_blips[0].get(f"{{{_DOC_REL_NS}}}embed", "")
+    if not embed:
+        return None, ""
+    try:
+        slide_part = shape.part
+        svg_part = slide_part.related_part(embed)
+        return svg_part.blob, "svg"
+    except (AttributeError, KeyError):
+        return None, ""
+
+
+def _extract_svg_colors(svg_bytes: bytes, n: int = 5) -> list[str]:
+    """Quick regex scan of unique fill/stroke hex colors in SVG source."""
+    seen: list[str] = []
+    for match in _SVG_COLOR_RE.finditer(svg_bytes):
+        hex_val = match.group(1).decode("ascii").upper()
+        if hex_val not in seen:
+            seen.append(hex_val)
+        if len(seen) >= n:
+            break
+    return seen
 
 
 def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir: Path) -> list[str]:
     """Save all picture shapes on this slide as <sha1>.<ext> binaries + yaml stubs.
 
-    Returns the list of asset ids extracted (sha1 prefixes).
+    v4: for each Picture shape we extract:
+      - the raster (PNG/JPG/EMF/...) with PIL-derived dominant colours
+      - any SVG sibling (asvg:svgBlip) as a separate vector asset with
+        kind="vector" and recolor_targets seeded from fill/stroke colours
+
+    Returns the list of asset ids extracted (raster + any siblings).
     """
     extracted: list[str] = []
     for shape in list(slide.shapes):
@@ -736,6 +905,8 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
             image = shape.image
         except Exception:
             continue
+
+        # --- Raster / fallback picture ---
         blob = image.blob
         ext = (image.ext or "png").lstrip(".")
         sha = hashlib.sha1(blob).hexdigest()
@@ -744,8 +915,39 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
         yaml_path = assets_dir / f"{sha}.yaml"
         if not bin_path.exists():
             bin_path.write_bytes(blob)
-        write_asset_yaml_stub(yaml_path, asset_id, sha, deck_stem, slide_number)
+        colors_hex = _extract_dominant_colors_hex(bin_path)
+        write_asset_yaml_stub(
+            yaml_path,
+            asset_id,
+            sha,
+            deck_stem,
+            slide_number,
+            colors_hex=colors_hex,
+        )
         extracted.append(asset_id)
+
+        # --- SVG sibling (vector source) ---
+        svg_blob, svg_ext = _extract_svg_sibling(shape)
+        if svg_blob:
+            svg_sha = hashlib.sha1(svg_blob).hexdigest()
+            svg_asset_id = f"asset_{svg_sha[:8]}"
+            svg_bin_path = assets_dir / f"{svg_sha}.{svg_ext}"
+            svg_yaml_path = assets_dir / f"{svg_sha}.yaml"
+            if not svg_bin_path.exists():
+                svg_bin_path.write_bytes(svg_blob)
+            svg_colors = _extract_svg_colors(svg_blob)
+            write_asset_yaml_stub(
+                svg_yaml_path,
+                svg_asset_id,
+                svg_sha,
+                deck_stem,
+                slide_number,
+                kind="vector",
+                colors_hex=svg_colors,
+                recolor_targets=svg_colors,
+            )
+            extracted.append(svg_asset_id)
+
     return extracted
 
 
