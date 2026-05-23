@@ -29,6 +29,7 @@ import click
 import yaml
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 
 
 HERE = Path(__file__).resolve().parent
@@ -127,6 +128,109 @@ def _shape_is_picture(shape) -> bool:
     return getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE
 
 
+# v4: theme-color name → clrScheme slot. MSO_THEME_COLOR has aliases
+# (BACKGROUND_1 / LIGHT_1 / DARK_1 are sometimes interchangeable with
+# TEXT_1 etc. in different OOXML dialects); the map below normalises
+# all known names to the 12 canonical slots stored in theme.yaml.
+_THEME_COLOR_TO_SLOT = {
+    "accent_1": "accent1", "accent_2": "accent2",
+    "accent_3": "accent3", "accent_4": "accent4",
+    "accent_5": "accent5", "accent_6": "accent6",
+    "background_1": "lt1", "background_2": "lt2",
+    "text_1": "dk1", "text_2": "dk2",
+    "dark_1": "dk1", "light_1": "lt1",
+    "dark_2": "dk2", "light_2": "lt2",
+    "hyperlink": "hlink", "followed_hyperlink": "folHlink",
+}
+
+
+def _resolve_run_color(run, theme_palette: dict) -> tuple[str, str]:
+    """Inspect a run's font.color. Returns (hex, role).
+
+    `hex` is "#RRGGBB" if resolvable, else empty.
+    `role` is the clrScheme slot name (e.g. "accent1") if the run uses
+    a theme color, else empty.
+    """
+    try:
+        color = run.font.color
+        ctype = color.type
+    except (AttributeError, ValueError):
+        return "", ""
+    if ctype is None:
+        return "", ""
+
+    # Direct RGB.
+    try:
+        rgb = color.rgb
+        if rgb is not None:
+            return f"#{str(rgb).upper()}", ""
+    except (AttributeError, ValueError):
+        pass
+
+    # Theme-color reference — resolve to slot, then to hex via theme.
+    try:
+        tc = color.theme_color
+        if tc is not None:
+            name = getattr(tc, "name", str(tc)).lower()
+            slot = _THEME_COLOR_TO_SLOT.get(name, "")
+            if slot:
+                return theme_palette.get(slot, ""), slot
+    except (AttributeError, ValueError):
+        pass
+
+    return "", ""
+
+
+def _extract_slot_style(shape, theme_palette: dict) -> dict:
+    """Snapshot the slot's first-run font properties for v4.
+
+    Inspects only the first paragraph's first run — the "anchor" style
+    that compose currently inherits when filling the slot. Returns a
+    dict with whichever fields could be resolved; missing fields are
+    omitted (not nulled).
+    """
+    try:
+        tf = shape.text_frame
+    except (AttributeError, ValueError):
+        return {}
+    paras = list(getattr(tf, "paragraphs", []) or [])
+    if not paras:
+        return {}
+    runs = list(getattr(paras[0], "runs", []) or [])
+    if not runs:
+        return {}
+    run = runs[0]
+    font = run.font
+
+    out: dict = {}
+    try:
+        if font.name:
+            out["font"] = font.name
+    except (AttributeError, ValueError):
+        pass
+    try:
+        if font.size is not None:
+            out["size_pt"] = float(font.size.pt)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        if font.bold is not None:
+            out["bold"] = bool(font.bold)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        if font.italic is not None:
+            out["italic"] = bool(font.italic)
+    except (AttributeError, ValueError):
+        pass
+    color_hex, color_role = _resolve_run_color(run, theme_palette)
+    if color_hex:
+        out["color"] = color_hex
+    if color_role:
+        out["color_role"] = color_role
+    return out
+
+
 def _slot_id_for_placeholder(ph_type, used: set) -> str:
     if ph_type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
         base = "title"
@@ -153,13 +257,20 @@ def _unique_id(base: str, used: set) -> str:
     return out
 
 
-def detect_slots(slide, slide_w: int, slide_h: int) -> tuple[list[dict], dict]:
+def detect_slots(
+    slide, slide_w: int, slide_h: int, theme_palette: dict | None = None
+) -> tuple[list[dict], dict]:
     """Detect slot definitions on a slide.
 
     Returns (slots, shape_renames) where shape_renames maps the original
     shape element id to the slot id we want set as shape.name (so the
     consumer can find each slot by shape name at compose time).
+
+    `theme_palette` is the deck's clrScheme → hex map (from theme.yaml).
+    Used to resolve per-slot theme colour references into hex; pass an
+    empty dict to skip the v4 style snapshot.
     """
+    theme_palette = theme_palette or {}
     slots: list[dict] = []
     used_ids: set = set()
     renames: dict = {}  # shape_id (int) -> slot_id
@@ -196,23 +307,23 @@ def detect_slots(slide, slide_w: int, slide_h: int) -> tuple[list[dict], dict]:
             and any((p.text or "").strip() for p in paragraphs)
         )
         slot_id = _slot_id_for_placeholder(ph_type, used_ids)
+        style = _extract_slot_style(shape, theme_palette)
         if is_bulleted:
             non_empty = [p for p in paragraphs if (p.text or "").strip()]
-            slots.append(
-                {
-                    "id": slot_id,
-                    "kind": "bullets",
-                    "max_items": max(1, len(non_empty)),
-                }
-            )
+            slot: dict = {
+                "id": slot_id,
+                "kind": "bullets",
+                "max_items": max(1, len(non_empty)),
+            }
         else:
-            slots.append(
-                {
-                    "id": slot_id,
-                    "kind": "text",
-                    "max_chars": max(20, int(len(text) * 1.5) or 60),
-                }
-            )
+            slot = {
+                "id": slot_id,
+                "kind": "text",
+                "max_chars": max(20, int(len(text) * 1.5) or 60),
+            }
+        if style:
+            slot["style"] = style
+        slots.append(slot)
         renames[shape.shape_id] = slot_id
 
     # Second pass: free pictures > 20% slide area.
@@ -524,32 +635,61 @@ def prune_unreachable_parts(pptx_path: Path) -> tuple[int, int]:
     return len(reachable), len(name_set) - len(reachable)
 
 
-def write_slide_yaml_stub(out_path: Path, slide_id: str, layout: str, slots: list[dict], deck_stem: str, slide_number: int) -> None:
-    """Write a slide sidecar stub. Skips writing if file exists with status: done/locked."""
-    if out_path.exists():
-        existing = read_yaml(out_path)
-        status = existing.get("status", "pending")
-        if status in ("done", "locked"):
-            # Refresh structural fields only, leave descriptive fields alone.
-            existing["id"] = slide_id
-            existing["layout"] = layout
-            existing["slots"] = slots
-            existing["sources"] = [{"deck": deck_stem, "slide": slide_number}]
-            write_yaml(out_path, existing)
-            return
+_SLIDE_DESCRIPTIVE_DEFAULTS = {
+    "intent": "",
+    "feel": "",
+    "suitable_for": [],
+    "status": "pending",
+    "notes": "",
+}
 
-    stub = {
-        "intent": "",
-        "feel": "",
-        "suitable_for": [],
-        "status": "pending",
-        "notes": "",
+
+def write_slide_yaml_stub(
+    out_path: Path,
+    slide_id: str,
+    layout: str,
+    slots: list[dict],
+    deck_stem: str,
+    slide_number: int,
+    *,
+    theme_colors: dict | None = None,
+    fonts: dict | None = None,
+    inventory: list | None = None,
+) -> None:
+    """Write a slide sidecar in canonical-order YAML.
+
+    Structural fields (id, layout, theme_colors, fonts, slots, inventory,
+    sources) are always refreshed. Descriptive fields (intent, feel,
+    suitable_for, status, notes) are preserved verbatim if the file
+    already exists — regardless of status. New stubs default
+    descriptive fields to empty + status=pending.
+    """
+    existing: dict = {}
+    if out_path.exists():
+        try:
+            existing = read_yaml(out_path)
+        except Exception:
+            existing = {}
+
+    descriptive = {
+        k: existing.get(k, default) for k, default in _SLIDE_DESCRIPTIVE_DEFAULTS.items()
+    }
+
+    out = {
+        "intent": descriptive["intent"],
+        "feel": descriptive["feel"],
+        "suitable_for": descriptive["suitable_for"],
+        "status": descriptive["status"],
+        "notes": descriptive["notes"],
         "id": slide_id,
         "layout": layout,
+        "theme_colors": theme_colors or {},
+        "fonts": fonts or {},
         "slots": slots,
+        "inventory": inventory or [],
         "sources": [{"deck": deck_stem, "slide": slide_number}],
     }
-    write_yaml(out_path, stub)
+    write_yaml(out_path, out)
 
 
 def write_asset_yaml_stub(out_path: Path, asset_id: str, sha1: str, deck_stem: str, slide_number: int) -> None:
@@ -607,6 +747,102 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
         write_asset_yaml_stub(yaml_path, asset_id, sha, deck_stem, slide_number)
         extracted.append(asset_id)
     return extracted
+
+
+# ---------------------------------------------------------------------------
+# v4: per-deck theme extraction
+# ---------------------------------------------------------------------------
+#
+# Reads the deck's primary theme (clrScheme + fontScheme) into a
+# theme.yaml-shaped dict. INFORMATIONAL — never enforced at compose
+# time. Ships in the consumer bundle so the agent has structured
+# access to the source palette/fonts without having to guess.
+#
+# clrScheme has 12 named slots: 4 dk/lt + 6 accents + 2 hyperlink.
+# Each slot wraps a colour element — usually <a:srgbClr val="XXXXXX"/>
+# but sometimes <a:sysClr val="windowText" lastClr="000000"/>.
+
+_PALETTE_SLOTS = (
+    "dk1", "lt1", "dk2", "lt2",
+    "accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+    "hlink", "folHlink",
+)
+
+
+def _resolve_color_slot(slot_el) -> str:
+    """Given a clrScheme slot element, return the resolved hex (#RRGGBB)
+    or empty string if unresolvable."""
+    for child in slot_el:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "srgbClr":
+            val = child.get("val", "")
+            if val:
+                return f"#{val.upper()}"
+        elif tag == "sysClr":
+            last = child.get("lastClr") or child.get("val")
+            if last and last != "windowText" and last != "window":
+                return f"#{last.upper()}"
+    return ""
+
+
+def extract_deck_theme(prs, deck_stem: str) -> dict:
+    """Extract clrScheme + fontScheme from the deck's primary theme.
+
+    Returns a dict matching authoring/schemas/theme.yaml. Always returns
+    a complete shape with empty slots when extraction fails so the
+    consumer schema is stable.
+    """
+    out: dict = {
+        "deck": deck_stem,
+        "palette": {slot: "" for slot in _PALETTE_SLOTS},
+        "aliases": {"primary": "", "accent": "", "text": "", "background": ""},
+        "fonts": {"major": "", "minor": ""},
+        "aspect": aspect_ratio(prs.slide_width or 0, prs.slide_height or 0),
+        "sources": [{"deck": deck_stem}],
+    }
+
+    masters = list(prs.slide_masters)
+    if not masters:
+        return out
+
+    try:
+        theme_part = masters[0].part.part_related_by(RT.THEME)
+    except KeyError:
+        return out
+
+    try:
+        theme_root = ET.fromstring(theme_part.blob)
+    except ET.ParseError:
+        return out
+
+    clr_scheme = theme_root.find(f".//{{{_DML_NS}}}clrScheme")
+    if clr_scheme is not None:
+        for slot in _PALETTE_SLOTS:
+            slot_el = clr_scheme.find(f"{{{_DML_NS}}}{slot}")
+            if slot_el is None:
+                continue
+            hex_val = _resolve_color_slot(slot_el)
+            if hex_val:
+                out["palette"][slot] = hex_val
+
+    font_scheme = theme_root.find(f".//{{{_DML_NS}}}fontScheme")
+    if font_scheme is not None:
+        for role in ("major", "minor"):
+            latin = font_scheme.find(
+                f"{{{_DML_NS}}}{role}Font/{{{_DML_NS}}}latin"
+            )
+            if latin is not None:
+                out["fonts"][role] = latin.get("typeface", "")
+
+    # Aliases — simple defaults for B1. Later iterations can detect
+    # dark-on-light vs light-on-dark layouts and flip text/background.
+    palette = out["palette"]
+    out["aliases"]["text"] = "dk1"
+    out["aliases"]["background"] = "lt1"
+    out["aliases"]["accent"] = "accent1"
+    out["aliases"]["primary"] = "dk2" if palette.get("dk2") else "accent1"
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -750,12 +986,30 @@ def ingest(deck: Path) -> None:
     slide_w = prs.slide_width or 9144000
     slide_h = prs.slide_height or 6858000
 
+    # v4: per-deck theme.yaml (palette + fonts). Regenerated on every
+    # ingest — it is derived data, no human-edited fields to preserve.
+    theme = extract_deck_theme(prs, deck_stem)
+    write_yaml(deck_dir / "theme.yaml", theme)
+
+    # Resolve slide-level theme_colors via aliases; pass palette into
+    # slot detection so per-run colour refs become hex + role names.
+    theme_palette = theme.get("palette") or {}
+    theme_aliases = theme.get("aliases") or {}
+    slide_theme_colors = {
+        role: theme_palette.get(theme_aliases.get(role, ""), "")
+        for role in ("primary", "accent", "text", "background")
+    }
+    # Strip empty entries so the YAML stays terse on fully-resolved
+    # decks but explicit on partial extractions.
+    slide_theme_colors = {k: v for k, v in slide_theme_colors.items() if v}
+    slide_fonts = {k: v for k, v in (theme.get("fonts") or {}).items() if v}
+
     assets_dir = WORKSPACE / "assets"
 
     n_slides = len(prs.slides)
     for idx in range(n_slides):
         slide = prs.slides[idx]
-        slot_defs, renames = detect_slots(slide, slide_w, slide_h)
+        slot_defs, renames = detect_slots(slide, slide_w, slide_h, theme_palette)
         layout = infer_layout(slide, slot_defs, renames, slide_w, slide_h)
 
         slide_number = idx + 1
@@ -764,7 +1018,16 @@ def ingest(deck: Path) -> None:
         slide_yaml = slides_dir / f"slide_{slide_number:02d}.yaml"
 
         write_slide_fragment(original, idx, slide_pptx, renames)
-        write_slide_yaml_stub(slide_yaml, slide_id, layout, slot_defs, deck_stem, slide_number)
+        write_slide_yaml_stub(
+            slide_yaml,
+            slide_id,
+            layout,
+            slot_defs,
+            deck_stem,
+            slide_number,
+            theme_colors=slide_theme_colors,
+            fonts=slide_fonts,
+        )
         extract_picture_assets(slide, deck_stem, slide_number, assets_dir)
 
     click.echo(f"Ingested {deck.name}: {n_slides} slide(s) → {slides_dir}")
