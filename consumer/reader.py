@@ -151,9 +151,53 @@ def _strip_bullet_prefix(text: str) -> str:
     return "\n".join(_BULLET_PREFIX_RE.sub("", ln) for ln in text.split("\n"))
 
 
+def _copy_run_color(src_font, dst_font) -> None:
+    """Copy a run's font.color from src to dst, handling RGB + theme.
+
+    ColorFormat assignment switches the colour type on assignment, so
+    we try RGB first (most common) then theme-color. Silent fallback
+    if neither resolves — leaves dst at its inherited default.
+    """
+    try:
+        ctype = src_font.color.type
+    except (AttributeError, ValueError):
+        return
+    if ctype is None:
+        return
+    try:
+        rgb = src_font.color.rgb
+        if rgb is not None:
+            dst_font.color.rgb = rgb
+            return
+    except (AttributeError, ValueError):
+        pass
+    try:
+        tc = src_font.color.theme_color
+        if tc is not None:
+            dst_font.color.theme_color = tc
+    except (AttributeError, ValueError):
+        pass
+
+
+def _copy_run_font(src_font, dst_font) -> None:
+    """Copy size/bold/italic/name/color from a template run to a new run."""
+    try:
+        if src_font.size is not None:
+            dst_font.size = src_font.size
+        if src_font.bold is not None:
+            dst_font.bold = src_font.bold
+        if src_font.italic is not None:
+            dst_font.italic = src_font.italic
+        if src_font.name is not None:
+            dst_font.name = src_font.name
+    except (AttributeError, ValueError):
+        pass
+    _copy_run_color(src_font, dst_font)
+
+
 def _fill_text_shape(shape, value: str) -> None:
     """Replace the shape's text frame content with `value`, keeping its first
-    paragraph's font/style as the template."""
+    paragraph's font/style (incl. colour) as the template."""
     if not shape.has_text_frame:
         return
     value = _strip_bullet_prefix(str(value))
@@ -168,20 +212,7 @@ def _fill_text_shape(shape, value: str) -> None:
         # text_frame.clear() leaves an empty first paragraph — reuse it.
         run = p.add_run()
         run.text = value
-        # Copy basic font properties.
-        src_font = template_run.font
-        dst_font = run.font
-        try:
-            if src_font.size is not None:
-                dst_font.size = src_font.size
-            if src_font.bold is not None:
-                dst_font.bold = src_font.bold
-            if src_font.italic is not None:
-                dst_font.italic = src_font.italic
-            if src_font.name is not None:
-                dst_font.name = src_font.name
-        except Exception:
-            pass
+        _copy_run_font(template_run.font, run.font)
     else:
         p.text = value
 
@@ -211,38 +242,97 @@ def _fill_bullets_shape(shape, values: list[str]) -> None:
         run = p.add_run()
         run.text = lines[0]
         if template_run is not None:
-            try:
-                if template_run.font.size is not None:
-                    run.font.size = template_run.font.size
-                if template_run.font.bold is not None:
-                    run.font.bold = template_run.font.bold
-                if template_run.font.name is not None:
-                    run.font.name = template_run.font.name
-            except Exception:
-                pass
+            _copy_run_font(template_run.font, run.font)
+        # Sub-runs for additional lines within a bullet inherit the
+        # same font + colour as the primary run. (FINDINGS A3.17 noted
+        # that without this they fall back to paragraph defaults and
+        # show visible drift mid-bullet. Sticking with "\n" in run.text
+        # for the soft break — the proper <a:br/> rewrite is a Phase
+        # D follow-up.)
         for extra in lines[1:]:
             sub = p.add_run()
             sub.text = "\n" + extra
+            if template_run is not None:
+                _copy_run_font(template_run.font, sub.font)
 
 
-def _replace_image_shape(slide, shape, image_path: Path) -> None:
-    """Swap the image of a Picture shape (placeholder or free) with the
-    given file's bytes. Preserves geometry."""
+def _replace_image_shape_legacy(slide, shape, image_path: Path) -> None:
+    """Remove the existing Picture shape and add a fresh one at the same
+    geometry. Loses crop / border / shadow / rotation / transparency /
+    effects / alt text. Used as a fallback when the in-place rewire
+    can't find what it needs."""
     left = shape.left
     top = shape.top
     width = shape.width
     height = shape.height
     name = shape.name
 
-    # Remove the existing shape from the tree.
     sp = shape._element
     sp.getparent().remove(sp)
 
-    # Add a fresh picture with the same geometry.
     new_pic = slide.shapes.add_picture(
         str(image_path), left, top, width=width, height=height
     )
     new_pic.name = name
+
+
+def _replace_image_shape(slide, shape, image_path: Path) -> None:
+    """Swap a Picture shape's image while preserving everything else.
+
+    Strategy: register the new image as a slide-part rel (use the
+    public add_picture API as the registration mechanism, then
+    immediately discard the temporary shape), then rewire the
+    existing shape's <a:blip r:embed> at the new rel id. Crop,
+    border, rotation, shadow, transparency, picture effects, alt
+    text — all preserved.
+
+    Falls back to remove+re-add (the v3 behaviour) if the existing
+    shape isn't a standard blipFill picture or if anything else
+    unexpected happens.
+    """
+    try:
+        from pptx.oxml.ns import qn
+    except ImportError:
+        _replace_image_shape_legacy(slide, shape, image_path)
+        return
+
+    blipFill = shape._element.find(qn("p:blipFill"))
+    if blipFill is None:
+        _replace_image_shape_legacy(slide, shape, image_path)
+        return
+    blip = blipFill.find(qn("a:blip"))
+    if blip is None:
+        _replace_image_shape_legacy(slide, shape, image_path)
+        return
+
+    embed_attr = qn("r:embed")
+
+    # Use add_picture as the registration vehicle: it imports the
+    # image into the slide's rels properly across all python-pptx
+    # versions. We grab the rel id, then remove the temporary shape
+    # — the image part stays bound to the slide via the rel.
+    try:
+        tmp_pic = slide.shapes.add_picture(
+            str(image_path),
+            left=0, top=0,
+            width=shape.width, height=shape.height,
+        )
+        tmp_blip = tmp_pic._element.find(".//" + qn("a:blip"))
+        if tmp_blip is None:
+            tmp_pic._element.getparent().remove(tmp_pic._element)
+            _replace_image_shape_legacy(slide, shape, image_path)
+            return
+        new_rid = tmp_blip.get(embed_attr)
+        tmp_pic._element.getparent().remove(tmp_pic._element)
+    except Exception:
+        _replace_image_shape_legacy(slide, shape, image_path)
+        return
+
+    if not new_rid:
+        _replace_image_shape_legacy(slide, shape, image_path)
+        return
+
+    blip.set(embed_attr, new_rid)
 
 
 def _degrade_styled_value(value: Any) -> tuple[Any, list[str]]:
