@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import webbrowser
 import zipfile
 from datetime import datetime
@@ -33,6 +34,9 @@ WORKSPACE = HERE / "workspace"
 BATCHES_DIR = WORKSPACE / "_batches"
 
 app = Flask(__name__)
+# Cap uploads at 200 MB — typical decks are <50 MB; this leaves headroom
+# without letting a stray multi-GB upload exhaust /tmp.
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +96,43 @@ def _asset_binary(yaml_path: Path) -> Path | None:
     return None
 
 
-SLIDE_DESCRIPTIVE = ("intent", "feel", "suitable_for", "notes")
+def _assets_for_slide(slide_yaml_path: Path) -> list[Path]:
+    """Return asset yaml paths whose `sources` includes this slide.
+
+    Each asset.yaml carries a `sources: [{deck, slide}, ...]` list that
+    ingest populates. We reverse-lookup: scan the workspace's asset pool
+    and pick the ones that mention this deck+slide pair. Used by the
+    slide_with_assets bulk-describe mode so each slide bundle ships
+    with the actual binaries of every picture / atom on it.
+    """
+    # Slide yamls live at workspace/decks/<deck>/slides/slide_NN.yaml — pull
+    # the deck stem from the path and the slide number from the filename.
+    try:
+        deck_stem = slide_yaml_path.parent.parent.name
+        slide_number = int(slide_yaml_path.stem.removeprefix("slide_"))
+    except (ValueError, AttributeError):
+        return []
+    out: list[Path] = []
+    for ap in cli_mod.iter_asset_yamls():
+        try:
+            data = cli_mod.read_yaml(ap)
+        except Exception:
+            continue
+        for src in (data.get("sources") or []):
+            if (
+                isinstance(src, dict)
+                and src.get("deck") == deck_stem
+                and src.get("slide") == slide_number
+            ):
+                out.append(ap)
+                break
+    return out
+
+
+SLIDE_DESCRIPTIVE = ("intent", "feel", "suitable_for", "notes", "interpretation")
 ASSET_DESCRIPTIVE = (
     "kind", "subject", "depicts", "feel", "composition",
-    "colors", "scope", "suitable_for", "notes",
+    "colors", "scope", "suitable_for", "notes", "interpretation",
 )
 _LIST_KEYS = {"suitable_for", "colors", "scope"}
 
@@ -151,6 +188,56 @@ def _save_and_validate(p: Path, merge_fields: dict) -> tuple[list, str]:
 @app.get("/api/items")
 def api_items():
     return jsonify(_items())
+
+
+def _safe_pptx_filename(raw: str) -> str | None:
+    """Sanitize a user-uploaded filename to a safe basename ending in .pptx.
+
+    Strips any path components and leading dots so a malicious upload
+    can't escape /tmp. Preserves unicode filenames as-is.
+    Returns None for empties, non-.pptx, or whitespace-only names.
+    """
+    if not raw:
+        return None
+    base = Path(raw).name.lstrip(".").strip()
+    if not base or not base.lower().endswith(".pptx"):
+        return None
+    return base
+
+
+@app.post("/api/ingest")
+def api_ingest():
+    """Upload + ingest a .pptx file. Rejects with 409 if the deck stem
+    already exists under workspace/decks/ (delete it first to re-ingest).
+
+    Form field: ``pptx`` (multipart file).
+    Returns: ``{"deck_stem", "slides", "pictures", "atoms"}`` on success.
+    """
+    if "pptx" not in request.files:
+        return jsonify({"error": "no file uploaded (expect form field 'pptx')"}), 400
+    f = request.files["pptx"]
+    safe_name = _safe_pptx_filename(f.filename or "")
+    if safe_name is None:
+        return jsonify({"error": "filename must end in .pptx"}), 400
+
+    # Save under a temp dir so the original filename is preserved
+    # verbatim (cli_mod._ingest_pptx uses path.stem for the deck name).
+    with tempfile.TemporaryDirectory(prefix="pptx_upload_") as td:
+        tmp_path = Path(td) / safe_name
+        f.save(str(tmp_path))
+        try:
+            result = cli_mod._ingest_pptx(tmp_path, reject_collision=True)
+        except cli_mod.IngestCollisionError as e:
+            return jsonify({
+                "error": (
+                    f"deck '{e.deck_stem}' is already ingested. Delete "
+                    f"workspace/decks/{e.deck_stem}/ before re-uploading."
+                ),
+                "deck_stem": e.deck_stem,
+            }), 409
+        except Exception as e:
+            return jsonify({"error": f"ingest failed: {e}"}), 500
+    return jsonify(result)
 
 
 @app.get("/api/item")
@@ -225,6 +312,99 @@ def api_prompt():
 # ---------------------------------------------------------------------------
 
 
+def _bulk_instructions_slide_with_assets(
+    n: int,
+    slide_prompt: str,
+    asset_prompt: str,
+    items: dict,
+) -> str:
+    """Bundled-describe prompt: each numbered folder = one slide + its assets.
+
+    `items` maps "01" → {"slide": rel, "assets": {asset_id: rel}} so the
+    prompt can show the model the exact asset_id keys it should use in
+    each entry's `assets` block (rather than expecting the model to
+    invent or copy them from filenames).
+    """
+    # Render a small table of expected asset keys per bundle so the model
+    # knows exactly what to fill in. Keeps the JSON output structured.
+    expected_lines = []
+    for key in sorted(items.keys()):
+        bundle = items[key]
+        asset_ids = list((bundle.get("assets") or {}).keys())
+        if asset_ids:
+            ids_str = ", ".join(f"`{a}`" for a in asset_ids)
+            expected_lines.append(f"- **{key}/** — slide + {len(asset_ids)} asset(s): {ids_str}")
+        else:
+            expected_lines.append(f"- **{key}/** — slide + 0 assets (describe slide only)")
+    expected_block = "\n".join(expected_lines)
+
+    sample_block = (
+        '{\n'
+        '  "01": {\n'
+        '    "slide": {\n'
+        '      "intent": "...",\n'
+        '      "feel": "formal",\n'
+        '      "suitable_for": ["opener"],\n'
+        '      "notes": "",\n'
+        '      "interpretation": ""\n'
+        '    },\n'
+        '    "assets": {\n'
+        '      "asset_abc12345": {\n'
+        '        "kind": "photo",\n'
+        '        "subject": "...",\n'
+        '        "depicts": "...",\n'
+        '        "feel": "warm",\n'
+        '        "composition": "centered",\n'
+        '        "colors": ["navy"],\n'
+        '        "scope": ["generic"],\n'
+        '        "suitable_for": ["team"],\n'
+        '        "notes": "",\n'
+        '        "interpretation": ""\n'
+        '      }\n'
+        '    }\n'
+        '  },\n'
+        '  "02": { "slide": {...}, "assets": { ... } }\n'
+        '}\n'
+    )
+    return (
+        f"# Bulk describe batch — {n} slide(s) with their constituent assets\n\n"
+        f"The downstream pipeline picks slides as templates and pulls "
+        f"individual assets (photos, logos, tables, callouts) onto them at "
+        f"compose time. Both need descriptions. Today they're described "
+        f"independently — this batch lets you describe them **together**, "
+        f"so the slide's context can inform asset descriptions (and vice "
+        f"versa).\n\n"
+        f"## Bundle structure\n\n"
+        f"The zip contains {n} numbered folders. Each folder is one slide:\n\n"
+        f"- `<NN>/slide.png` — rendered preview of the slide\n"
+        f"- `<NN>/<asset_id>.<ext>` — the binary of every asset that "
+        f"appears on this slide (photo, logo, icon, table xml, etc.). "
+        f"The filename stem is the asset's stable id — use it verbatim "
+        f"as the JSON key.\n\n"
+        f"### Expected per-bundle contents\n\n"
+        f"{expected_block}\n\n"
+        f"## Output format\n\n"
+        f"Return ONE JSON object. Top-level keys are the 2-digit bundle "
+        f"ids (`\"01\"`, `\"02\"`, ..., `\"{n:02d}\"`). Each value is an "
+        f"object with two sub-keys:\n\n"
+        f"- `slide` — the slide's description fields (see slide schema below)\n"
+        f"- `assets` — a dict keyed by asset id (e.g. `\"asset_abc12345\"`); "
+        f"each value is that asset's description fields (see asset schema "
+        f"below). Include exactly the asset ids listed for that bundle "
+        f"above. If a bundle has 0 assets, output `\"assets\": {{}}`.\n\n"
+        f"```json\n{sample_block}```\n\n"
+        f"Return EXACTLY {n} top-level entries. Use the asset ids as listed "
+        f"above — do NOT rename them. Output ONLY the JSON object. No "
+        f"commentary, no markdown code fences, no prose before or after.\n\n"
+        f"---\n\n"
+        f"## Slide description schema (use under each `slide` key)\n\n"
+        f"{slide_prompt}\n\n"
+        f"---\n\n"
+        f"## Asset description schema (use under each `assets.<id>` key)\n\n"
+        f"{asset_prompt}\n"
+    )
+
+
 def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
     item_name = "image" if kind == "asset" else "slide preview"
     if kind == "asset":
@@ -239,7 +419,8 @@ def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
             '    "colors": ["navy", "white"],\n'
             '    "scope": ["generic"],\n'
             '    "suitable_for": ["team"],\n'
-            '    "notes": ""\n'
+            '    "notes": "",\n'
+            '    "interpretation": ""\n'
             '  },\n'
             '  "02": { "kind": "photo", "...": "same fields" }\n'
             '}\n'
@@ -251,7 +432,8 @@ def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
             '    "intent": "...",\n'
             '    "feel": "formal",\n'
             '    "suitable_for": ["opener"],\n'
-            '    "notes": ""\n'
+            '    "notes": "",\n'
+            '    "interpretation": ""\n'
             '  },\n'
             '  "02": { "intent": "...", "...": "same fields" }\n'
             '}\n'
@@ -275,6 +457,37 @@ def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
     )
 
 
+# Cap on how many describe batches we keep on disk. Each batch holds a
+# zip (slide PNGs + asset binaries) plus a manifest; at ~2 MB/bundle
+# they accumulate quickly in long-running workspaces. The /api/batches
+# list endpoint still caps at 20 for safety, but in practice we prune
+# eagerly here. Losing a batch before applying it just means
+# regenerating — cheap.
+_KEEP_BATCHES = 5
+
+
+def _prune_old_batches(keep: int = _KEEP_BATCHES) -> int:
+    """Delete all but the `keep` most-recent batch dirs. Returns count removed.
+
+    Batch ids are `%Y%m%d-%H%M%S` so lexicographic sort == chronological.
+    """
+    if not BATCHES_DIR.exists():
+        return 0
+    dirs = sorted(
+        [d for d in BATCHES_DIR.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    removed = 0
+    for stale in dirs[keep:]:
+        try:
+            shutil.rmtree(stale)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 @app.post("/api/batch/create")
 def api_batch_create():
     body = request.get_json(force=True) or {}
@@ -283,12 +496,15 @@ def api_batch_create():
         count = max(1, min(20, int(body.get("count", 10))))
     except (TypeError, ValueError):
         return jsonify({"error": "count must be an integer"}), 400
-    if kind not in ("asset", "slide"):
-        return jsonify({"error": "kind must be 'asset' or 'slide'"}), 400
+    if kind not in ("asset", "slide", "slide_with_assets"):
+        return jsonify({
+            "error": "kind must be 'asset', 'slide', or 'slide_with_assets'",
+        }), 400
 
     if kind == "asset":
         candidates = list(cli_mod.iter_asset_yamls())
     else:
+        # Both 'slide' and 'slide_with_assets' start from pending slides.
         candidates = list(cli_mod.iter_slide_yamls())
     pending = [p for p in candidates if _safe_read(p).get("status", "pending") == "pending"]
     selected = pending[:count]
@@ -319,7 +535,9 @@ def api_batch_create():
                     ext = binary.suffix.lstrip(".") or "png"
                     key = f"{added + 1:02d}"
                     zf.write(binary, f"{key}.{ext}")
-                else:
+                    manifest["items"][key] = rel
+                    added += 1
+                elif kind == "slide":
                     slide_pptx = ypath.with_suffix(".pptx")
                     if not slide_pptx.exists():
                         skipped.append({"yaml": rel, "reason": "slide fragment .pptx missing"})
@@ -341,20 +559,68 @@ def api_batch_create():
                         continue
                     key = f"{added + 1:02d}"
                     zf.write(png, f"{key}.png")
-                manifest["items"][key] = rel
-                added += 1
+                    manifest["items"][key] = rel
+                    added += 1
+                else:
+                    # slide_with_assets: one numbered folder per slide,
+                    # containing slide.png + each asset binary. Manifest
+                    # value is a nested dict so apply can route both
+                    # halves of the LLM response.
+                    slide_pptx = ypath.with_suffix(".pptx")
+                    if not slide_pptx.exists():
+                        skipped.append({"yaml": rel, "reason": "slide fragment .pptx missing"})
+                        continue
+                    png = _ensure_slide_png(slide_pptx)
+                    if png is None:
+                        available = cli_mod.available_renderers()
+                        reason = (
+                            "no slide renderer available — install "
+                            "LibreOffice, or use PowerPoint on Windows"
+                            if not available
+                            else f"slide rendering failed (tried: {', '.join(available)})"
+                        )
+                        skipped.append({"yaml": rel, "reason": reason})
+                        continue
+                    key = f"{added + 1:02d}"
+                    zf.write(png, f"{key}/slide.png")
+                    asset_yamls = _assets_for_slide(ypath)
+                    assets_map: dict[str, str] = {}
+                    for ap in asset_yamls:
+                        a_data = _safe_read(ap)
+                        a_id = a_data.get("id", "")
+                        if not a_id:
+                            continue
+                        a_bin = _asset_binary(ap)
+                        if a_bin is None or not a_bin.exists() or a_bin.stat().st_size == 0:
+                            # Skip this individual asset but keep the bundle.
+                            continue
+                        ext = a_bin.suffix.lstrip(".") or "bin"
+                        zf.write(a_bin, f"{key}/{a_id}.{ext}")
+                        assets_map[a_id] = str(ap.relative_to(HERE))
+                    manifest["items"][key] = {"slide": rel, "assets": assets_map}
+                    added += 1
             except OSError as e:
                 skipped.append({"yaml": rel, "reason": f"OS error: {e}"})
             except Exception as e:
                 skipped.append({"yaml": rel, "reason": f"unexpected: {type(e).__name__}: {e}"})
 
-        per_item_prompt = (HERE / "prompts" / f"describe_{kind}.md").read_text(
-            encoding="utf-8"
-        )
-        zf.writestr(
-            "instructions.md",
-            _bulk_instructions(kind, added, per_item_prompt),
-        )
+        if kind == "slide_with_assets":
+            slide_prompt = (HERE / "prompts" / "describe_slide.md").read_text(encoding="utf-8")
+            asset_prompt = (HERE / "prompts" / "describe_asset.md").read_text(encoding="utf-8")
+            zf.writestr(
+                "instructions.md",
+                _bulk_instructions_slide_with_assets(
+                    added, slide_prompt, asset_prompt, manifest["items"],
+                ),
+            )
+        else:
+            per_item_prompt = (HERE / "prompts" / f"describe_{kind}.md").read_text(
+                encoding="utf-8"
+            )
+            zf.writestr(
+                "instructions.md",
+                _bulk_instructions(kind, added, per_item_prompt),
+            )
 
     if not manifest["items"]:
         shutil.rmtree(batch_dir, ignore_errors=True)
@@ -368,6 +634,8 @@ def api_batch_create():
         json_mod.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
+    pruned = _prune_old_batches()
+
     return jsonify({
         "batch_id": batch_id,
         "kind": kind,
@@ -376,6 +644,7 @@ def api_batch_create():
         "items": manifest["items"],
         "skipped": skipped,
         "download_url": f"/api/batch/{batch_id}/download",
+        "pruned": pruned,
     })
 
 
@@ -447,10 +716,82 @@ def api_batch_apply(batch_id):
         if n is not None and isinstance(v, dict):
             by_int[n] = v
 
+    batch_kind = manifest.get("kind", "asset")
     results = []
-    for key, rel in manifest["items"].items():
+    for key, manifest_entry in manifest["items"].items():
         n = _normalize_key_to_int(key)
         entry = by_int.get(n) if n is not None else None
+
+        # slide_with_assets: manifest_entry is a dict {slide, assets},
+        # and entry is expected to mirror that nested shape.
+        if batch_kind == "slide_with_assets" and isinstance(manifest_entry, dict):
+            slide_rel = manifest_entry.get("slide", "")
+            assets_map = manifest_entry.get("assets") or {}
+            if entry is None:
+                results.append({
+                    "id": key, "yaml": slide_rel, "status": "no-match",
+                    "errors": ["LLM response missing this bundle key"],
+                })
+                continue
+            slide_fields = entry.get("slide") if isinstance(entry.get("slide"), dict) else None
+            asset_fields = entry.get("assets") if isinstance(entry.get("assets"), dict) else {}
+
+            # Apply slide half.
+            if slide_fields is None:
+                results.append({
+                    "id": key, "yaml": slide_rel, "status": "no-match",
+                    "errors": ["bundle entry missing 'slide' object"],
+                })
+            else:
+                try:
+                    p = _yaml_for_rel(slide_rel)
+                    errs, status = _save_and_validate(p, slide_fields)
+                    results.append({
+                        "id": key, "yaml": slide_rel, "status": status, "errors": errs,
+                    })
+                except Exception as e:
+                    results.append({
+                        "id": key, "yaml": slide_rel, "status": "error",
+                        "errors": [str(e)],
+                    })
+
+            # Apply each asset half. Skip with a notice if already done —
+            # avoids overwriting a description the user already validated
+            # via the regular asset bulk mode or by hand.
+            for asset_id, asset_rel in assets_map.items():
+                sub_key = f"{key}/{asset_id}"
+                af = asset_fields.get(asset_id) if isinstance(asset_fields, dict) else None
+                if not isinstance(af, dict):
+                    results.append({
+                        "id": sub_key, "yaml": asset_rel, "status": "no-match",
+                        "errors": [f"bundle entry missing assets.{asset_id}"],
+                    })
+                    continue
+                try:
+                    ap = _yaml_for_rel(asset_rel)
+                    existing = _safe_read(ap)
+                    if existing.get("status") == "done":
+                        results.append({
+                            "id": sub_key, "yaml": asset_rel, "status": "skipped",
+                            "errors": [
+                                f"asset {asset_id} already described as 'done'; "
+                                f"keeping existing description, skipping bundle override"
+                            ],
+                        })
+                        continue
+                    errs, status = _save_and_validate(ap, af)
+                    results.append({
+                        "id": sub_key, "yaml": asset_rel, "status": status, "errors": errs,
+                    })
+                except Exception as e:
+                    results.append({
+                        "id": sub_key, "yaml": asset_rel, "status": "error",
+                        "errors": [str(e)],
+                    })
+            continue
+
+        # Flat batch kinds (asset, slide): manifest_entry is a path string.
+        rel = manifest_entry if isinstance(manifest_entry, str) else str(manifest_entry)
         if entry is None:
             results.append({
                 "id": key, "yaml": rel, "status": "no-match",
@@ -472,7 +813,7 @@ def api_batch_apply(batch_id):
         "batch_id": batch_id,
         "results": results,
         "found_keys": found_keys,
-        "matched": sum(1 for r in results if r["status"] != "no-match"),
+        "matched": sum(1 for r in results if r["status"] not in ("no-match",)),
     })
 
 
@@ -501,7 +842,10 @@ def api_batches_list():
             "kind": m.get("kind"),
             "count": len(m.get("items", {})),
         })
-    return jsonify({"batches": out[:20]})
+    # Cap matches _KEEP_BATCHES so the dropdown can't surface a batch
+    # that's already been pruned from disk. Defense-in-depth — disk
+    # pruning runs on every create, so out should already be ≤_KEEP_BATCHES.
+    return jsonify({"batches": out[:_KEEP_BATCHES]})
 
 
 @app.get("/preview")
@@ -757,7 +1101,13 @@ def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str
 
 
 def _stage_compose_bundle(staging: Path) -> None:
-    """Stage a minimal reader.py-compatible bundle (full KB) under `staging`."""
+    """Stage a minimal reader.py-compatible bundle (full KB) under `staging`.
+
+    Produces the same on-disk layout `cli build` does (sans SKILL.md /
+    brand.md, which compose-run doesn't need): reader.py, index.json,
+    templates/<id>/slide.pptx + meta.yaml, assets/<id>.<ext> + .yaml,
+    decks/<deck>/theme.yaml (so D5 cross-deck remap can resolve themes).
+    """
     slides, assets = _collect_descriptions()
     (staging / "reader.py").write_text(
         (cli_mod.CONSUMER / "reader.py").read_text(encoding="utf-8"),
@@ -793,6 +1143,32 @@ def _stage_compose_bundle(staging: Path) -> None:
             yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
+
+    # index.json — required by reader.py's load_index(). Same payload
+    # build_index() produces during `cli build`, minus the _yaml_path
+    # sidecar that's only meaningful inside the workspace.
+    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
+    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
+    index = cli_mod.build_index(clean_slides, clean_assets)
+    (staging / "index.json").write_text(
+        json_mod.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+    # Per-deck theme.yaml — needed for D5 cross-deck colour remap +
+    # v4.1 font remap when an atom is pulled from a foreign deck onto
+    # a host. Only ship themes whose deck still has at least one
+    # described template (mirrors _build_prompt_bundle_zip's logic).
+    decks_in_bundle = {
+        (s.get("sources") or [{}])[0].get("deck", "") for s in clean_slides
+    }
+    decks_in_bundle.discard("")
+    decks_dir = staging / "decks"
+    for theme_yaml in sorted((cli_mod.WORKSPACE / "decks").glob("*/theme.yaml")):
+        if theme_yaml.parent.name not in decks_in_bundle:
+            continue
+        deck_out = decks_dir / theme_yaml.parent.name
+        deck_out.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(theme_yaml, deck_out / "theme.yaml")
 
 
 @app.get("/api/compose/options")
@@ -1100,6 +1476,20 @@ INDEX_HTML = r"""<!doctype html>
     .batch-view code { background: #eef; padding: 1px 4px; border-radius: 3px;
                         font-size: 11px; }
     .recent-batch { font-size: 12px; color: #555; margin: 8px 0; }
+
+    .ingest-row { padding: 8px 14px; border-bottom: 1px solid #ddd;
+                  background: #fafafa; display: flex; align-items: center;
+                  gap: 8px; flex-wrap: wrap; }
+    .ingest-row button { font-size: 12px; padding: 4px 10px;
+                          border: 1px solid #0066cc; background: white;
+                          color: #0066cc; border-radius: 4px; cursor: pointer; }
+    .ingest-row button:hover { background: #eef4ff; }
+    .ingest-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .ingest-row .ingest-msg { font-size: 11px; color: #555; flex: 1;
+                               min-width: 0; overflow: hidden;
+                               text-overflow: ellipsis; white-space: nowrap; }
+    .ingest-row .ingest-msg.ok { color: #1b5e20; }
+    .ingest-row .ingest-msg.err { color: #a00; white-space: normal; }
   </style>
 </head>
 <body>
@@ -1110,6 +1500,15 @@ INDEX_HTML = r"""<!doctype html>
       <a href="/compose" style="float:right;font-size:11px;color:#0066cc;
          text-decoration:none;">Compose →</a>
     </header>
+    <div class="ingest-row">
+      <input type="file" id="ingestFile" accept=".pptx"
+             style="display:none;" />
+      <button id="ingestBtn" type="button">+ Ingest .pptx</button>
+      <span class="ingest-msg" id="ingestMsg"
+            title="Upload a .pptx to ingest as a new deck. Re-uploads of an existing deck are rejected — delete its workspace/decks/&lt;name&gt;/ dir first.">
+        Add a new deck to the workspace
+      </span>
+    </div>
     <div class="view-toggle">
       <button data-view="items" class="active">Single</button>
       <button data-view="batch">Bulk</button>
@@ -1141,6 +1540,7 @@ INDEX_HTML = r"""<!doctype html>
           <select id="batchKind">
             <option value="asset">Assets</option>
             <option value="slide">Slides</option>
+            <option value="slide_with_assets">Slides + their assets (bundled)</option>
           </select>
         </label>
         <label>Count:
@@ -1320,7 +1720,9 @@ function buildForm(item) {
     addText(f, "intent", d.intent || "", "one sentence, <20 words");
     addSelect(f, "feel", d.feel || "", SLIDE_FEEL);
     addChips(f, "suitable_for", d.suitable_for || [], SLIDE_TAGS);
-    addTextarea(f, "notes", d.notes || "");
+    addTextarea(f, "notes", d.notes || "", "human reviewer note");
+    addTextarea(f, "interpretation", d.interpretation || "",
+      "model's speculative observations — info only, not filterable");
   } else {
     addSelect(f, "kind", d.kind || "", ASSET_KIND);
     addText(f, "subject", d.subject || "", "neutral, <25 words");
@@ -1331,7 +1733,9 @@ function buildForm(item) {
     addText(f, "scope", (d.scope || []).join(", "),
       "comma-separated; e.g. 'client:acme-bank, industry:finance' or 'generic'");
     addChips(f, "suitable_for", d.suitable_for || [], ASSET_TAGS);
-    addTextarea(f, "notes", d.notes || "");
+    addTextarea(f, "notes", d.notes || "", "human reviewer note");
+    addTextarea(f, "interpretation", d.interpretation || "",
+      "model's speculative observations — info only, not filterable");
   }
   document.getElementById("msg").innerHTML = "";
 }
@@ -1342,8 +1746,10 @@ function addText(parent, name, value, hint) {
   parent.append(lbl);
   parent.append(el("input", {type: "text", name, value, id: name}));
 }
-function addTextarea(parent, name, value) {
-  parent.append(el("label", {for: name}, name));
+function addTextarea(parent, name, value, hint) {
+  const lbl = el("label", {for: name}, name);
+  if (hint) lbl.append(el("span", {class: "hint"}, hint));
+  parent.append(lbl);
   parent.append(el("textarea", {name, id: name, rows: "3"}, value));
 }
 function addSelect(parent, name, value, options) {
@@ -1374,6 +1780,7 @@ function gatherForm() {
     out.feel = document.getElementById("feel").value;
     out.suitable_for = chipValues("suitable_for");
     out.notes = document.getElementById("notes").value.trim();
+    out.interpretation = document.getElementById("interpretation").value.trim();
   } else {
     out.kind = document.getElementById("kind").value;
     out.subject = document.getElementById("subject").value.trim();
@@ -1386,6 +1793,7 @@ function gatherForm() {
       .split(",").map(s => s.trim()).filter(Boolean);
     out.suitable_for = chipValues("suitable_for");
     out.notes = document.getElementById("notes").value.trim();
+    out.interpretation = document.getElementById("interpretation").value.trim();
   }
   return out;
 }
@@ -1505,12 +1913,22 @@ async function renderBatchThumbnails(batchId) {
       pane.innerHTML = '<div class="batch-thumbs-empty">Batch is empty.</div>';
       return;
     }
-    const cards = Object.entries(items).map(([k, v]) =>
-      `<div class="bt" title="${escapeHtml(v)}">
+    const cards = Object.entries(items).map(([k, v]) => {
+      // slide_with_assets entries are {slide, assets}; render the slide
+      // preview and a small count of bundled assets.
+      if (v && typeof v === "object" && v.slide) {
+        const nAssets = Object.keys(v.assets || {}).length;
+        const slideRel = v.slide;
+        return `<div class="bt" title="${escapeHtml(slideRel)}">
+          <img src="/preview?yaml=${encodeURIComponent(slideRel)}" alt="${escapeHtml(k)}" loading="lazy">
+          <div class="lbl">${escapeHtml(k)} · ${escapeHtml(slideRel.split("/").pop().replace(/\.yaml$/, ""))} <em>(+${nAssets})</em></div>
+         </div>`;
+      }
+      return `<div class="bt" title="${escapeHtml(v)}">
         <img src="/preview?yaml=${encodeURIComponent(v)}" alt="${escapeHtml(k)}" loading="lazy">
         <div class="lbl">${escapeHtml(k)} · ${escapeHtml(v.split("/").pop().replace(/\.yaml$/, ""))}</div>
-       </div>`
-    ).join("");
+       </div>`;
+    }).join("");
     pane.innerHTML = `<div class="batch-thumbs">${cards}</div>`;
   } catch (e) {
     pane.innerHTML =
@@ -1578,7 +1996,12 @@ function refreshPendingHint() {
   const pool = kind === "asset" ? items.assets : items.slides;
   const n = pool.filter(i => i.status === "pending").length;
   const hint = document.getElementById("pendingHint");
-  hint.textContent = `(${n} pending ${kind}${n === 1 ? "" : "s"})`;
+  const label = (
+    kind === "asset" ? "asset" :
+    kind === "slide" ? "slide" :
+    "slide bundle"
+  );
+  hint.textContent = `(${n} pending ${label}${n === 1 ? "" : "s"})`;
   hint.style.color = n === 0 ? "#a00" : "#888";
   document.getElementById("batchGenBtn").disabled = n === 0;
 }
@@ -1607,9 +2030,14 @@ async function batchGenerate() {
   currentBatchId = j.batch_id;
   localStorage.setItem("describe.batchId", currentBatchId);
 
-  const itemsList = Object.entries(j.items).map(([k, v]) =>
-    `<code>${k}</code> → ${escapeHtml(_shortPath(v))}`
-  ).join("<br>");
+  const itemsList = Object.entries(j.items).map(([k, v]) => {
+    // slide_with_assets entries are nested {slide, assets}; others are strings.
+    if (v && typeof v === "object" && v.slide) {
+      const nAssets = Object.keys(v.assets || {}).length;
+      return `<code>${k}</code> → ${escapeHtml(_shortPath(v.slide))} <em>(+${nAssets} asset${nAssets === 1 ? "" : "s"})</em>`;
+    }
+    return `<code>${k}</code> → ${escapeHtml(_shortPath(v))}`;
+  }).join("<br>");
 
   const summary = (j.count < (j.requested || j.count))
     ? `${j.count} of ${j.requested} requested`
@@ -1695,6 +2123,48 @@ document.getElementById("saveOnly").addEventListener("click", () => save(false))
 document.getElementById("copyPrompt").addEventListener("click", copyPrompt);
 document.querySelectorAll(".mode-toggle button").forEach(b => {
   b.addEventListener("click", () => setMode(b.dataset.mode));
+});
+
+// --- Ingest .pptx upload ---------------------------------------------------
+const ingestBtn = document.getElementById("ingestBtn");
+const ingestFile = document.getElementById("ingestFile");
+const ingestMsg = document.getElementById("ingestMsg");
+
+function setIngestMsg(text, tone) {
+  ingestMsg.textContent = text;
+  ingestMsg.classList.remove("ok", "err");
+  if (tone) ingestMsg.classList.add(tone);
+}
+
+ingestBtn.addEventListener("click", () => ingestFile.click());
+ingestFile.addEventListener("change", async () => {
+  const f = ingestFile.files && ingestFile.files[0];
+  if (!f) return;
+  setIngestMsg("Uploading " + f.name + " …", null);
+  ingestBtn.disabled = true;
+  const fd = new FormData();
+  fd.append("pptx", f);
+  try {
+    const r = await fetch("/api/ingest", { method: "POST", body: fd });
+    const data = await r.json().catch(() => ({error: "non-JSON response"}));
+    if (!r.ok) {
+      setIngestMsg(data.error || ("HTTP " + r.status), "err");
+    } else {
+      setIngestMsg(
+        "Ingested " + data.deck_stem + ": "
+        + data.slides + " slides, "
+        + data.pictures + " pictures, "
+        + data.atoms + " atoms",
+        "ok"
+      );
+      loadItems();  // refresh sidebar so new pending items appear
+    }
+  } catch (e) {
+    setIngestMsg("Upload failed: " + e.message, "err");
+  } finally {
+    ingestBtn.disabled = false;
+    ingestFile.value = "";  // allow re-uploading same filename
+  }
 });
 
 applyMode();

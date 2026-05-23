@@ -481,21 +481,26 @@ class TestGroupRecursion(unittest.TestCase):
         self._add_callout(grp, 1, 1)
         self._add_callout(grp, 4, 1)
         with tempfile.TemporaryDirectory() as d:
-            ids = cli_mod.extract_structured_atoms(
+            entries = cli_mod.extract_structured_atoms(
                 slide, deck_stem="syn_group", slide_number=1,
                 assets_dir=Path(d),
                 slide_w=prs.slide_width, slide_h=prs.slide_height,
             )
             # Two grouped callouts should both surface as callout atoms.
-            self.assertEqual(len(ids), 2)
-            # Each id should have a .xml fragment + .yaml stub on disk.
-            for aid in ids:
-                sha = aid.replace("asset_", "")
-                # sha-prefix only — find the full filename via glob.
+            self.assertEqual(len(entries), 2)
+            for entry in entries:
+                self.assertIn("atom", entry)
+                self.assertEqual(entry["kind"], "callout")
+                # Geometry is per-shape fractional; group-local coords
+                # still produce valid fractions (sometimes inflated for
+                # scaled groups; here the groups have default transforms).
+                for key in ("x", "y", "w", "h", "region"):
+                    self.assertIn(key, entry)
+                sha = entry["atom"].replace("asset_", "")
                 xmls = list(Path(d).glob(f"{sha}*.xml"))
                 yamls = list(Path(d).glob(f"{sha}*.yaml"))
-                self.assertEqual(len(xmls), 1, f"missing xml for {aid}")
-                self.assertEqual(len(yamls), 1, f"missing yaml for {aid}")
+                self.assertEqual(len(xmls), 1, f"missing xml for {entry['atom']}")
+                self.assertEqual(len(yamls), 1, f"missing yaml for {entry['atom']}")
 
     def test_extract_structured_atoms_mixes_grouped_and_flat(self):
         prs = Presentation()
@@ -507,12 +512,173 @@ class TestGroupRecursion(unittest.TestCase):
         self._add_callout(grp, 4, 1)
         self._add_callout(grp, 7, 1)
         with tempfile.TemporaryDirectory() as d:
-            ids = cli_mod.extract_structured_atoms(
+            entries = cli_mod.extract_structured_atoms(
                 slide, deck_stem="syn_mixed", slide_number=1,
                 assets_dir=Path(d),
                 slide_w=prs.slide_width, slide_h=prs.slide_height,
             )
-            self.assertEqual(len(ids), 3)
+            self.assertEqual(len(entries), 3)
+            self.assertTrue(all(e["kind"] == "callout" for e in entries))
+
+
+# ---------------------------------------------------------------------------
+# v4.2 — slide anatomy: enriched layout + positional inventory
+# ---------------------------------------------------------------------------
+
+
+class TestSlideAnatomy(unittest.TestCase):
+    def test_shape_kind_label_identifies_common_kinds(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        callout = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(1), Inches(1), Inches(2), Inches(1),
+        )
+        tbl = slide.shapes.add_table(
+            rows=2, cols=2,
+            left=Inches(4), top=Inches(1), width=Inches(3), height=Inches(2),
+        )
+        self.assertEqual(cli_mod._shape_kind_label(callout), "callout")
+        self.assertEqual(cli_mod._shape_kind_label(tbl), "table")
+
+    def test_shape_geometry_yields_fractions_and_region(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        shp = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(7), Inches(5), Inches(2), Inches(1.5),  # right-bottom area
+        )
+        geom = cli_mod._shape_geometry(shp, prs.slide_width, prs.slide_height)
+        # Fractions in (0, 1) for a real shape on a real slide.
+        for k in ("x", "y", "w", "h"):
+            self.assertIsInstance(geom[k], float)
+            self.assertGreaterEqual(geom[k], 0.0)
+            self.assertLess(geom[k], 1.0)
+        # Center of the shape lands in the right-bottom third → region
+        # should be "bottom-right".
+        self.assertEqual(geom["region"], "bottom-right")
+
+    def test_infer_layout_includes_non_placeholder_atoms(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        # Title placeholder is already present from layout 5.
+        slide.shapes.title.text = "hi"
+        # Add a callout in the bottom-right.
+        slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(7), Inches(5), Inches(2), Inches(1.5),
+        )
+        slots, renames = cli_mod.detect_slots(
+            slide, prs.slide_width, prs.slide_height, {},
+        )
+        layout = cli_mod.infer_layout(
+            slide, slots, renames, prs.slide_width, prs.slide_height,
+        )
+        # The title slot should appear with its slot id; the callout
+        # should appear as "callout@bottom-right".
+        self.assertIn("@", layout)
+        self.assertIn("callout@bottom-right", layout)
+
+    def test_infer_layout_disambiguates_repeated_kinds(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        # Two callouts at different positions → expect "callout@…, callout#2@…".
+        slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(1), Inches(1), Inches(2), Inches(2),
+        )
+        slide.shapes.add_shape(
+            MSO_SHAPE.OVAL,
+            Inches(6), Inches(5), Inches(2), Inches(1.5),
+        )
+        slots, renames = cli_mod.detect_slots(
+            slide, prs.slide_width, prs.slide_height, {},
+        )
+        layout = cli_mod.infer_layout(
+            slide, slots, renames, prs.slide_width, prs.slide_height,
+        )
+        self.assertIn("callout@", layout)
+        self.assertIn("callout#2@", layout)
+
+    def test_infer_layout_skips_decorative_tiny_shapes(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        # Hairline-sized shape (well under 0.5% area) — should be filtered.
+        slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(1), Inches(1), Inches(0.05), Inches(0.05),
+        )
+        slots, renames = cli_mod.detect_slots(
+            slide, prs.slide_width, prs.slide_height, {},
+        )
+        layout = cli_mod.infer_layout(
+            slide, slots, renames, prs.slide_width, prs.slide_height,
+        )
+        # No "callout@" in the layout — the tiny shape was skipped.
+        self.assertNotIn("callout@", layout)
+
+    def test_extract_structured_atoms_inventory_carries_geometry(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(7), Inches(5), Inches(2), Inches(1.5),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            entries = cli_mod.extract_structured_atoms(
+                slide, deck_stem="syn_geom", slide_number=1,
+                assets_dir=Path(d),
+                slide_w=prs.slide_width, slide_h=prs.slide_height,
+            )
+            self.assertEqual(len(entries), 1)
+            e = entries[0]
+            self.assertTrue(e["atom"].startswith("asset_"))
+            self.assertEqual(e["kind"], "callout")
+            self.assertEqual(e["region"], "bottom-right")
+            self.assertGreater(e["x"], 0.5)  # right-half
+            self.assertGreater(e["y"], 0.5)  # bottom-half
+
+
+# ---------------------------------------------------------------------------
+# v4.2 — composition required for picture-kinds only
+# ---------------------------------------------------------------------------
+
+
+class TestAssetValidation(unittest.TestCase):
+    BASE = {
+        "subject": "x",
+        "feel": "formal",
+        "colors": ["gray"],
+        "scope": ["generic"],
+        "suitable_for": ["data"],
+    }
+
+    def test_table_atom_with_empty_composition_validates(self):
+        data = {**self.BASE, "kind": "table", "composition": ""}
+        self.assertEqual(cli_mod.validate_asset(data), [])
+
+    def test_callout_atom_with_empty_composition_validates(self):
+        data = {**self.BASE, "kind": "callout", "composition": ""}
+        self.assertEqual(cli_mod.validate_asset(data), [])
+
+    def test_photo_with_empty_composition_fails(self):
+        data = {**self.BASE, "kind": "photo", "composition": ""}
+        errs = cli_mod.validate_asset(data)
+        self.assertTrue(
+            any("composition is required" in e for e in errs),
+            errs,
+        )
+
+    def test_photo_with_valid_composition_validates(self):
+        data = {**self.BASE, "kind": "photo", "composition": "centered"}
+        self.assertEqual(cli_mod.validate_asset(data), [])
+
+    def test_bad_composition_value_fails_regardless_of_kind(self):
+        # Even for a structured atom, a NON-EMPTY but invalid composition
+        # still fails — we don't accept arbitrary strings.
+        data = {**self.BASE, "kind": "table", "composition": "lopsided"}
+        errs = cli_mod.validate_asset(data)
+        self.assertTrue(any("not in" in e for e in errs), errs)
 
 
 if __name__ == "__main__":

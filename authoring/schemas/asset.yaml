@@ -123,6 +123,16 @@ status: pending
 # fields. Ignored by the consumer agent's filter logic.
 notes: ""
 
+# Model's speculative observations — soft hunches, plausible-but-
+# uncertain identifications, era guesses, historical / cultural
+# references, things the describing model noticed but isn't willing
+# to assert in `subject`/`depicts`/etc. (e.g. "might be Einstein —
+# 1920s portrait, chalkboard with relativity equations visible").
+# Visible to the consuming agent as INFORMATIONAL context — never a
+# filter target, never used by the engine for any policy decision.
+# Distinct from `notes` (human reviewer free-form).
+interpretation: ""
+
 # --- Auto-populated structural fields (do not hand-edit) ---
 
 id: ""               # filled on ingest

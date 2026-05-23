@@ -24,7 +24,14 @@ When choosing between assets, the agent reads:
 - `suitable_for` — slide types this works on
 
 Do not write marketing language. Do not interpret meaning beyond what
-is visible. Describe what is there and quantifiable.
+is visible **in these fields**. Describe what is there and quantifiable.
+
+For your softer observations — hunches you can't fully commit to,
+plausible-but-uncertain identifications, era guesses, cultural /
+historical references you noticed — use `interpretation` (see below).
+That field is INFORMATIONAL ONLY: the agent reads it as context but
+it is never used as a filter target or policy gate, so it can't
+corrupt the strict pipeline.
 
 ---
 
@@ -41,7 +48,8 @@ composition: ""       # centered | left-weighted | right-weighted | full-bleed |
 colors: []            # 1-3 plain color words
 scope: []             # REQUIRED — see "Scope" below. Use [generic] if unsure.
 suitable_for: []      # 1-4 tags from the controlled vocab below
-notes: ""             # optional
+notes: ""             # optional human reviewer note
+interpretation: ""    # your speculative observations — see "interpretation" below
 ```
 
 ## `kind` — what the atom is
@@ -130,6 +138,7 @@ colors: [warm white, navy, soft yellow]
 scope: [generic]
 suitable_for: [team, culture]
 notes: ""
+interpretation: ""
 ```
 
 ### Example 2 — Client-specific logo
@@ -146,6 +155,7 @@ colors: [navy, white]
 scope: [client:acme-bank]
 suitable_for: [closing, hero]
 notes: ""
+interpretation: ""
 ```
 
 ### Example 3 — Internal process diagram
@@ -163,6 +173,7 @@ colors: [white, gray, black]
 scope: [program:offer-process]
 suitable_for: [data, abstract]
 notes: "Activity diagram from internal RFP tooling"
+interpretation: "Lane labels and gate-density suggest a regulated-industry approval workflow — likely banking or insurance. The annotation style (rounded boxes, dashed handoffs) reads as a BPMN-tool export rather than hand-drawn."
 ```
 
 ### Example 4 — Industry-fit stock photo
@@ -180,6 +191,7 @@ colors: [navy, white, red]
 scope: [industry:finance]
 suitable_for: [hero, data]
 notes: ""
+interpretation: "Appears to be a generic stock-image trading floor — Bloomberg-terminal-style monitors visible, no firm-specific branding I can identify. Likely from a stock library rather than a real venue."
 ```
 
 ### Example 5 — Product screenshot
@@ -196,6 +208,7 @@ colors: [blue, white, gray]
 scope: [product:salesforce]
 suitable_for: [product, data]
 notes: ""
+interpretation: ""
 ```
 
 ### Example 6 — Decorative
@@ -212,7 +225,47 @@ colors: [orange, cream]
 scope: [generic]
 suitable_for: [decorative]
 notes: ""
+interpretation: ""
 ```
+
+---
+
+## `interpretation` — your speculative observations
+
+The strict fields above are deliberately constrained — they must be
+machine-actionable and uncontroversial. This means there is no place
+for hunches, plausible identifications you can't fully confirm, art-
+historical references, era guesses, or contextual clues. Those often
+matter, so `interpretation` is where they go.
+
+Use it freely for things like:
+
+- "The figure resembles Einstein in a 1920s Berlin studio portrait,
+  chalkboard with relativity equations visible — likely intended to
+  evoke that era of physics specifically."
+- "Mid-century corporate signage aesthetic; the typeface and palette
+  read as ~1960s IBM or AT&T. Probably chosen to project legacy."
+- "Black & white press photo of what looks like a Cold War summit.
+  Cannot confirm identities or event."
+- "The icon repeats a motif I noticed in earlier assets (the same
+  abstract spiral) — may be a recurring brand element across this
+  deck family."
+
+Rules for `interpretation`:
+
+- **Mark uncertainty.** Use "appears", "looks like", "possibly", "may
+  be" — never assert as fact what you would not put in `subject`.
+- **Don't repeat the strict fields.** If something belongs in
+  `subject` / `depicts` / `feel`, put it there. `interpretation` is
+  for the *extra* observations those fields can't accommodate.
+- **Free text, one paragraph.** No enum vocab, no list structure.
+- **Plain prose, no markdown formatting** inside the YAML string.
+- **Empty is fine.** If you have nothing speculative to add, leave it
+  as `""`. Don't pad.
+
+The agent reads `interpretation` as informational context — it never
+filters, gates, or routes on this field, so a wrong hunch can't break
+the pipeline. Distinct from `notes`, which is for human reviewer use.
 
 ---
 
@@ -230,5 +283,7 @@ notes: ""
   matching namespaced scope.
 - `suitable_for` describes *slide types*, not *topics*. "team" is
   fine; "Q4 earnings deck" is too specific.
+- `interpretation` carries soft observations (see section above).
+  Empty is acceptable. Never use it to assert facts.
 - Output ONLY the YAML. No preamble, no closing remarks, no
   surrounding code fence labels other than `yaml`.

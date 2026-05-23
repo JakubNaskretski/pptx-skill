@@ -57,10 +57,23 @@ Pick a pre-described template, fill its slots.
 Slot keys must match the template's declared `slots` (call
 `get <template_id>` to inspect them).
 
-### Mode 2 — compose from atoms (v4)
+### Mode 2 — compose from atoms (v4) — full freedom mode
 
-Assemble a slide from atoms on a blank canvas. Use when no template
-fits but you want to reuse captured atoms.
+Build a slide from scratch on a blank canvas. You can place **any
+atom from the catalog** (photo, logo, illustration, vector, table,
+callout, freeform, smartart) at any position, mixed with **native
+textboxes** you write yourself. The host template's theme (colours +
+fonts) still applies to the slide — see `theme_colors` / `fonts`
+on the host you picked.
+
+Use this mode whenever a template's `slots` don't expose what you
+need. Want a photo where the template only has a text slot? Want
+to mix a logo + table + freeform title that don't naturally
+co-occur in any single template? Want to add a one-off text
+annotation positioned freely? Compose-mode is the answer — it is
+not a fallback, it is a peer to template-mode. Pick template-mode
+when an existing template *already encodes the layout you want*;
+pick compose-mode otherwise.
 
 ```json
 {
@@ -70,8 +83,10 @@ fits but you want to reuse captured atoms.
     {"kind": "text", "value": "Pipeline view",
      "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.1,
      "bold": true},
+    {"atom": "asset_8c14", "kind": "image",
+     "x": 0.05, "y": 0.2, "w": 0.4, "h": 0.5},
     {"atom": "asset_cb3a", "kind": "callout",
-     "x": 0.05, "y": 0.2, "w": 0.4, "h": 0.4,
+     "x": 0.05, "y": 0.75, "w": 0.4, "h": 0.15,
      "recolor": {"#ff0000": "accent"}},
     {"atom": "asset_4f01", "kind": "table",
      "x": 0.55, "y": 0.2, "w": 0.4, "h": 0.6,
@@ -79,6 +94,29 @@ fits but you want to reuse captured atoms.
   ]
 }
 ```
+
+The shape spec is uniform regardless of asset kind — pass any
+`asset_<id>` from the bundle's `assets` index along with fractional
+geometry. Picture atoms route through `add_picture`; XML atoms
+(table, callout, freeform) graft as fragments. The `kind` field on
+each shape is informational + lets the engine apply kind-specific
+handling like `cells` for tables.
+
+### How to choose between modes
+
+- **Template-mode** when an existing template `slots[]` + `layout`
+  already match the slide you want — fill the slots, ship it. Best
+  for "standard slide types" the deck author already pre-designed:
+  openers, two-column layouts, dashboards, closers.
+- **Compose-mode** when the layout you need doesn't exist as a
+  template, OR when you want to mix atoms from multiple decks onto
+  a single slide (e.g. a photo atom from deck A on a host template
+  from deck B), OR when you want full positional control. Don't
+  force a template to do something it wasn't designed for — drop
+  into compose-mode instead.
+- **Hybrid plan** — a plan is an array, so you can mix entry kinds
+  freely. Most decks end up template-mode for 60-80% of slides and
+  compose-mode for the rest where flexibility matters.
 
 **Status (current build):**
 - `kind: text` shapes render as plain textboxes; `bold` is honored.
@@ -156,9 +194,18 @@ Templates additionally expose (v4):
 - `fonts` — `{major, minor}` from the deck's theme font scheme
 - `slots[].style` — captured run-level overrides (`size_pt`, `bold`,
   `color_role`, `font`, …) where the template explicitly set them
-- `inventory` — list of atom ids carried by this template (so you
-  know what comes "for free" when picking it; the same atoms are
-  individually addressable from compose-mode)
+- `layout` — a richer spatial summary string of *every* visually-
+  meaningful shape on the slide (placeholders, pictures, atoms),
+  not just placeholders. Tokens are `label@region` where region is
+  one of `top|middle|bottom`-`left|center|right`. Repeats of the
+  same kind get suffixed (`image@…, image#2@…`). Example:
+  `"title@top-center, image@right, bullets@left, image#2@bottom-right"`.
+- `inventory` — per-shape dicts for the assets that appear on this
+  slide. Each entry: `{atom, kind, x, y, w, h, region}` where x/y/w/h
+  are slide-relative fractions (0.0-1.0). Lets you pick a template
+  not just by intent but by *anatomy* — "this template has a chart
+  bottom-right and a callout middle". Same atoms are individually
+  addressable from compose-mode via their `atom` id.
 
 Assets additionally expose kind-specific blocks (v4):
 
@@ -167,6 +214,26 @@ Assets additionally expose kind-specific blocks (v4):
 - `shape`: `{geometry, is_recolorable}` (for callout / freeform)
 - `smartart`: `{layout, nodes}`
 - `recolor_targets` (vector): hex codes the engine can rewrite
+
+## Informational fields (v4.1) — not filterable
+
+Both templates and assets can carry an `interpretation` string when
+the describing model surfaced soft observations alongside the strict
+descriptive fields. Treat this as **context to consider, never as a
+filter target or routing rule**:
+
+- It carries hunches, plausible-but-uncertain identifications, era
+  guesses, design rationale the model inferred, cross-asset patterns
+  it noticed, etc.
+- `--filter interpretation=…` is not supported and should not be
+  attempted — the field is deliberately excluded from the strict
+  retrieval pipeline so a wrong hunch cannot mis-route a pick.
+- Use it the way a human designer would use marginalia: it can tip
+  ties between otherwise comparable picks (e.g. a brief mentioning
+  "early-20th-century physics" matches an asset whose
+  `interpretation` reads "appears to be Einstein in 1920s Berlin",
+  even though `subject` only says "older man at a chalkboard"), but
+  never override the strict fields.
 
 `--filter` accepts comma-separated `key=value` pairs. List-valued
 fields match if any element equals the filter value. Within a

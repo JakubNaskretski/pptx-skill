@@ -372,19 +372,96 @@ def detect_slots(
     return slots, renames
 
 
+def _shape_kind_label(shape) -> str | None:
+    """Short kind label for a non-placeholder shape, or None if uninteresting.
+
+    Used by ``infer_layout`` to label visually-meaningful content that
+    isn't a placeholder slot. Returns one of: ``image``, ``vector``,
+    ``table``, ``chart``, ``smartart``, ``callout``, ``freeform``,
+    ``text``. Returns ``None`` for shape types we don't classify so the
+    caller can skip them (decorations, connectors, etc.).
+    """
+    if _shape_is_picture(shape):
+        return "image"
+    try:
+        if getattr(shape, "has_table", False):
+            return "table"
+        if getattr(shape, "has_chart", False):
+            return "chart"
+    except (AttributeError, ValueError):
+        pass
+    if _shape_is_smartart(shape):
+        return "smartart"
+    stype = getattr(shape, "shape_type", None)
+    if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
+        return "callout"
+    if stype == MSO_SHAPE_TYPE.FREEFORM:
+        return "freeform"
+    if stype == MSO_SHAPE_TYPE.TEXT_BOX:
+        return "text"
+    return None
+
+
+def _shape_geometry(shape, slide_w: int, slide_h: int) -> dict:
+    """Per-shape fractional geometry + coarse region label.
+
+    Returns ``{x, y, w, h, region}`` where x/y/w/h are slide-relative
+    fractions (0.0-1.0, rounded to 3 decimals to keep YAML terse) and
+    ``region`` is the position-quadrant string used by ``infer_layout``.
+    Empty dict if slide dimensions are zero.
+    """
+    if not slide_w or not slide_h:
+        return {}
+    left = shape.left or 0
+    top = shape.top or 0
+    width = shape.width or 0
+    height = shape.height or 0
+    return {
+        "x": round(left / slide_w, 3),
+        "y": round(top / slide_h, 3),
+        "w": round(width / slide_w, 3),
+        "h": round(height / slide_h, 3),
+        "region": position_quadrant(left, top, width, height, slide_w, slide_h),
+    }
+
+
 def infer_layout(slide, slots: list[dict], renames: dict, slide_w: int, slide_h: int) -> str:
-    """Best-effort one-line layout description from slot positions."""
+    """One-line spatial summary of every visually-meaningful shape.
+
+    Walks the slide (descending into groups) and labels each shape by
+    either its slot id (if it became a template slot during
+    ``detect_slots``) or by ``_shape_kind_label`` (otherwise). Skips
+    decorations and hairlines via ``_atom_too_small``.
+
+    Output is a comma-separated list of ``label@region`` tokens, e.g.
+    ``"title@top-center, image@middle-right, callout@bottom-left"``.
+    This is what the compose-time agent reads to understand a slide's
+    *anatomy* — distinct from its descriptive ``intent``.
+    """
     parts: list[str] = []
-    for shape in list(slide.shapes):
-        sid = renames.get(shape.shape_id)
-        if not sid:
-            continue
+    seen_labels: dict[str, int] = {}  # disambiguate repeats: image, image#2
+    for shape in _iter_shapes_recursive(slide):
+        if shape.shape_id in renames:
+            label = renames[shape.shape_id]
+        else:
+            if _atom_too_small(shape, slide_w, slide_h):
+                continue
+            kind = _shape_kind_label(shape)
+            if not kind:
+                continue
+            label = kind
+        # If we see the same kind twice on one slide (e.g. two pictures),
+        # disambiguate as image, image#2, image#3 — gives the compose
+        # agent a stable way to refer to the n-th instance positionally.
+        count = seen_labels.get(label, 0) + 1
+        seen_labels[label] = count
+        tag = label if count == 1 else f"{label}#{count}"
         left = shape.left or 0
         top = shape.top or 0
         width = shape.width or 0
         height = shape.height or 0
-        pos = position_quadrant(left, top, width, height, slide_w, slide_h)
-        parts.append(f"{sid}@{pos}")
+        region = position_quadrant(left, top, width, height, slide_w, slide_h)
+        parts.append(f"{tag}@{region}")
     return ", ".join(parts) if parts else "freeform"
 
 
@@ -662,6 +739,7 @@ _SLIDE_DESCRIPTIVE_DEFAULTS = {
     "suitable_for": [],
     "status": "pending",
     "notes": "",
+    "interpretation": "",
 }
 
 
@@ -702,6 +780,7 @@ def write_slide_yaml_stub(
         "suitable_for": descriptive["suitable_for"],
         "status": descriptive["status"],
         "notes": descriptive["notes"],
+        "interpretation": descriptive["interpretation"],
         "id": slide_id,
         "layout": layout,
         "theme_colors": theme_colors or {},
@@ -743,6 +822,7 @@ _ASSET_DESCRIPTIVE_DEFAULTS = {
     "suitable_for": [],
     "status": "pending",
     "notes": "",
+    "interpretation": "",
 }
 
 
@@ -814,6 +894,7 @@ def write_asset_yaml_stub(
         "suitable_for": descriptive["suitable_for"],
         "status": descriptive["status"],
         "notes": descriptive["notes"],
+        "interpretation": descriptive["interpretation"],
         "id": asset_id,
         "sha1": sha1,
         "sources": sources,
@@ -1178,7 +1259,7 @@ def extract_structured_atoms(
     slide_w: int,
     slide_h: int,
     slot_shape_ids: set | None = None,
-) -> list[str]:
+) -> list[dict]:
     """Save non-picture, non-text-placeholder shapes as typed atom assets.
 
     Captures tables, charts, smartart, auto-shapes (callouts), freeforms.
@@ -1189,10 +1270,22 @@ def extract_structured_atoms(
     Descends into Group shapes up to ``_MAX_GROUP_DEPTH`` levels so
     grouped callouts aren't silently lost.
 
-    Returns list of asset ids.
+    v4.2: returns ``[{atom, kind, x, y, w, h, region}, ...]`` — one
+    per slide occurrence with positional info, for the slide's
+    inventory. Previously returned bare asset ids.
     """
     slot_shape_ids = slot_shape_ids or set()
-    extracted: list[str] = []
+    extracted: list[dict] = []
+
+    def _add(asset_id: str | None, shape, kind: str) -> None:
+        if not asset_id:
+            return
+        extracted.append({
+            "atom": asset_id,
+            "kind": kind,
+            **_shape_geometry(shape, slide_w, slide_h),
+        })
+
     for shape in list(_iter_shapes_recursive(slide)):
         # Shapes that detect_slots claimed as template slots aren't
         # addressable as standalone atoms — the agent fills them via
@@ -1213,44 +1306,47 @@ def extract_structured_atoms(
         # has_table / has_chart. Check the more specific ones first.
         try:
             if getattr(shape, "has_table", False):
-                a = _extract_table_atom(shape, deck_stem, slide_number, assets_dir)
-                if a:
-                    extracted.append(a)
+                _add(_extract_table_atom(shape, deck_stem, slide_number, assets_dir), shape, "table")
                 continue
             if getattr(shape, "has_chart", False):
-                a = _extract_chart_atom(shape, deck_stem, slide_number, assets_dir)
-                if a:
-                    extracted.append(a)
+                _add(_extract_chart_atom(shape, deck_stem, slide_number, assets_dir), shape, "chart")
                 continue
         except (AttributeError, ValueError):
             pass
 
         if _shape_is_smartart(shape):
-            a = _extract_smartart_atom(shape, deck_stem, slide_number, assets_dir)
-            if a:
-                extracted.append(a)
+            _add(_extract_smartart_atom(shape, deck_stem, slide_number, assets_dir), shape, "smartart")
             continue
 
         stype = getattr(shape, "shape_type", None)
         if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
             if _atom_too_small(shape, slide_w, slide_h):
                 continue
-            a = _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "callout")
-            if a:
-                extracted.append(a)
+            _add(
+                _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "callout"),
+                shape, "callout",
+            )
             continue
         if stype == MSO_SHAPE_TYPE.FREEFORM:
             if _atom_too_small(shape, slide_w, slide_h):
                 continue
-            a = _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "freeform")
-            if a:
-                extracted.append(a)
+            _add(
+                _extract_geometric_atom(shape, deck_stem, slide_number, assets_dir, "freeform"),
+                shape, "freeform",
+            )
             continue
 
     return extracted
 
 
-def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir: Path) -> list[str]:
+def extract_picture_assets(
+    slide,
+    deck_stem: str,
+    slide_number: int,
+    assets_dir: Path,
+    slide_w: int = 0,
+    slide_h: int = 0,
+) -> list[dict]:
     """Save all picture shapes on this slide as <sha1>.<ext> binaries + yaml stubs.
 
     v4: for each Picture shape we extract:
@@ -1261,9 +1357,13 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
     v4.1: descends into Group shapes up to ``_MAX_GROUP_DEPTH`` levels
     so grouped pictures aren't lost.
 
-    Returns the list of asset ids extracted (raster + any siblings).
+    v4.2: returns a list of per-slide inventory dicts ``{atom, kind, x,
+    y, w, h, region}`` instead of bare ids — gives the compose-time
+    agent positional info for each picture. SVG siblings share the
+    parent picture's geometry (they render in place of the raster on
+    capable viewers).
     """
-    extracted: list[str] = []
+    extracted: list[dict] = []
     for shape in list(_iter_shapes_recursive(slide)):
         if not _shape_is_picture(shape):
             continue
@@ -1290,7 +1390,8 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
             slide_number,
             colors_hex=colors_hex,
         )
-        extracted.append(asset_id)
+        geom = _shape_geometry(shape, slide_w, slide_h)
+        extracted.append({"atom": asset_id, "kind": "image", **geom})
 
         # --- SVG sibling (vector source) ---
         svg_blob, svg_ext = _extract_svg_sibling(shape)
@@ -1312,7 +1413,7 @@ def extract_picture_assets(slide, deck_stem: str, slide_number: int, assets_dir:
                 colors_hex=svg_colors,
                 recolor_targets=svg_colors,
             )
-            extracted.append(svg_asset_id)
+            extracted.append({"atom": svg_asset_id, "kind": "vector", **geom})
 
     return extracted
 
@@ -1419,7 +1520,16 @@ def extract_deck_theme(prs, deck_stem: str) -> dict:
 
 
 SLIDE_REQUIRED = ("intent", "feel", "suitable_for")
-ASSET_REQUIRED = ("kind", "subject", "feel", "composition", "colors", "scope", "suitable_for")
+# Base required-for-all-assets. `composition` is intentionally NOT in
+# this list — it's only required for picture-kinds (see ASSET_PICTURE_KINDS
+# below). Structured atoms (table, chart, callout, freeform, smartart)
+# can have empty composition because the concept doesn't apply.
+ASSET_REQUIRED = ("kind", "subject", "feel", "colors", "scope", "suitable_for")
+# Kinds for which `composition` is meaningful and required. Mirrors the
+# guidance in describe_asset.md ("the slot applies primarily to pictures").
+ASSET_PICTURE_KINDS = frozenset(
+    {"photo", "icon", "logo", "illustration", "screenshot", "vector"}
+)
 
 VOCAB_PATH = SCHEMAS / "vocab.yaml"
 
@@ -1466,13 +1576,19 @@ def validate_slide(data: dict) -> list[str]:
 
 def validate_asset(data: dict) -> list[str]:
     errors = _missing_or_empty(data, ASSET_REQUIRED)
-    if data.get("kind") and data["kind"] not in ASSET_KIND_ENUM:
-        errors.append(f"kind '{data['kind']}' not in {sorted(ASSET_KIND_ENUM)}")
+    kind = data.get("kind") or ""
+    if kind and kind not in ASSET_KIND_ENUM:
+        errors.append(f"kind '{kind}' not in {sorted(ASSET_KIND_ENUM)}")
     if data.get("feel") and data["feel"] not in ASSET_FEEL_ENUM:
         errors.append(f"feel '{data['feel']}' not in {sorted(ASSET_FEEL_ENUM)}")
-    if data.get("composition") and data["composition"] not in ASSET_COMPOSITION_ENUM:
+    # `composition` is required for picture-kinds only; structured atoms
+    # (table, chart, callout, freeform, smartart) can leave it empty.
+    composition = data.get("composition") or ""
+    if kind in ASSET_PICTURE_KINDS and not composition:
+        errors.append("composition is required for picture-kind assets")
+    if composition and composition not in ASSET_COMPOSITION_ENUM:
         errors.append(
-            f"composition '{data['composition']}' not in {sorted(ASSET_COMPOSITION_ENUM)}"
+            f"composition '{composition}' not in {sorted(ASSET_COMPOSITION_ENUM)}"
         )
     sfor = data.get("suitable_for") or []
     if isinstance(sfor, list):
@@ -1535,13 +1651,40 @@ def cli() -> None:
 # --- ingest ----------------------------------------------------------------
 
 
-@cli.command()
-@click.argument("deck", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def ingest(deck: Path) -> None:
-    """Strip a deck into workspace/ as slide fragments + asset binaries."""
+class IngestCollisionError(Exception):
+    """Raised when a deck dir with the target stem already exists.
+
+    The CLI shells out to a fresh process per ingest so collisions are
+    rare in practice, but the Flask app's /api/ingest endpoint chose a
+    reject-on-collision policy to keep accidental re-uploads from
+    silently overwriting state — callers can catch this and surface it.
+    """
+
+    def __init__(self, deck_stem: str, existing_dir: Path):
+        super().__init__(
+            f"deck {deck_stem!r} already ingested at {existing_dir}"
+        )
+        self.deck_stem = deck_stem
+        self.existing_dir = existing_dir
+
+
+def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
+    """Strip a deck into workspace/ as slide fragments + asset binaries.
+
+    Pure-Python helper used by the CLI command and the Flask /api/ingest
+    endpoint. Returns a dict with ingest stats so callers can show the
+    user what landed without re-walking the workspace.
+
+    ``reject_collision``: if True and ``workspace/decks/<stem>/`` already
+    exists, raise IngestCollisionError instead of re-ingesting. The CLI
+    leaves this False (re-ingest is a normal flow); the upload endpoint
+    sets True so accidental double-uploads surface a clear error.
+    """
     ensure_workspace()
     deck_stem = deck.stem
     deck_dir = WORKSPACE / "decks" / deck_stem
+    if reject_collision and deck_dir.exists():
+        raise IngestCollisionError(deck_stem, deck_dir)
     slides_dir = deck_dir / "slides"
     slides_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1573,6 +1716,8 @@ def ingest(deck: Path) -> None:
     slide_fonts = {k: v for k, v in (theme.get("fonts") or {}).items() if v}
 
     assets_dir = WORKSPACE / "assets"
+    all_atom_ids: set[str] = set()
+    all_picture_ids: set[str] = set()
 
     n_slides = len(prs.slides)
     for idx in range(n_slides):
@@ -1587,15 +1732,23 @@ def ingest(deck: Path) -> None:
 
         write_slide_fragment(original, idx, slide_pptx, renames)
         # Extract atoms BEFORE writing the slide yaml so we can populate
-        # inventory with the structured-atom ids this template carries
-        # (so the agent knows "picking this template gives you these
-        # atoms for free, or you can address them individually in
-        # compose mode").
-        extract_picture_assets(slide, deck_stem, slide_number, assets_dir)
-        atom_ids = extract_structured_atoms(
+        # inventory with the per-shape positional info this template
+        # carries (so the agent knows "picking this template gives you
+        # these atoms for free at these positions, or you can address
+        # them individually in compose mode").
+        pic_entries = extract_picture_assets(
+            slide, deck_stem, slide_number, assets_dir, slide_w, slide_h,
+        )
+        atom_entries = extract_structured_atoms(
             slide, deck_stem, slide_number, assets_dir, slide_w, slide_h,
             slot_shape_ids=set(renames.keys()),
         )
+        # v4.2: inventory unions pictures + structured atoms with
+        # per-shape geometry — gives the compose-time agent slide
+        # anatomy beyond just the (placeholder-only) `slots` field.
+        inventory = pic_entries + atom_entries
+        all_picture_ids.update(e["atom"] for e in pic_entries if e.get("atom"))
+        all_atom_ids.update(e["atom"] for e in atom_entries if e.get("atom"))
         write_slide_yaml_stub(
             slide_yaml,
             slide_id,
@@ -1605,10 +1758,26 @@ def ingest(deck: Path) -> None:
             slide_number,
             theme_colors=slide_theme_colors,
             fonts=slide_fonts,
-            inventory=atom_ids,
+            inventory=inventory,
         )
 
-    click.echo(f"Ingested {deck.name}: {n_slides} slide(s) → {slides_dir}")
+    return {
+        "deck_stem": deck_stem,
+        "slides": n_slides,
+        "pictures": len(all_picture_ids),
+        "atoms": len(all_atom_ids),
+        "slides_dir": str(slides_dir),
+    }
+
+
+@cli.command()
+@click.argument("deck", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def ingest(deck: Path) -> None:
+    """Strip a deck into workspace/ as slide fragments + asset binaries."""
+    result = _ingest_pptx(deck)
+    click.echo(
+        f"Ingested {deck.name}: {result['slides']} slide(s) → {result['slides_dir']}"
+    )
 
 
 # --- status ----------------------------------------------------------------
@@ -1949,7 +2118,9 @@ def _template_index_entry(s: dict) -> dict:
     }
     # v4: include the auto-extracted theme snapshot + atom inventory
     # when present. Omit empties so v3-era templates stay terse.
-    for key in ("theme_colors", "fonts", "inventory"):
+    # v4.1: `interpretation` — model's speculative observations, info-only;
+    # not used for filtering, just surfaced to the compose-time agent.
+    for key in ("theme_colors", "fonts", "inventory", "interpretation"):
         v = s.get(key)
         if v:
             out[key] = v
@@ -1971,7 +2142,12 @@ def _asset_index_entry(a: dict) -> dict:
     # v4: structured colour + kind-specific blocks. All optional —
     # only emit when present so the index stays focused on retrievable
     # fields.
-    for key in ("colors_hex", "recolor_targets", "table", "chart", "shape", "smartart"):
+    # v4.1: `interpretation` — model's speculative observations, info-only;
+    # never a filter target, surfaced to the compose-time agent as context.
+    for key in (
+        "colors_hex", "recolor_targets", "table", "chart", "shape", "smartart",
+        "interpretation",
+    ):
         v = a.get(key)
         if v:
             out[key] = v

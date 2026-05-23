@@ -29,6 +29,14 @@ suitable_for: []
 status: pending     # pending | done | locked
 notes: ""           # free-form reviewer notes
 
+# Model's speculative observations about the slide — design rationale
+# the model infers, audience guesses, things noticed beyond what
+# `intent` / `feel` capture (e.g. "looks like a Q4 retrospective; the
+# yellow callout reads as a celebratory accent rather than a warning").
+# Visible to the consuming agent as INFORMATIONAL context — never a
+# filter target. Distinct from `notes` (human reviewer free-form).
+interpretation: ""
+
 # --- Auto-populated structural fields (do not hand-edit) ---
 #
 # `layout` is best-effort inferred from placeholder geometry.
@@ -79,9 +87,19 @@ slots:
 # Decorative atoms present on this template (informational; carried
 # verbatim by template-mode compose, individually addressable by
 # compose-mode if the agent wants to reuse them outside the template).
-# List of asset ids; see assets/<id>.yaml for descriptions.
-# Auto-populated by Phase B ingest. Pre-v4 templates leave empty.
-inventory: []        # ["asset_cb3a7799", "asset_4f01a2bb"]
+#
+# v4.2: list of per-shape dicts with positional info. Each entry:
+#   - atom:   asset id ("asset_<sha8>")
+#   - kind:   image | vector | table | chart | callout | freeform | smartart
+#   - x,y,w,h: slide-relative fractions (0.0-1.0)
+#   - region: coarse position quadrant (e.g. "bottom-right")
+#
+# Together with `layout` and `slots`, this gives the compose-time
+# agent the slide's anatomy beyond just its descriptive `intent`:
+# which assets are on this slide and where.
+# Auto-populated by Phase B ingest. Pre-v4.2 templates may show empty
+# list or the older bare-id format; re-ingest to refresh.
+inventory: []        # [{atom: asset_xxx, kind: image, region: bottom-right, x: 0.85, y: 0.86, w: 0.13, h: 0.13}]
 
 sources:
   - deck: ""
