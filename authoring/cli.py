@@ -693,6 +693,25 @@ def write_slide_yaml_stub(
     write_yaml(out_path, out)
 
 
+def _current_deck_stems() -> set[str]:
+    """Names of decks currently present under workspace/decks/.
+
+    Used to prune asset.sources entries that point at decks the user
+    has since deleted (e.g. an ingest mistake cleaned up by `rm -rf`).
+    Full workspace lifecycle reconciliation is out of v4 scope; this
+    keeps cross-deck source lists from accreting noise just by ingest
+    touching the asset again.
+    """
+    decks_dir = WORKSPACE / "decks"
+    if not decks_dir.exists():
+        return set()
+    return {p.name for p in decks_dir.iterdir() if p.is_dir()}
+
+
+def _prune_dead_sources(sources: list, valid_decks: set[str]) -> list:
+    return [s for s in sources if (s.get("deck") or "") in valid_decks]
+
+
 _ASSET_DESCRIPTIVE_DEFAULTS = {
     "kind": "",
     "subject": "",
@@ -742,12 +761,15 @@ def write_asset_yaml_stub(
     if kind is not None and not descriptive["kind"]:
         descriptive["kind"] = kind
 
-    # Source list: append-only across re-ingests.
+    # Source list: append the current touch, then prune entries pointing
+    # at decks no longer in workspace/decks/ (handles the "I ran ingest
+    # wrong then rm -rf'd the bad dir" case).
     sources = list(existing.get("sources") or [])
     if not any(
         s.get("deck") == deck_stem and s.get("slide") == slide_number for s in sources
     ):
         sources.append({"deck": deck_stem, "slide": slide_number})
+    sources = _prune_dead_sources(sources, _current_deck_stems())
 
     # colors_hex: preserve previous extraction if the new pass returned
     # nothing (e.g. PIL absent, or unsupported format) so we don't clobber.
