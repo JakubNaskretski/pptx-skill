@@ -97,6 +97,12 @@ fits but you want to reuse captured atoms.
   master / theme apply). If the plan is all compose-mode entries,
   the first template in the bundle (alphabetical) becomes scratch
   host and its original slide is dropped.
+- **Cross-deck normalisation (D5).** When copying a template or atom
+  from a non-host deck, semantically-named scheme slots (`primary`,
+  `accent`, `text`, `background`) get remapped from the source deck's
+  alias to the host deck's alias so a brand colour stays a brand
+  colour. Aspect-ratio mismatches between source and host warn once
+  per source deck but don't refuse or auto-scale.
 
 ## Slot value polymorphism (v4)
 

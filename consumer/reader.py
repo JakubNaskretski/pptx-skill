@@ -522,12 +522,120 @@ def _apply_slot_value(slide, slot_id: str, value: Any, kind_hint: str | None) ->
 # --- cross-deck slide copy --------------------------------------------------
 
 
-def _copy_slide_into(dest_prs: Presentation, src_slide_pptx: Path):
+# ---------------------------------------------------------------------------
+# Deck-theme normalisation (v4 — D5)
+# ---------------------------------------------------------------------------
+#
+# When we copy a foreign deck's slide / atom into the host package, any
+# `<a:schemeClr val="..."/>` reference resolves against the HOST's theme
+# at render time — so a "brand pink accent1" in the source might paint as
+# a "navy accent1" in the host. We mitigate by remapping the small set of
+# semantically-named slots (primary / accent / text / background) per the
+# decks' aliases, so a shape that used "the source deck's accent" still
+# uses "the host deck's accent" after the copy. Other clrScheme slots
+# (accent2-6, dk3, …) we accept as-is — there is no canonical semantic
+# mapping for them.
+
+# Both names are valid in <a:schemeClr val>: theme-side (dk1/lt1/dk2/lt2)
+# and use-site (tx1/bg1/tx2/bg2). Normalize both forms to the theme-side.
+_SCHEME_NORMALIZE = {
+    "tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2",
+}
+
+
+def _norm_scheme_slot(val: str) -> str:
+    v = (val or "").lower()
+    return _SCHEME_NORMALIZE.get(v, v)
+
+
+def _load_deck_theme(deck_name: str) -> dict | None:
+    """Load decks/<deck>/theme.yaml from the bundle; None if missing."""
+    if not deck_name:
+        return None
+    p = bundle_root() / "decks" / deck_name / "theme.yaml"
+    if not p.exists():
+        return None
+    try:
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+
+
+def _resolve_template_deck_theme(template_meta: dict) -> dict:
+    """Return the full deck theme for a template; fall back to a
+    minimal synthesized dict from template_meta.theme_colors if the
+    deck's theme.yaml isn't in the bundle (e.g. older builds)."""
+    src = (template_meta.get("sources") or [{}])[0] if template_meta.get("sources") else {}
+    deck_name = src.get("deck") or ""
+    deck_theme = _load_deck_theme(deck_name)
+    if deck_theme:
+        return deck_theme
+    palette: dict = {}
+    aliases: dict = {}
+    for role, hex_val in (template_meta.get("theme_colors") or {}).items():
+        if hex_val:
+            palette[role] = hex_val
+            aliases[role] = role
+    return {"palette": palette, "aliases": aliases}
+
+
+def _build_scheme_remap(
+    source_theme: dict | None, host_theme: dict | None
+) -> dict[str, str]:
+    """Build a clrScheme-slot remap aligning source.aliases with host.aliases.
+
+    For each shared role where the slot differs between decks, add a
+    rule. Keys are normalised (dk1/lt1/dk2/lt2) so both naming forms
+    in the XML get matched.
+    """
+    if not source_theme or not host_theme:
+        return {}
+    src_aliases = source_theme.get("aliases") or {}
+    host_aliases = host_theme.get("aliases") or {}
+    remap: dict[str, str] = {}
+    for role in ("primary", "accent", "text", "background"):
+        src_slot = src_aliases.get(role)
+        host_slot = host_aliases.get(role)
+        if not src_slot or not host_slot:
+            continue
+        src_norm = _norm_scheme_slot(src_slot)
+        host_norm = _norm_scheme_slot(host_slot)
+        if src_norm != host_norm:
+            remap[src_norm] = host_slot
+    return remap
+
+
+def _apply_scheme_remap(el, remap: dict[str, str]) -> int:
+    """Rewrite <a:schemeClr val=...> per remap; returns count of substitutions."""
+    if not remap:
+        return 0
+    try:
+        from pptx.oxml.ns import qn
+    except ImportError:
+        return 0
+    count = 0
+    for sc in el.findall(".//" + qn("a:schemeClr")):
+        val = (sc.get("val") or "").lower()
+        norm = _norm_scheme_slot(val)
+        if norm in remap:
+            sc.set("val", remap[norm])
+            count += 1
+    return count
+
+
+def _copy_slide_into(
+    dest_prs: Presentation,
+    src_slide_pptx: Path,
+    source_theme: dict | None = None,
+    host_theme: dict | None = None,
+):
     """Copy the (single) slide from src_slide_pptx into dest_prs and return
     the new slide.
 
     Strategy: open the source deck, copy its first slide's shape tree onto a
-    blank layout in the destination, then re-import image rels.
+    blank layout in the destination, re-import image rels, and remap
+    semantic clrScheme slots (D5) so the copied shapes stay consistent
+    with the host's brand colours.
     """
     src_prs = Presentation(str(src_slide_pptx))
     if len(src_prs.slides) == 0:
@@ -554,6 +662,8 @@ def _copy_slide_into(dest_prs: Presentation, src_slide_pptx: Path):
     # Clear any placeholders the layout brought along — we want a clean canvas.
     for shp in list(new_slide.shapes):
         shp._element.getparent().remove(shp._element)
+
+    remap = _build_scheme_remap(source_theme, host_theme)
 
     # Copy shapes from source. For pictures, re-add via add_picture so the
     # image part is imported into the destination package.
@@ -583,6 +693,8 @@ def _copy_slide_into(dest_prs: Presentation, src_slide_pptx: Path):
             # Fall through to plain XML copy if no blob accessible.
 
         el = copy.deepcopy(shape._element)
+        if remap:
+            _apply_scheme_remap(el, remap)
         new_slide.shapes._spTree.append(el)
 
     return new_slide
@@ -775,6 +887,17 @@ def _place_atom(
         return warnings
 
     _set_atom_geometry(new_el, x_emu, y_emu, w_emu, h_emu)
+
+    # D5: remap semantic clrScheme slots when the atom came from a
+    # different deck than the host — so e.g. an accent1 reference
+    # painted in the source deck's accent still paints in the host
+    # deck's accent on the rendered slide.
+    asset_src = (meta.get("sources") or [{}])[0] if meta.get("sources") else {}
+    asset_deck_theme = _load_deck_theme(asset_src.get("deck") or "")
+    if asset_deck_theme and host_theme:
+        scheme_remap = _build_scheme_remap(asset_deck_theme, host_theme)
+        if scheme_remap:
+            _apply_scheme_remap(new_el, scheme_remap)
 
     recolor = spec.get("recolor")
     if isinstance(recolor, dict) and recolor:
@@ -974,24 +1097,6 @@ def cmd_get(args: argparse.Namespace) -> None:
     raise SystemExit(f"id not found: {target}")
 
 
-def _load_host_theme(template_meta: dict) -> dict:
-    """Best-effort host-theme dict for the recolor map's role resolution.
-
-    Template meta carries ``theme_colors`` ({primary, accent, text,
-    background} resolved hex) and originating deck info. We assemble
-    a palette/aliases shape compatible with ``_apply_recolor_xml``.
-    """
-    palette: dict = {}
-    aliases: dict = {}
-    tc = template_meta.get("theme_colors") or {}
-    for role, hex_val in tc.items():
-        if not hex_val:
-            continue
-        palette[role] = hex_val
-        aliases[role] = role
-    return {"palette": palette, "aliases": aliases}
-
-
 def cmd_compose(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
     out_path = Path(args.out)
@@ -1051,7 +1156,10 @@ def cmd_compose(args: argparse.Namespace) -> None:
     if not host_pptx.exists():
         raise SystemExit(f"missing slide.pptx for {host_tid}")
 
-    host_theme = _load_host_theme(template_meta(host_tid))
+    host_meta = template_meta(host_tid)
+    host_theme = _resolve_template_deck_theme(host_meta)
+    host_aspect = host_theme.get("aspect") or ""
+    aspect_warned_for: set[str] = set()
 
     with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
         shutil.copyfile(host_pptx, tmp.name)
@@ -1064,14 +1172,31 @@ def cmd_compose(args: argparse.Namespace) -> None:
         for i, (kind, entry) in enumerate(valid_entries):
             if kind == "template":
                 tid = entry["template"]
+                meta = template_meta(tid)
+                src_theme = _resolve_template_deck_theme(meta)
+                # Aspect-mismatch warning — once per foreign deck so
+                # the agent sees it but the warning list stays terse.
+                src_aspect = src_theme.get("aspect") or ""
+                src_deck = ((meta.get("sources") or [{}])[0] or {}).get("deck") or ""
+                if (
+                    host_aspect and src_aspect and host_aspect != src_aspect
+                    and src_deck and src_deck not in aspect_warned_for
+                ):
+                    warnings.append(
+                        f"template {tid!r}: aspect {src_aspect!r} differs from "
+                        f"host {host_aspect!r}; copied shapes are not auto-scaled"
+                    )
+                    aspect_warned_for.add(src_deck)
                 if i == 0 and host_claims_first_slide:
                     slide = dest_prs.slides[0]
                 else:
                     src_pptx = template_dir(tid) / "slide.pptx"
                     if not src_pptx.exists():
                         raise SystemExit(f"missing slide.pptx for {tid}")
-                    slide = _copy_slide_into(dest_prs, src_pptx)
-                meta = template_meta(tid)
+                    slide = _copy_slide_into(
+                        dest_prs, src_pptx,
+                        source_theme=src_theme, host_theme=host_theme,
+                    )
                 slots_by_id = {s["id"]: s for s in meta.get("slots", [])}
                 for slot_id, value in (entry.get("slots") or {}).items():
                     kind_hint = slots_by_id.get(slot_id, {}).get("kind")
