@@ -1958,7 +1958,14 @@ def build_index(slides: list[dict], assets: list[dict]) -> dict:
 @cli.command()
 @click.option("--allow-pending", is_flag=True, help="Build even if some sidecars are pending.")
 @click.option("--out", "out_path", type=click.Path(path_type=Path), default=None)
-def build(allow_pending: bool, out_path: Path | None) -> None:
+@click.option(
+    "--no-brand",
+    is_flag=True,
+    help="Build a policy-stripped bundle: brand.md is omitted and SKILL.md "
+    "carries a 'policy disabled' notice. Useful for control-test runs "
+    "comparing branded vs un-branded agent behaviour.",
+)
+def build(allow_pending: bool, out_path: Path | None, no_brand: bool) -> None:
     """Emit dist/skill.zip — the consumer artifact."""
     slide_yamls = list(iter_slide_yamls())
     asset_yamls = list(iter_asset_yamls())
@@ -2005,13 +2012,23 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
 
     index = build_index(slides_meta, assets_meta)
 
+    skill_text = skill_md.read_text(encoding="utf-8")
+    if no_brand:
+        notice = (
+            "> **Policy disabled.** This bundle was built with "
+            "`build --no-brand` — `brand.md` is intentionally omitted and "
+            "the agent should not assume any deck-style constraints beyond "
+            "what individual templates / assets describe.\n\n"
+        )
+        skill_text = notice + skill_text
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("SKILL.md", skill_md.read_text(encoding="utf-8"))
+        zf.writestr("SKILL.md", skill_text)
         zf.writestr("reader.py", reader_src.read_text(encoding="utf-8"))
         if consumer_reqs.exists():
             zf.writestr("requirements.txt", consumer_reqs.read_text(encoding="utf-8"))
         zf.writestr("index.json", json.dumps(index, indent=2, ensure_ascii=False))
-        if brand_md.exists():
+        if not no_brand and brand_md.exists():
             brand_text = brand_md.read_text(encoding="utf-8").strip()
             if brand_text:
                 zf.writestr("brand.md", brand_text + "\n")
@@ -2062,8 +2079,10 @@ def build(allow_pending: bool, out_path: Path | None) -> None:
                 yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
             )
 
+    brand_tag = " (no brand)" if no_brand else ""
     click.echo(
-        f"built {zip_path} — {len(slides_meta)} template(s), {len(assets_meta)} asset(s)"
+        f"built {zip_path}{brand_tag} — "
+        f"{len(slides_meta)} template(s), {len(assets_meta)} asset(s)"
     )
 
 
