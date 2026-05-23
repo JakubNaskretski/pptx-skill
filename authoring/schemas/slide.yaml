@@ -2,8 +2,10 @@
 # Filename: slide_NN.yaml ↔ slide_NN.pptx.
 #
 # Describe what the slide is FOR (its purpose / shape), not its
-# specific text or images. The agent picks templates by intent,
-# then replaces all slot content at compose time.
+# specific text or images. The downstream agent picks templates by
+# intent, then either replaces all slot content at compose time
+# (template mode) or extracts individual atoms onto a custom canvas
+# (compose mode — see PLAN.md → v4).
 
 # --- Required descriptive fields ---
 
@@ -36,15 +38,50 @@ notes: ""           # free-form reviewer notes
 id: ""
 layout: ""          # e.g. "title-left, image-right", "title-top, 4-quadrant"
 
+# --- v4: auto-extracted style snapshot (do not hand-edit) ---
+#
+# These fields are filled by Phase B ingest. They are INFORMATIONAL
+# for the consuming agent — they describe the template's actual
+# styling so the agent can match it to deck policy. Existing
+# templates (pre-v4) leave these empty and behave unchanged.
+
+# Colours used on this template. Auto-extracted from master/theme
+# and per-run inspection. Empty = "not yet extracted".
+theme_colors: {}    # {primary: "#0A2540", accent: "#F26B38", text: "#222222"}
+
+# Major/minor latin fonts from the theme font scheme.
+fonts: {}           # {major: "Inter", minor: "Inter"}
+
 # Slots the consumer agent can fill. Stable ids inferred from
-# placeholder kind + position. `kind` is one of: text | bullets | image.
+# placeholder kind + position. `kind` is one of:
+#   text | bullets | image | table | chart
+# `style` captures the template's actual styling so the agent
+# can decide whether to inherit (cheap) or override (creative).
+# `style` is informational, auto-populated by Phase B ingest;
+# pre-v4 templates leave it empty.
 slots:
   - id: title
     kind: text
     max_chars: 60
+    style: {}        # {font: "Inter", size_pt: 36, bold: true, color: "#0A2540", color_role: "primary"}
   # - id: hero
   #   kind: image
-  #   aspect: "16:9"   # one of: 16:9 | 4:3 | 1:1 | 3:4 | 9:16 | free
+  #   aspect: "16:9"          # 16:9 | 4:3 | 1:1 | 3:4 | 9:16 | free
+  # - id: bullets
+  #   kind: bullets
+  #   max_items: 4
+  #   style: {}
+  # - id: data
+  #   kind: table              # NEW (v4) — structured slot for cell data
+  #   rows: 4
+  #   cols: 3
+
+# Decorative atoms present on this template (informational; carried
+# verbatim by template-mode compose, individually addressable by
+# compose-mode if the agent wants to reuse them outside the template).
+# List of asset ids; see assets/<id>.yaml for descriptions.
+# Auto-populated by Phase B ingest. Pre-v4 templates leave empty.
+inventory: []        # ["asset_cb3a7799", "asset_4f01a2bb"]
 
 sources:
   - deck: ""

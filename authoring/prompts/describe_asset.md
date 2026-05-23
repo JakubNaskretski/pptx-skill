@@ -33,7 +33,7 @@ is visible. Describe what is there and quantifiable.
 Return YAML in exactly this shape — nothing else, no commentary:
 
 ```yaml
-kind: ""              # photo | icon | logo | illustration | screenshot
+kind: ""              # see "Kind" below
 subject: ""           # one sentence, neutral, under 25 words
 depicts: ""           # the THING this is about (concept). Optional if purely decorative.
 feel: ""              # formal | warm | clinical | punchy | playful | minimal | dramatic
@@ -43,6 +43,22 @@ scope: []             # REQUIRED — see "Scope" below. Use [generic] if unsure.
 suitable_for: []      # 1-4 tags from the controlled vocab below
 notes: ""             # optional
 ```
+
+## `kind` — what the atom is
+
+If you are describing a single image file, pick one of:
+
+`photo`, `icon`, `logo`, `illustration`, `screenshot`.
+
+The downstream ingest pipeline (v4+) also classifies non-picture
+atoms automatically — you will rarely be asked to describe these by
+hand, but if so use the matching kind:
+
+`vector` (SVG/EMF), `table`, `chart`, `callout`, `freeform`, `smartart`.
+
+For structured atoms (`table`, `chart`, `callout`, `freeform`,
+`smartart`) the `composition` field may be left empty — the slot
+applies primarily to pictures.
 
 Controlled vocab for `suitable_for`:
 `team`, `hero`, `product`, `data`, `culture`, `event`, `abstract`,

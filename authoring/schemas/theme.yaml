@@ -1,0 +1,52 @@
+# Per-deck theme — auto-extracted at Phase B ingest time.
+# Lives at workspace/decks/<deck>/theme.yaml.
+#
+# Captures the source deck's actual OOXML theme so the consuming
+# agent has structured access to the palette and fonts it would
+# otherwise have to guess. INFORMATIONAL ONLY — not enforced at
+# compose time. Policy enforcement is via prompt (brand.md + brief).
+#
+# Ships in the consumer skill bundle under decks/<deck>/theme.yaml.
+
+deck: ""              # source deck stem
+
+# OOXML clrScheme → 12 named slots: 4 dk/lt + 6 accents + 2 hyperlink.
+# Stored as hex with '#' prefix for readability. Engine accepts both.
+palette:
+  dk1: ""             # "dark 1" — typically the text colour
+  lt1: ""             # "light 1" — typically the page colour
+  dk2: ""             # "dark 2" — secondary dark
+  lt2: ""             # "light 2" — secondary light
+  accent1: ""
+  accent2: ""
+  accent3: ""
+  accent4: ""
+  accent5: ""
+  accent6: ""
+  hlink: ""           # hyperlink
+  folHlink: ""        # followed hyperlink
+
+# Friendly aliases mapped from the slots above. Populated by ingest
+# based on heuristics (most-used accent → "accent", darkest non-bg
+# → "primary text", …). The consuming agent uses these names; the
+# compose engine resolves through to the canonical clrScheme slot.
+aliases:
+  primary: ""         # usually dk2 or accent1 depending on deck
+  accent: ""          # usually accent1
+  text: ""            # usually dk1
+  background: ""      # usually lt1
+
+# Theme font scheme: +mj-lt (major / heading) and +mn-lt (minor / body).
+fonts:
+  major: ""
+  minor: ""
+
+# Slide aspect ratio of the source deck.
+# Informational: mismatch at compose time is a stderr warning, not
+# a hard error.
+aspect: ""            # 16:9 | 4:3 | 1:1 | 3:4 | 9:16 | free
+
+# Sources of this theme — typically a single deck, but if two decks
+# happen to ship identical themes ingest can dedupe and append.
+sources:
+  - deck: ""

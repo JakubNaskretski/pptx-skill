@@ -1,13 +1,28 @@
-# Asset description sidecar — one file per visual asset.
-# Filename matches the asset binary: <sha1>.yaml ↔ <sha1>.<ext>.
+# Asset / atom sidecar — one file per visual atom.
+# Filename matches the binary: <sha1>.yaml ↔ <sha1>.<ext>.
 #
-# The consuming agent has NO vision capability — it picks assets
+# The consuming agent has NO vision capability — it picks atoms
 # purely by reading these fields. Optimize for retrieval, not
 # captioning. Use neutral, literal language.
 
 # --- Required descriptive fields ---
 
-# One of: photo | icon | logo | illustration | screenshot
+# What kind of atom this is. The `kind` controls which kind-specific
+# fields (table:, chart:, shape:, smartart:) apply.
+#
+# Raster pictures (existing):
+#   photo | icon | logo | illustration | screenshot
+# Vector picture (NEW v4):
+#   vector      — SVG or EMF; DPI-independent, recolourable
+# Structured atoms (NEW v4):
+#   table       — has cell data + style fragment
+#   chart       — has series data + chart XML fragment
+#   callout     — has shape XML fragment + bounding geometry
+#   freeform    — has custom path XML
+#   smartart    — has layout + node text + fragment XML
+#
+# kind is set by ingest. Hand-editing it changes how compose treats
+# the atom — only do so if ingest mis-classified.
 kind: ""
 
 # What is literally visible. One neutral sentence, under 25 words.
@@ -15,51 +30,87 @@ kind: ""
 # Good: "Four people standing around a laptop in an open office."
 subject: ""
 
+# The concept this atom is ABOUT — what THING it represents.
+# Most important field for retrieval beyond visual matching.
+# 1-5 words. Leave empty only if purely decorative.
+depicts: ""
+
 # Mood / visual style. Pick from the enum:
 #   formal | warm | clinical | punchy | playful | minimal | dramatic
-# If nothing fits, pick the closest and add a note in `notes`.
 feel: ""
 
 # Where the focal subject sits in the frame. Pick from the enum:
 #   centered | left-weighted | right-weighted | full-bleed |
 #   top-heavy | scattered
-# Helps the agent match the asset to slots with matching geometry.
+#
+# REQUIRED for picture kinds (photo/icon/logo/illustration/
+# screenshot/vector). Optional for structured atoms
+# (table/chart/callout/freeform/smartart) — leave empty.
 composition: ""
 
 # 1-3 dominant colors as plain words.
 # Example: [warm white, navy]
 colors: []
 
-# The concept this asset is ABOUT — what THING it represents, not how it
-# looks. Most important field for retrieval beyond visual matching.
-# Examples:
-#   "ACME Bank brand mark"
-#   "sales-offer preparation workflow"
-#   "team collaboration"
-# Leave empty only if the asset is purely decorative (gradient, divider).
-depicts: ""
+# Actual hex codes extracted from binary or XML at ingest. Used by
+# the compose engine for recolouring (when the plan supplies a
+# recolour map). Auto-populated by Phase B ingest; pre-v4 atoms
+# leave empty.
+colors_hex: []        # ["#0A2540", "#F26B38"]
 
-# Where this asset is reusable. List of namespaced tokens telling the
-# downstream agent WHEN this asset is appropriate.
+# Where this asset is reusable. List of namespaced tokens telling
+# the downstream agent WHEN this asset is appropriate.
 #
-# Recognized prefixes (extend as the library grows):
-#   generic              — bare token; usable in any deck
-#   client:<slug>        — tied to a specific client/account
-#   industry:<slug>      — tied to a sector
-#   product:<slug>       — tied to a specific product/offering
-#   program:<slug>       — tied to an internal program/initiative
-#   topic:<slug>         — tied to a topic
+# Recognized prefixes:
+#   generic                    — bare token; usable in any deck
+#   client:<slug>              — tied to a specific client/account
+#   industry:<slug>            — tied to a sector
+#   product:<slug>             — tied to a specific product/offering
+#   program:<slug>             — tied to an internal program/initiative
+#   topic:<slug>               — tied to a topic
 #
-# An asset can have multiple scopes — e.g. an event photo from an ACME
-# finance summit: [client:acme-bank, industry:finance].
 # Required: at least one entry. If unsure, use [generic].
 scope: []
 
-# Slide-content types this asset is appropriate for. 1-4 tags.
-# Use existing tags where possible:
+# Slide-content types this asset is appropriate for. 1-4 tags from:
 #   team | hero | product | data | culture | event | abstract |
 #   decorative | closing | quote
 suitable_for: []
+
+# --- Kind-specific fields (v4, auto-populated by Phase B ingest) ---
+#
+# Only the block matching this atom's `kind` is relevant. Others
+# stay empty / are omitted.
+
+# For kind: vector — hex colors that can be remapped at compose time.
+# Subset of colors_hex that the engine knows how to find + rewrite
+# inside the SVG/EMF (e.g. fill / stroke colours in the source).
+recolor_targets: []   # ["#0A2540", "#F26B38"]
+
+# For kind: table
+table:
+  rows: 0
+  cols: 0
+  headers: []         # column header strings (first row)
+  sample_cells: []    # first few rows verbatim for retrieval context
+
+# For kind: chart
+chart:
+  type: ""            # bar | line | pie | scatter | column | area | combo
+  series_count: 0
+  categories_count: 0
+
+# For kind: callout | freeform
+shape:
+  geometry: ""        # rect | rounded-rect | ellipse | arrow | triangle |
+                      # flowchart-step | banner | star | callout-cloud | ...
+  is_recolorable: false   # true if the fill is a solid colour the
+                          # engine can rewrite via the recolor map
+
+# For kind: smartart
+smartart:
+  layout: ""          # which SmartArt layout (e.g. "process", "hierarchy")
+  nodes: []           # text from each node, in reading order
 
 # --- Workflow / optional ---
 
@@ -74,8 +125,8 @@ notes: ""
 
 # --- Auto-populated structural fields (do not hand-edit) ---
 
-id: ""             # filled on ingest
-sha1: ""           # binary hash
-sources:           # which deck/slide(s) this asset came from
+id: ""               # filled on ingest
+sha1: ""             # binary hash
+sources:             # which deck/slide(s) this atom came from
   - deck: ""
     slide: 0

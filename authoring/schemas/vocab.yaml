@@ -32,11 +32,20 @@ slide:
 
 asset:
   kind:
+    # Raster pictures (v1+)
     - photo
     - icon
     - logo
     - illustration
     - screenshot
+    # Vector picture (v4) — SVG/EMF, recolourable
+    - vector
+    # Structured atoms (v4) — addressable via compose-mode plans
+    - table
+    - chart
+    - callout
+    - freeform
+    - smartart
   feel:
     - formal
     - warm
