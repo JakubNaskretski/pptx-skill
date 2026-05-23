@@ -293,6 +293,26 @@ def detect_slots(
             )
             renames[shape.shape_id] = slot_id
             continue
+        # Tables in a Content/OBJECT placeholder show up before the
+        # textual check, so an OBJECT-with-table doesn't get mistyped
+        # as a text slot (FINDINGS A2.7).
+        if getattr(shape, "has_table", False):
+            try:
+                rows = len(list(shape.table.rows))
+                cols = len(list(shape.table.columns))
+            except (AttributeError, ValueError):
+                rows = cols = 0
+            slot_id = _unique_id("data", used_ids)
+            slots.append(
+                {
+                    "id": slot_id,
+                    "kind": "table",
+                    "rows": rows,
+                    "cols": cols,
+                }
+            )
+            renames[shape.shape_id] = slot_id
+            continue
         if ph_type not in PLACEHOLDER_TEXTUAL:
             # Decorative / unsupported — leave frozen.
             continue
@@ -1131,19 +1151,27 @@ def extract_structured_atoms(
     assets_dir: Path,
     slide_w: int,
     slide_h: int,
+    slot_shape_ids: set | None = None,
 ) -> list[str]:
     """Save non-picture, non-text-placeholder shapes as typed atom assets.
 
     Captures tables, charts, smartart, auto-shapes (callouts), freeforms.
     Skips pictures (extract_picture_assets handles them), textual
     placeholders (those are template slots, not addressable atoms),
-    groups (recursion deferred), and atoms below ~0.5% slide area
+    any shape already promoted to a slot (`slot_shape_ids`), groups
+    (recursion deferred), and atoms below ~0.5% slide area
     (decorative hairlines / single-pixel dots).
 
     Returns list of asset ids.
     """
+    slot_shape_ids = slot_shape_ids or set()
     extracted: list[str] = []
     for shape in list(slide.shapes):
+        # Shapes that detect_slots claimed as template slots aren't
+        # addressable as standalone atoms — the agent fills them via
+        # the slot interface.
+        if shape.shape_id in slot_shape_ids:
+            continue
         if _shape_is_picture(shape):
             continue
         # Skip text/image placeholders — those drive template slots,
@@ -1535,7 +1563,8 @@ def ingest(deck: Path) -> None:
         # compose mode").
         extract_picture_assets(slide, deck_stem, slide_number, assets_dir)
         atom_ids = extract_structured_atoms(
-            slide, deck_stem, slide_number, assets_dir, slide_w, slide_h
+            slide, deck_stem, slide_number, assets_dir, slide_w, slide_h,
+            slot_shape_ids=set(renames.keys()),
         )
         write_slide_yaml_stub(
             slide_yaml,

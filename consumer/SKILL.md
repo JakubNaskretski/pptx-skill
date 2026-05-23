@@ -95,6 +95,8 @@ Slot values can take any of these shapes:
 | `"text content"` | string — plain text | ✅ |
 | `["a", "b"]` | bullets — array of plain strings | ✅ |
 | `"asset_<id>"` | image — references an asset by id | ✅ |
+| `[["h1","h2"], ["r1c1","r1c2"]]` | table — list-of-lists of cell strings (for `kind: table` slots) | ✅ |
+| `{"cells": [[...], ...]}` | table — same data wrapped (other keys ignored with a warning) | ✅ |
 | `{"text": "...", "color_role": "accent", "bold": true}` | styled text | ⚠️ degraded to plain text |
 | `{"runs": [{"text": "X", "bold": true}, {"text": " Y"}]}` | per-run rich text | ⚠️ degraded to concatenated text |
 | `{"asset": "asset_<id>", "recolor": {"#ff0000": "accent"}}` | image with overrides | ⚠️ degraded to plain image |

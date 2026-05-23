@@ -256,6 +256,61 @@ def _fill_bullets_shape(shape, values: list[str]) -> None:
                 _copy_run_font(template_run.font, sub.font)
 
 
+def _fill_table_shape(shape, cells: list[list]) -> list[str]:
+    """Fill a table placeholder's cells from a list-of-lists.
+
+    The agent supplies cells as `[[row0_col0, row0_col1, ...], ...]`.
+    Cells beyond what the template table holds are dropped with a
+    warning. Cells the agent doesn't provide are left untouched —
+    that keeps decorative template rows (e.g. footer summary) intact
+    when the agent only wants to overwrite a subset. Per-cell font /
+    colour formatting is inherited from each cell's existing first
+    run.
+
+    Returns a list of non-fatal warning strings.
+    """
+    warnings: list[str] = []
+    if not getattr(shape, "has_table", False):
+        warnings.append(f"slot '{shape.name}': not a table shape; skipping table fill")
+        return warnings
+    table = shape.table
+    rows = list(table.rows)
+    nrows = len(rows)
+
+    if len(cells) > nrows:
+        warnings.append(
+            f"slot '{shape.name}': got {len(cells)} table rows, "
+            f"template has {nrows}; truncating extras"
+        )
+
+    for i, row_vals in enumerate(cells[:nrows]):
+        row_cells = list(rows[i].cells)
+        ncols = len(row_cells)
+        if not isinstance(row_vals, list):
+            warnings.append(
+                f"slot '{shape.name}': row {i} is not a list (got {type(row_vals).__name__}); skipping"
+            )
+            continue
+        if len(row_vals) > ncols:
+            warnings.append(
+                f"slot '{shape.name}': row {i} got {len(row_vals)} cols, "
+                f"template has {ncols}; truncating extras"
+            )
+        for j, val in enumerate(row_vals[:ncols]):
+            cell = row_cells[j]
+            tf = cell.text_frame
+            first_para = tf.paragraphs[0] if tf.paragraphs else None
+            template_run = first_para.runs[0] if (first_para and first_para.runs) else None
+            tf.clear()
+            p = tf.paragraphs[0]
+            run = p.add_run()
+            run.text = _strip_bullet_prefix(str(val))
+            if template_run is not None:
+                _copy_run_font(template_run.font, run.font)
+
+    return warnings
+
+
 def _replace_image_shape_legacy(slide, shape, image_path: Path) -> None:
     """Remove the existing Picture shape and add a fresh one at the same
     geometry. Loses crop / border / shadow / rotation / transparency /
@@ -387,6 +442,31 @@ def _apply_slot_value(slide, slot_id: str, value: Any, kind_hint: str | None) ->
     shape = _find_shape_by_name(slide, slot_id)
     if shape is None:
         warnings.append(f"slot '{slot_id}' not found on slide (no shape with that name)")
+        return warnings
+
+    # Table slots use a list-of-lists shape that the degrade-and-flatten
+    # pre-pass below would corrupt — handle them up-front. We trust the
+    # slot's kind hint, but also detect has_table on the shape as a
+    # fallback when the meta is silent (pre-D3 templates).
+    is_table_slot = kind_hint == "table" or (
+        kind_hint is None and getattr(shape, "has_table", False)
+    )
+    if is_table_slot:
+        cells = value
+        if isinstance(value, dict):
+            ignored = sorted(k for k in value if k != "cells")
+            if ignored:
+                warnings.append(
+                    f"slot '{slot_id}': table slot only honors 'cells'; ignoring {ignored}"
+                )
+            cells = value.get("cells")
+        if not isinstance(cells, list) or not all(isinstance(r, list) for r in cells):
+            warnings.append(
+                f"slot '{slot_id}': table slot expects list-of-lists "
+                f"(got {type(value).__name__}); leaving template cells unchanged"
+            )
+            return warnings
+        warnings.extend(_fill_table_shape(shape, cells))
         return warnings
 
     # v4: degrade styled/per-run/image-override dicts to v3 primitives.
