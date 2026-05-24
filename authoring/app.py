@@ -1004,6 +1004,29 @@ def _format_brief(brief: str) -> str:
         "- Bullets slot values: array of strings.\n"
         "- If no asset fits a slot, omit the slot rather than forcing one.\n"
         "\n"
+        "## Helpers in this bundle\n"
+        "\n"
+        "Read-only Python utilities under `helpers/` — invoke them from the\n"
+        "bundle root (stdlib + pyyaml; exit codes 0 ok / 1 empty-or-fail / 2\n"
+        "bad input). They expose data; you decide the picks.\n"
+        "\n"
+        "- `python helpers/kb_summary.py` — facet counts; start here on a "
+        "fresh bundle\n"
+        "- `python helpers/kb_filter.py templates --feel formal "
+        "--suitable_for opener`\n"
+        "- `python helpers/kb_filter.py assets --kind photo --text \"team\"`\n"
+        "- `python helpers/kb_inspect.py <id>` — denormalized view; inlines "
+        "inventory atoms with their descriptions\n"
+        "- `python helpers/kb_lint.py < plan.json` — pre-flight validator "
+        "(slot ids, max_chars, bullet glyphs, missing assets, degraded "
+        "shapes)\n"
+        "- `python helpers/kb_themes.py [--resolve-role <role> --for-deck "
+        "<deck>]` — per-deck theme + alias-aware role resolution\n"
+        "- `python helpers/kb_budget.py <template_id> <slot_id> \"text\"` — "
+        "one-shot text-budget check\n"
+        "\n"
+        "See `helpers/README.md` for full docs.\n"
+        "\n"
         "## v4 capabilities — what's new\n"
         "\n"
         "- Each template carries `theme_colors` and `fonts` showing the\n"
@@ -1083,6 +1106,15 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
                 f"decks/{theme_yaml.parent.name}/theme.yaml",
                 theme_yaml.read_text(encoding="utf-8"),
             )
+        # Agent-side helpers: read-only kb_* scripts the agent invokes
+        # against the bundle from its own working dir (filter the catalog,
+        # inspect entries, lint a draft plan). See helpers/README.md inside
+        # the bundle. Stdlib + pyyaml only.
+        helpers_dir = cli_mod.CONSUMER / "helpers"
+        if helpers_dir.exists():
+            for hp in sorted(helpers_dir.iterdir()):
+                if hp.is_file() and not hp.name.startswith("."):
+                    zf.write(hp, f"helpers/{hp.name}")
     return buf.getvalue()
 
 
