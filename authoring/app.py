@@ -33,6 +33,16 @@ import cli as cli_mod  # noqa: E402
 WORKSPACE = HERE / "workspace"
 BATCHES_DIR = WORKSPACE / "_batches"
 
+# Per-request user-supplied assets (images / svg / xml the user attaches
+# to a specific compose request). Separate from the workspace KB.
+#   _user_assets/staged/  — accumulates uploads until Download bundle
+#   _user_assets/bundle/  — snapshot of the last bundle's user assets,
+#                           used by compose-run to resolve user_<id>
+#                           references the agent emits in the plan.
+USER_ASSETS_DIR = WORKSPACE / "_user_assets"
+USER_STAGED_DIR = USER_ASSETS_DIR / "staged"
+USER_BUNDLE_DIR = USER_ASSETS_DIR / "bundle"
+
 app = Flask(__name__)
 # Cap uploads at 200 MB — typical decks are <50 MB; this leaves headroom
 # without letting a stray multi-GB upload exhaust /tmp.
@@ -1302,6 +1312,313 @@ def api_compose_preset_delete():
     if p.exists():
         p.unlink()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# User-supplied assets — per-request attachments (separate from KB)
+# ---------------------------------------------------------------------------
+
+
+# Allow common raster images, SVG vectors, and XML atom fragments. The
+# user said they want tables/charts/etc. to work too — those are all
+# XML fragments in this codebase, so a single .xml acceptor covers them.
+_USER_EXT_KIND = {
+    ".png":  "image",  ".jpg":  "image",  ".jpeg": "image",
+    ".webp": "image",  ".gif":  "image",
+    ".svg":  "vector",
+    ".xml":  "atom",
+}
+_USER_MAX_FILE_BYTES = 20 * 1024 * 1024   # 20 MB / file
+_USER_MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB across all staged
+_USER_MAX_FILES = 30
+_USER_LOW_RES_LONG_SIDE = 800  # px — for the low-res copy shipped in the zip
+
+
+def _clear_user_staged_on_startup() -> None:
+    """Per user preference: staged uploads do NOT persist across app
+    restarts. Cleared on import. `bundle/` is left alone so a previous
+    bundle's compose-run still resolves user_<id> references."""
+    if USER_STAGED_DIR.exists():
+        shutil.rmtree(USER_STAGED_DIR, ignore_errors=True)
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _user_meta_path(dir_: Path) -> Path:
+    return dir_ / "meta.json"
+
+
+def _read_user_meta(dir_: Path) -> dict:
+    p = _user_meta_path(dir_)
+    if not p.exists():
+        return {}
+    try:
+        return json_mod.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_user_meta(dir_: Path, meta: dict) -> None:
+    _user_meta_path(dir_).write_text(
+        json_mod.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _safe_user_filename(raw: str) -> tuple[str, str] | None:
+    """Return (safe_basename, ext_lower) or None for rejected filenames.
+
+    Strips path components and leading dots so a malicious upload can't
+    escape the staging dir.
+    """
+    if not raw:
+        return None
+    base = Path(raw).name.lstrip(".").strip()
+    if not base:
+        return None
+    ext = Path(base).suffix.lower()
+    if ext not in _USER_EXT_KIND:
+        return None
+    return base, ext
+
+
+def _user_asset_image_dims(path: Path) -> tuple[int | None, int | None]:
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        return None, None
+
+
+def _user_asset_svg_dims(path: Path) -> tuple[int | None, int | None]:
+    """Pull width/height from an SVG's root element if declared. Returns
+    (None, None) on parse failure or missing attrs (acceptable — the
+    agent gets to know it's a vector either way)."""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None, None
+
+    def _strip_unit(v: str | None) -> int | None:
+        if not v:
+            return None
+        v = v.strip()
+        for unit in ("px", "pt", "mm", "cm", "in"):
+            if v.endswith(unit):
+                v = v[: -len(unit)]
+                break
+        try:
+            return int(float(v))
+        except ValueError:
+            return None
+
+    w = _strip_unit(root.get("width"))
+    h = _strip_unit(root.get("height"))
+    if (w is None or h is None) and root.get("viewBox"):
+        parts = root.get("viewBox").replace(",", " ").split()
+        if len(parts) == 4:
+            w = w or _strip_unit(parts[2])
+            h = h or _strip_unit(parts[3])
+    return w, h
+
+
+def _make_low_res(src: Path, dst: Path, kind: str) -> None:
+    """For raster: downsize so long side <= _USER_LOW_RES_LONG_SIDE and
+    re-encode. For everything else (svg / xml): copy verbatim."""
+    if kind != "image":
+        shutil.copyfile(src, dst)
+        return
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(src) as im:
+            im.load()
+            long_side = max(im.width, im.height)
+            if long_side > _USER_LOW_RES_LONG_SIDE:
+                scale = _USER_LOW_RES_LONG_SIDE / long_side
+                new_size = (max(1, int(im.width * scale)),
+                            max(1, int(im.height * scale)))
+                im = im.resize(new_size, Image.LANCZOS)
+            save_kwargs: dict = {}
+            if dst.suffix.lower() in (".jpg", ".jpeg"):
+                im = im.convert("RGB")
+                save_kwargs["quality"] = 78
+                save_kwargs["optimize"] = True
+            elif dst.suffix.lower() == ".png":
+                save_kwargs["optimize"] = True
+            im.save(dst, **save_kwargs)
+    except Exception:
+        # On any failure: fall back to the original. Bundle size hit is
+        # acceptable; correctness matters more.
+        shutil.copyfile(src, dst)
+
+
+def _hash_file(p: Path) -> str:
+    """SHA1 of file content; first 8 chars used as the stable id."""
+    import hashlib
+    h = hashlib.sha1()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stage_user_asset(f, meta: dict) -> dict:
+    """Validate + persist one uploaded file under USER_STAGED_DIR.
+
+    Returns a metadata dict for the saved file, or raises ValueError.
+    Mutates `meta` in place with the new entry.
+    """
+    parsed = _safe_user_filename(f.filename or "")
+    if parsed is None:
+        raise ValueError(f"filename rejected (need {sorted(_USER_EXT_KIND)})")
+    orig_name, ext = parsed
+    kind = _USER_EXT_KIND[ext]
+
+    # Stream into a temp file inside the staging dir so we can hash + size-
+    # check without buffering the whole upload in RAM.
+    tmp = USER_STAGED_DIR / f".incoming_{datetime.now().strftime('%H%M%S%f')}{ext}"
+    f.save(str(tmp))
+    try:
+        size_bytes = tmp.stat().st_size
+        if size_bytes > _USER_MAX_FILE_BYTES:
+            raise ValueError(
+                f"file exceeds per-file cap of "
+                f"{_USER_MAX_FILE_BYTES // (1024 * 1024)} MB"
+            )
+        total = sum(
+            (e.get("size_bytes") or 0) for e in meta.values()
+        ) + size_bytes
+        if total > _USER_MAX_TOTAL_BYTES:
+            raise ValueError(
+                f"total staged size would exceed "
+                f"{_USER_MAX_TOTAL_BYTES // (1024 * 1024)} MB"
+            )
+        if len(meta) >= _USER_MAX_FILES:
+            raise ValueError(f"already at {_USER_MAX_FILES}-file cap")
+        sha8 = _hash_file(tmp)[:8]
+        aid = f"asset_{sha8}"
+        # Dedupe: same content uploaded twice keeps the first entry.
+        if aid in meta:
+            tmp.unlink(missing_ok=True)
+            return meta[aid]
+
+        dims_w, dims_h = (None, None)
+        if kind == "image":
+            dims_w, dims_h = _user_asset_image_dims(tmp)
+        elif kind == "vector":
+            dims_w, dims_h = _user_asset_svg_dims(tmp)
+
+        final = USER_STAGED_DIR / f"{aid}{ext}"
+        tmp.rename(final)
+        entry = {
+            "id": aid,
+            "filename": orig_name,
+            "ext": ext.lstrip("."),
+            "kind": kind,
+            "size_bytes": size_bytes,
+            "width": dims_w,
+            "height": dims_h,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta[aid] = entry
+        return entry
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _move_staged_to_bundle() -> dict:
+    """On bundle generation: replace USER_BUNDLE_DIR with current staged
+    contents. Old bundle assets are removed (per user spec: 'base copies
+    should be deleted after zip is generated so we don't keep bloat')."""
+    if USER_BUNDLE_DIR.exists():
+        shutil.rmtree(USER_BUNDLE_DIR, ignore_errors=True)
+    USER_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    staged_meta = _read_user_meta(USER_STAGED_DIR)
+    moved: dict = {}
+    for aid, entry in staged_meta.items():
+        src = USER_STAGED_DIR / f"{aid}.{entry['ext']}"
+        if not src.exists():
+            continue
+        dst = USER_BUNDLE_DIR / f"{aid}.{entry['ext']}"
+        shutil.move(str(src), str(dst))
+        moved[aid] = entry
+    _write_user_meta(USER_BUNDLE_DIR, moved)
+    # Clear staged for the next round.
+    shutil.rmtree(USER_STAGED_DIR, ignore_errors=True)
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    return moved
+
+
+@app.post("/api/user_assets")
+def api_user_assets_upload():
+    """Upload one or more user-supplied assets (multipart 'files')."""
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "no files (multipart field 'files')"}), 400
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    meta = _read_user_meta(USER_STAGED_DIR)
+    added: list[dict] = []
+    errors: list[dict] = []
+    for f in files:
+        try:
+            entry = _stage_user_asset(f, meta)
+            added.append(entry)
+        except ValueError as e:
+            errors.append({"filename": f.filename or "?", "reason": str(e)})
+        except Exception as e:
+            errors.append({"filename": f.filename or "?",
+                           "reason": f"unexpected: {type(e).__name__}: {e}"})
+    _write_user_meta(USER_STAGED_DIR, meta)
+    return jsonify({"added": added, "errors": errors,
+                    "staged": list(meta.values())})
+
+
+@app.get("/api/user_assets")
+def api_user_assets_list():
+    meta = _read_user_meta(USER_STAGED_DIR)
+    return jsonify({
+        "staged": list(meta.values()),
+        "total_bytes": sum((e.get("size_bytes") or 0) for e in meta.values()),
+        "limits": {
+            "max_files": _USER_MAX_FILES,
+            "max_file_bytes": _USER_MAX_FILE_BYTES,
+            "max_total_bytes": _USER_MAX_TOTAL_BYTES,
+            "allowed_exts": sorted(_USER_EXT_KIND.keys()),
+        },
+    })
+
+
+@app.delete("/api/user_assets/<asset_id>")
+def api_user_assets_delete(asset_id):
+    meta = _read_user_meta(USER_STAGED_DIR)
+    entry = meta.pop(asset_id, None)
+    if entry is None:
+        return jsonify({"error": "asset id not staged"}), 404
+    bin_path = USER_STAGED_DIR / f"{asset_id}.{entry.get('ext', '')}"
+    bin_path.unlink(missing_ok=True)
+    _write_user_meta(USER_STAGED_DIR, meta)
+    return jsonify({"ok": True, "removed": asset_id})
+
+
+@app.get("/api/user_assets/<asset_id>/preview")
+def api_user_assets_preview(asset_id):
+    """Stream the binary for thumbnail display in the UI. Looks at staged
+    first, then bundle (so post-zip-gen UI still shows the same images)."""
+    for d in (USER_STAGED_DIR, USER_BUNDLE_DIR):
+        meta = _read_user_meta(d)
+        entry = meta.get(asset_id)
+        if entry is None:
+            continue
+        bin_path = d / f"{asset_id}.{entry.get('ext', '')}"
+        if bin_path.exists():
+            return send_file(bin_path)
+    abort(404, "user asset not found")
+
+
+# Clear staged dir on import so we don't surface zombie files from a
+# previous app session (per user preference: tmp-style staging).
+_clear_user_staged_on_startup()
 
 
 @app.post("/api/compose/run")
