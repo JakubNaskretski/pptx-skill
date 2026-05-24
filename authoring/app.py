@@ -1311,6 +1311,35 @@ def _stage_compose_bundle(staging: Path) -> None:
             encoding="utf-8",
         )
 
+    # User-supplied assets from the last bundle generation: copy the
+    # full-res originals into staging/assets/ alongside KB assets so
+    # reader.py resolves them transparently. Write a minimal yaml stub
+    # (kind + subject) — compose-mode needs the sidecar to exist; image
+    # slots don't read it but the file being present is harmless.
+    user_meta = _read_user_meta(USER_BUNDLE_DIR)
+    for aid, entry in user_meta.items():
+        ext = entry.get("ext") or "bin"
+        src = USER_BUNDLE_DIR / f"{aid}.{ext}"
+        if not src.exists():
+            continue
+        # Don't overwrite a KB asset with the same id (extremely unlikely
+        # — would mean SHA1 collision on file content — but be defensive).
+        dst = ast_dir / f"{aid}.{ext}"
+        if dst.exists():
+            continue
+        shutil.copyfile(src, dst)
+        stub = {
+            "id": aid,
+            "kind": entry.get("kind") or "image",
+            "subject": f"User-supplied {entry.get('kind') or 'asset'} "
+                       f"({entry.get('filename') or '?'})",
+            "sources": [],
+        }
+        (ast_dir / f"{aid}.yaml").write_text(
+            yaml.safe_dump(stub, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
     # index.json — required by reader.py's load_index(). Same payload
     # build_index() produces during `cli build`, minus the _yaml_path
     # sidecar that's only meaningful inside the workspace.
