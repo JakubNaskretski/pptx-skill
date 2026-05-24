@@ -2767,6 +2767,40 @@ COMPOSE_HTML = r"""<!doctype html>
                           border-radius: 4px; font-size: 13px; flex: 1; }
     .preset-row .small { background: white; color: #0066cc;
                           border: 1px solid #0066cc; padding: 6px 10px; }
+    .ua-block { margin-top: 12px; }
+    .ua-header { display: flex; align-items: center; gap: 10px;
+                  font-size: 13px; color: #333; margin-bottom: 6px; }
+    .ua-header .ua-label { font-weight: 600; }
+    .ua-header .ua-counter { color: #888; font-size: 12px; margin-left: auto; }
+    .ua-dropzone { border: 1.5px dashed #c5d4ea; border-radius: 6px;
+                    padding: 14px; text-align: center; background: #fafcff;
+                    color: #555; font-size: 12px; cursor: pointer;
+                    transition: background 0.15s, border-color 0.15s; }
+    .ua-dropzone:hover, .ua-dropzone.drag-over {
+        background: #eef4ff; border-color: #0066cc; }
+    .ua-dropzone strong { color: #0066cc; }
+    .ua-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+                gap: 10px; margin-top: 10px; }
+    .ua-tile { border: 1px solid #ddd; border-radius: 6px; overflow: hidden;
+                background: white; display: flex; flex-direction: column;
+                position: relative; }
+    .ua-tile .thumb { height: 80px; background: #f5f5f5; display: flex;
+                       align-items: center; justify-content: center;
+                       overflow: hidden; }
+    .ua-tile .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    .ua-tile .thumb .non-img { font-size: 11px; color: #888;
+                                 font-family: ui-monospace, monospace; }
+    .ua-tile .meta { padding: 6px 8px; font-size: 11px; }
+    .ua-tile .meta .fn { font-weight: 600; color: #333; white-space: nowrap;
+                          overflow: hidden; text-overflow: ellipsis; }
+    .ua-tile .meta .sub { color: #888; margin-top: 2px; }
+    .ua-tile .remove { position: absolute; top: 4px; right: 4px;
+                        width: 22px; height: 22px; border-radius: 50%;
+                        background: rgba(0,0,0,0.55); color: white;
+                        border: none; cursor: pointer; font-size: 13px;
+                        line-height: 1; display: flex; align-items: center;
+                        justify-content: center; padding: 0; }
+    .ua-tile .remove:hover { background: rgba(180,0,0,0.85); }
     .brand-editor textarea { min-height: 140px; font-family: ui-monospace,
                               Menlo, monospace; font-size: 12px; }
     .brand-summary { font-size: 12px; color: #666; }
@@ -2824,6 +2858,24 @@ COMPOSE_HTML = r"""<!doctype html>
         <button class="small" id="deletePreset">Delete</button>
       </div>
       <textarea id="brief" class="brief-area" placeholder="e.g. 4-slide thesis-defense summary for an academic committee. Formal feel. Include the swimlane diagram on the methodology slide."></textarea>
+
+      <div class="ua-block">
+        <div class="ua-header">
+          <span class="ua-label">Attach your own assets (optional)</span>
+          <span class="ua-counter" id="uaCounter">0 files</span>
+        </div>
+        <div class="ua-dropzone" id="uaDropzone">
+          <strong>Click to choose files</strong> or drop here —
+          png / jpg / webp / gif / svg / xml.<br>
+          Sent to the agent as low-res previews; originals stay on this
+          machine and are spliced into the deck at compose time.
+        </div>
+        <input type="file" id="uaFileInput" multiple
+               accept=".png,.jpg,.jpeg,.webp,.gif,.svg,.xml"
+               style="display:none">
+        <div class="ua-grid" id="uaGrid"></div>
+      </div>
+
       <div class="actions">
         <button id="dlBundle">Download bundle (.zip)</button>
         <button id="copyText" class="ghost">Copy as text</button>
@@ -2996,6 +3048,10 @@ document.getElementById("dlBundle").onclick = async () => {
   a.remove();
   URL.revokeObjectURL(url);
   showMsg("bundleMsg", "downloaded " + a.download, true);
+  // Staged user assets just moved into the bundle snapshot — refresh the
+  // grid so the user sees the staged area cleared (their files are now
+  // persisted next to the saved bundle for the compose round-trip).
+  loadUserAssets();
 };
 
 async function fetchFlat() {
@@ -3147,6 +3203,115 @@ document.getElementById("deletePreset").onclick = async () => {
   await loadPresets();
 };
 
+// --- User-supplied assets ----------------------------------------------
+
+function _fmtBytes(n) {
+  if (!n) return "0 B";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return Math.round(n / 1024) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function renderUserAssets(staged) {
+  const grid = document.getElementById("uaGrid");
+  grid.innerHTML = "";
+  const counter = document.getElementById("uaCounter");
+  const totalBytes = staged.reduce((a, e) => a + (e.size_bytes || 0), 0);
+  counter.textContent = `${staged.length} file${staged.length === 1 ? "" : "s"} · ${_fmtBytes(totalBytes)}`;
+  for (const e of staged) {
+    const tile = document.createElement("div");
+    tile.className = "ua-tile";
+    const thumb = document.createElement("div");
+    thumb.className = "thumb";
+    const previewable = (e.kind === "image" || e.kind === "vector");
+    if (previewable) {
+      const img = document.createElement("img");
+      img.src = `/api/user_assets/${e.id}/preview`;
+      img.alt = e.filename || e.id;
+      thumb.appendChild(img);
+    } else {
+      const placeholder = document.createElement("div");
+      placeholder.className = "non-img";
+      placeholder.textContent = (e.ext || "?").toUpperCase();
+      thumb.appendChild(placeholder);
+    }
+    tile.appendChild(thumb);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const fn = document.createElement("div");
+    fn.className = "fn";
+    fn.textContent = e.filename || e.id;
+    fn.title = e.filename || e.id;
+    meta.appendChild(fn);
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    const dims = (e.width && e.height) ? `${e.width}×${e.height}px · ` : "";
+    sub.textContent = `${dims}${_fmtBytes(e.size_bytes)}`;
+    meta.appendChild(sub);
+    tile.appendChild(meta);
+    const rm = document.createElement("button");
+    rm.className = "remove";
+    rm.title = "Remove";
+    rm.textContent = "×";
+    rm.onclick = async () => {
+      rm.disabled = true;
+      await fetch(`/api/user_assets/${e.id}`, { method: "DELETE" });
+      await loadUserAssets();
+    };
+    tile.appendChild(rm);
+    grid.appendChild(tile);
+  }
+}
+
+async function loadUserAssets() {
+  const r = await fetch("/api/user_assets");
+  if (!r.ok) { renderUserAssets([]); return; }
+  const j = await r.json();
+  renderUserAssets(j.staged || []);
+}
+
+async function uploadUserAssets(files) {
+  if (!files || !files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  showMsg("bundleMsg", `uploading ${files.length} file(s)…`, true);
+  const r = await fetch("/api/user_assets", { method: "POST", body: fd });
+  if (!r.ok) {
+    showMsg("bundleMsg", "upload failed", false);
+    return;
+  }
+  const j = await r.json();
+  await loadUserAssets();
+  if (j.errors && j.errors.length) {
+    const reasons = j.errors.map(e => `${e.filename}: ${e.reason}`).join("; ");
+    showMsg("bundleMsg", `added ${j.added.length}, rejected: ${reasons}`, false);
+  } else {
+    showMsg("bundleMsg", `added ${j.added.length} file(s)`, true);
+  }
+}
+
+document.getElementById("uaDropzone").onclick = () => {
+  document.getElementById("uaFileInput").click();
+};
+document.getElementById("uaFileInput").onchange = (e) => {
+  uploadUserAssets(e.target.files);
+  e.target.value = "";  // allow re-selecting the same file later
+};
+(() => {
+  const dz = document.getElementById("uaDropzone");
+  ["dragenter", "dragover"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag-over"); })
+  );
+  ["dragleave", "drop"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag-over"); })
+  );
+  dz.addEventListener("drop", e => {
+    if (e.dataTransfer && e.dataTransfer.files) {
+      uploadUserAssets(e.dataTransfer.files);
+    }
+  });
+})();
+
 (async () => {
   const r = await fetch("/api/compose/options");
   state.options = await r.json();
@@ -3154,6 +3319,7 @@ document.getElementById("deletePreset").onclick = async () => {
   refreshCount();
   loadBrand();
   loadPresets();
+  loadUserAssets();
 })();
 </script>
 </body>
