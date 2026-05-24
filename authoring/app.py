@@ -33,6 +33,16 @@ import cli as cli_mod  # noqa: E402
 WORKSPACE = HERE / "workspace"
 BATCHES_DIR = WORKSPACE / "_batches"
 
+# Per-request user-supplied assets (images / svg / xml the user attaches
+# to a specific compose request). Separate from the workspace KB.
+#   _user_assets/staged/  — accumulates uploads until Download bundle
+#   _user_assets/bundle/  — snapshot of the last bundle's user assets,
+#                           used by compose-run to resolve user_<id>
+#                           references the agent emits in the plan.
+USER_ASSETS_DIR = WORKSPACE / "_user_assets"
+USER_STAGED_DIR = USER_ASSETS_DIR / "staged"
+USER_BUNDLE_DIR = USER_ASSETS_DIR / "bundle"
+
 app = Flask(__name__)
 # Cap uploads at 200 MB — typical decks are <50 MB; this leaves headroom
 # without letting a stray multi-GB upload exhaust /tmp.
@@ -988,12 +998,78 @@ def _read_skill_md() -> str:
     return (cli_mod.CONSUMER / "SKILL.md").read_text(encoding="utf-8")
 
 
-def _format_brief(brief: str) -> str:
+def _format_user_assets_section(user_meta: dict) -> str:
+    """Brief.md sub-section listing user-supplied assets and how to treat
+    them. Returns the empty string when none are attached.
+    """
+    if not user_meta:
+        return ""
+    lines = [
+        "## User-supplied assets — IMPORTANT",
+        "",
+        "The user attached the following assets to THIS request. They "
+        "are the primary intent and SHOULD be used in the deck wherever "
+        "they fit. Each file lives at `user_assets/<id>.<ext>` in this "
+        "bundle as a LOW-RES preview; the user's machine holds the "
+        "original at full resolution and will splice the original in at "
+        "compose time. The dimensions below are the originals'.",
+        "",
+        "Reference them in the plan exactly the same way you reference "
+        "any catalog asset — `\"<slot>\": \"<id>\"` for image slots, or "
+        "`{\"atom\": \"<id>\", ...}` inside a compose-mode shape. The id "
+        "format matches catalog assets on purpose so the compose "
+        "pipeline resolves them transparently.",
+        "",
+    ]
+    for aid, entry in sorted(user_meta.items()):
+        kind = entry.get("kind", "?")
+        ext = entry.get("ext", "?")
+        fname = entry.get("filename", "?")
+        size_kb = max(1, (entry.get("size_bytes") or 0) // 1024)
+        dims = ""
+        w, h = entry.get("width"), entry.get("height")
+        if w and h:
+            dims = f" {w}x{h}px"
+        lines.append(
+            f"- `{aid}` — {kind} ({ext}){dims}, "
+            f"{size_kb} KB original — original filename: `{fname}`"
+        )
+    lines += [
+        "",
+        "### How to treat these",
+        "",
+        "- The user expects these assets to appear in the output. Treat "
+        "them as a stronger signal than KB catalog matches.",
+        "- If a user asset fits a slot, use it — even if a KB asset "
+        "would score better on `feel` / `colors`. The user's intent "
+        "trumps the descriptive index here.",
+        "- If a user asset CANNOT fit any slot in your plan (wrong "
+        "aspect, no semantic match, etc.), prefer in this order:",
+        "  1. Pick a different template whose layout exposes a slot "
+        "this asset fits.",
+        "  2. Use compose-mode (free-form atoms) to place the user "
+        "asset alongside other shapes you control.",
+        "  3. Fall back to a similar KB catalog asset and explicitly "
+        "explain in the brief response that the user asset didn't fit.",
+        "  4. Last resort: omit the user asset, but flag it.",
+        "- The previews are LOW-RES (max 800px long side, possibly "
+        "re-encoded). Judge subject / composition / colors from them, "
+        "but don't reason about pixel-level detail.",
+        "- These assets do NOT carry descriptions. You see the file "
+        "itself plus the brief — combine the two to infer intent.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _format_brief(brief: str, user_meta: dict | None = None) -> str:
+    user_section = _format_user_assets_section(user_meta or {})
     return (
         "# Deck brief\n\n"
         f"{brief.strip() or '(no brief supplied)'}\n\n"
         "---\n\n"
-        "# Output rules\n\n"
+        + (user_section + "---\n\n" if user_section else "")
+        + "# Output rules\n\n"
         "- Read SKILL.md for the three-command surface and plan format.\n"
         "- Pick templates and assets ONLY from the attached `index.json`.\n"
         "- Return ONLY a JSON array. No prose, no markdown fences.\n"
@@ -1003,6 +1079,29 @@ def _format_brief(brief: str) -> str:
         "- Text slot values: plain string, respect each slot's `max_chars`.\n"
         "- Bullets slot values: array of strings.\n"
         "- If no asset fits a slot, omit the slot rather than forcing one.\n"
+        "\n"
+        "## Helpers in this bundle\n"
+        "\n"
+        "Read-only Python utilities under `helpers/` — invoke them from the\n"
+        "bundle root (stdlib + pyyaml; exit codes 0 ok / 1 empty-or-fail / 2\n"
+        "bad input). They expose data; you decide the picks.\n"
+        "\n"
+        "- `python helpers/kb_summary.py` — facet counts; start here on a "
+        "fresh bundle\n"
+        "- `python helpers/kb_filter.py templates --feel formal "
+        "--suitable_for opener`\n"
+        "- `python helpers/kb_filter.py assets --kind photo --text \"team\"`\n"
+        "- `python helpers/kb_inspect.py <id>` — denormalized view; inlines "
+        "inventory atoms with their descriptions\n"
+        "- `python helpers/kb_lint.py < plan.json` — pre-flight validator "
+        "(slot ids, max_chars, bullet glyphs, missing assets, degraded "
+        "shapes)\n"
+        "- `python helpers/kb_themes.py [--resolve-role <role> --for-deck "
+        "<deck>]` — per-deck theme + alias-aware role resolution\n"
+        "- `python helpers/kb_budget.py <template_id> <slot_id> \"text\"` — "
+        "one-shot text-budget check\n"
+        "\n"
+        "See `helpers/README.md` for full docs.\n"
         "\n"
         "## v4 capabilities — what's new\n"
         "\n"
@@ -1059,6 +1158,7 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
     clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
     clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
     index = cli_mod.build_index(clean_slides, clean_assets)
+    user_meta = _read_user_meta(USER_STAGED_DIR)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("SKILL.md", _read_skill_md())
@@ -1066,7 +1166,7 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
         if brand:
             zf.writestr("brand.md", brand + "\n")
         zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
-        zf.writestr("brief.md", _format_brief(brief))
+        zf.writestr("brief.md", _format_brief(brief, user_meta))
         # v4: per-deck theme.yaml. Filtered KB may have culled some
         # decks entirely — only ship themes whose deck still has at
         # least one template in the bundle (so the agent's bundle
@@ -1083,7 +1183,66 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
                 f"decks/{theme_yaml.parent.name}/theme.yaml",
                 theme_yaml.read_text(encoding="utf-8"),
             )
-    return buf.getvalue()
+        # Agent-side helpers: read-only kb_* scripts the agent invokes
+        # against the bundle from its own working dir (filter the catalog,
+        # inspect entries, lint a draft plan). See helpers/README.md inside
+        # the bundle. Stdlib + pyyaml only.
+        helpers_dir = cli_mod.CONSUMER / "helpers"
+        if helpers_dir.exists():
+            for hp in sorted(helpers_dir.iterdir()):
+                if hp.is_file() and not hp.name.startswith("."):
+                    zf.write(hp, f"helpers/{hp.name}")
+        # User-supplied assets: low-res previews + manifest with original
+        # dimensions. Full-res originals stay on the user's machine and
+        # are spliced into compose-run staging when the plan comes back.
+        if user_meta:
+            manifest_for_zip: dict = {}
+            for aid, entry in user_meta.items():
+                ext = entry.get("ext") or "bin"
+                src = USER_STAGED_DIR / f"{aid}.{ext}"
+                if not src.exists():
+                    continue
+                # Write a low-res copy directly into the zip via a tmp
+                # file so we don't materialize huge images in RAM.
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=f".{ext}",
+                ) as tf:
+                    low = Path(tf.name)
+                try:
+                    _make_low_res(src, low, entry.get("kind", "image"))
+                    zf.write(low, f"user_assets/{aid}.{ext}")
+                finally:
+                    low.unlink(missing_ok=True)
+                manifest_for_zip[aid] = {
+                    "id": aid,
+                    "filename": entry.get("filename"),
+                    "kind": entry.get("kind"),
+                    "ext": ext,
+                    "size_bytes": entry.get("size_bytes"),
+                    "width": entry.get("width"),
+                    "height": entry.get("height"),
+                }
+            zf.writestr(
+                "user_assets/manifest.json",
+                json_mod.dumps(
+                    {"note": (
+                        "User-supplied assets attached to this request. "
+                        "The files here are LOW-RES previews; the "
+                        "user's machine holds the full-resolution "
+                        "originals and will splice them in at compose "
+                        "time. See brief.md for usage guidance."
+                    ),
+                     "assets": manifest_for_zip},
+                    indent=2, ensure_ascii=False,
+                ),
+            )
+    blob = buf.getvalue()
+    # Move staged → bundle AFTER the zip is finalized: the bundle/ dir
+    # is now the canonical snapshot compose-run will use to resolve any
+    # user asset ids the agent references in the plan.
+    if user_meta:
+        _move_staged_to_bundle()
+    return blob
 
 
 def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str:
@@ -1096,7 +1255,15 @@ def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str
         sections.append("=== brand.md ===\n" + brand)
     sections.append("=== SKILL.md ===\n" + _read_skill_md())
     sections.append("=== index.json ===\n" + json_mod.dumps(index, indent=2, ensure_ascii=False))
-    sections.append("=== brief.md ===\n" + _format_brief(brief))
+    user_meta = _read_user_meta(USER_STAGED_DIR)
+    sections.append("=== brief.md ===\n" + _format_brief(brief, user_meta))
+    if user_meta:
+        sections.append(
+            "=== user_assets note ===\n"
+            "User-supplied asset BINARIES are not included in this "
+            "flat-text view. Use the .zip bundle path to see them; "
+            "metadata is listed in brief.md above."
+        )
     return "\n\n".join(sections) + "\n"
 
 
@@ -1141,6 +1308,35 @@ def _stage_compose_bundle(staging: Path) -> None:
         clean = {k: v for k, v in ad.items() if not k.startswith("_")}
         (ast_dir / f"{aid}.yaml").write_text(
             yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
+    # User-supplied assets from the last bundle generation: copy the
+    # full-res originals into staging/assets/ alongside KB assets so
+    # reader.py resolves them transparently. Write a minimal yaml stub
+    # (kind + subject) — compose-mode needs the sidecar to exist; image
+    # slots don't read it but the file being present is harmless.
+    user_meta = _read_user_meta(USER_BUNDLE_DIR)
+    for aid, entry in user_meta.items():
+        ext = entry.get("ext") or "bin"
+        src = USER_BUNDLE_DIR / f"{aid}.{ext}"
+        if not src.exists():
+            continue
+        # Don't overwrite a KB asset with the same id (extremely unlikely
+        # — would mean SHA1 collision on file content — but be defensive).
+        dst = ast_dir / f"{aid}.{ext}"
+        if dst.exists():
+            continue
+        shutil.copyfile(src, dst)
+        stub = {
+            "id": aid,
+            "kind": entry.get("kind") or "image",
+            "subject": f"User-supplied {entry.get('kind') or 'asset'} "
+                       f"({entry.get('filename') or '?'})",
+            "sources": [],
+        }
+        (ast_dir / f"{aid}.yaml").write_text(
+            yaml.safe_dump(stub, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
 
@@ -1270,6 +1466,313 @@ def api_compose_preset_delete():
     if p.exists():
         p.unlink()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# User-supplied assets — per-request attachments (separate from KB)
+# ---------------------------------------------------------------------------
+
+
+# Allow common raster images, SVG vectors, and XML atom fragments. The
+# user said they want tables/charts/etc. to work too — those are all
+# XML fragments in this codebase, so a single .xml acceptor covers them.
+_USER_EXT_KIND = {
+    ".png":  "image",  ".jpg":  "image",  ".jpeg": "image",
+    ".webp": "image",  ".gif":  "image",
+    ".svg":  "vector",
+    ".xml":  "atom",
+}
+_USER_MAX_FILE_BYTES = 20 * 1024 * 1024   # 20 MB / file
+_USER_MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB across all staged
+_USER_MAX_FILES = 30
+_USER_LOW_RES_LONG_SIDE = 800  # px — for the low-res copy shipped in the zip
+
+
+def _clear_user_staged_on_startup() -> None:
+    """Per user preference: staged uploads do NOT persist across app
+    restarts. Cleared on import. `bundle/` is left alone so a previous
+    bundle's compose-run still resolves user_<id> references."""
+    if USER_STAGED_DIR.exists():
+        shutil.rmtree(USER_STAGED_DIR, ignore_errors=True)
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _user_meta_path(dir_: Path) -> Path:
+    return dir_ / "meta.json"
+
+
+def _read_user_meta(dir_: Path) -> dict:
+    p = _user_meta_path(dir_)
+    if not p.exists():
+        return {}
+    try:
+        return json_mod.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_user_meta(dir_: Path, meta: dict) -> None:
+    _user_meta_path(dir_).write_text(
+        json_mod.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _safe_user_filename(raw: str) -> tuple[str, str] | None:
+    """Return (safe_basename, ext_lower) or None for rejected filenames.
+
+    Strips path components and leading dots so a malicious upload can't
+    escape the staging dir.
+    """
+    if not raw:
+        return None
+    base = Path(raw).name.lstrip(".").strip()
+    if not base:
+        return None
+    ext = Path(base).suffix.lower()
+    if ext not in _USER_EXT_KIND:
+        return None
+    return base, ext
+
+
+def _user_asset_image_dims(path: Path) -> tuple[int | None, int | None]:
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        return None, None
+
+
+def _user_asset_svg_dims(path: Path) -> tuple[int | None, int | None]:
+    """Pull width/height from an SVG's root element if declared. Returns
+    (None, None) on parse failure or missing attrs (acceptable — the
+    agent gets to know it's a vector either way)."""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None, None
+
+    def _strip_unit(v: str | None) -> int | None:
+        if not v:
+            return None
+        v = v.strip()
+        for unit in ("px", "pt", "mm", "cm", "in"):
+            if v.endswith(unit):
+                v = v[: -len(unit)]
+                break
+        try:
+            return int(float(v))
+        except ValueError:
+            return None
+
+    w = _strip_unit(root.get("width"))
+    h = _strip_unit(root.get("height"))
+    if (w is None or h is None) and root.get("viewBox"):
+        parts = root.get("viewBox").replace(",", " ").split()
+        if len(parts) == 4:
+            w = w or _strip_unit(parts[2])
+            h = h or _strip_unit(parts[3])
+    return w, h
+
+
+def _make_low_res(src: Path, dst: Path, kind: str) -> None:
+    """For raster: downsize so long side <= _USER_LOW_RES_LONG_SIDE and
+    re-encode. For everything else (svg / xml): copy verbatim."""
+    if kind != "image":
+        shutil.copyfile(src, dst)
+        return
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(src) as im:
+            im.load()
+            long_side = max(im.width, im.height)
+            if long_side > _USER_LOW_RES_LONG_SIDE:
+                scale = _USER_LOW_RES_LONG_SIDE / long_side
+                new_size = (max(1, int(im.width * scale)),
+                            max(1, int(im.height * scale)))
+                im = im.resize(new_size, Image.LANCZOS)
+            save_kwargs: dict = {}
+            if dst.suffix.lower() in (".jpg", ".jpeg"):
+                im = im.convert("RGB")
+                save_kwargs["quality"] = 78
+                save_kwargs["optimize"] = True
+            elif dst.suffix.lower() == ".png":
+                save_kwargs["optimize"] = True
+            im.save(dst, **save_kwargs)
+    except Exception:
+        # On any failure: fall back to the original. Bundle size hit is
+        # acceptable; correctness matters more.
+        shutil.copyfile(src, dst)
+
+
+def _hash_file(p: Path) -> str:
+    """SHA1 of file content; first 8 chars used as the stable id."""
+    import hashlib
+    h = hashlib.sha1()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stage_user_asset(f, meta: dict) -> dict:
+    """Validate + persist one uploaded file under USER_STAGED_DIR.
+
+    Returns a metadata dict for the saved file, or raises ValueError.
+    Mutates `meta` in place with the new entry.
+    """
+    parsed = _safe_user_filename(f.filename or "")
+    if parsed is None:
+        raise ValueError(f"filename rejected (need {sorted(_USER_EXT_KIND)})")
+    orig_name, ext = parsed
+    kind = _USER_EXT_KIND[ext]
+
+    # Stream into a temp file inside the staging dir so we can hash + size-
+    # check without buffering the whole upload in RAM.
+    tmp = USER_STAGED_DIR / f".incoming_{datetime.now().strftime('%H%M%S%f')}{ext}"
+    f.save(str(tmp))
+    try:
+        size_bytes = tmp.stat().st_size
+        if size_bytes > _USER_MAX_FILE_BYTES:
+            raise ValueError(
+                f"file exceeds per-file cap of "
+                f"{_USER_MAX_FILE_BYTES // (1024 * 1024)} MB"
+            )
+        total = sum(
+            (e.get("size_bytes") or 0) for e in meta.values()
+        ) + size_bytes
+        if total > _USER_MAX_TOTAL_BYTES:
+            raise ValueError(
+                f"total staged size would exceed "
+                f"{_USER_MAX_TOTAL_BYTES // (1024 * 1024)} MB"
+            )
+        if len(meta) >= _USER_MAX_FILES:
+            raise ValueError(f"already at {_USER_MAX_FILES}-file cap")
+        sha8 = _hash_file(tmp)[:8]
+        aid = f"asset_{sha8}"
+        # Dedupe: same content uploaded twice keeps the first entry.
+        if aid in meta:
+            tmp.unlink(missing_ok=True)
+            return meta[aid]
+
+        dims_w, dims_h = (None, None)
+        if kind == "image":
+            dims_w, dims_h = _user_asset_image_dims(tmp)
+        elif kind == "vector":
+            dims_w, dims_h = _user_asset_svg_dims(tmp)
+
+        final = USER_STAGED_DIR / f"{aid}{ext}"
+        tmp.rename(final)
+        entry = {
+            "id": aid,
+            "filename": orig_name,
+            "ext": ext.lstrip("."),
+            "kind": kind,
+            "size_bytes": size_bytes,
+            "width": dims_w,
+            "height": dims_h,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta[aid] = entry
+        return entry
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _move_staged_to_bundle() -> dict:
+    """On bundle generation: replace USER_BUNDLE_DIR with current staged
+    contents. Old bundle assets are removed (per user spec: 'base copies
+    should be deleted after zip is generated so we don't keep bloat')."""
+    if USER_BUNDLE_DIR.exists():
+        shutil.rmtree(USER_BUNDLE_DIR, ignore_errors=True)
+    USER_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    staged_meta = _read_user_meta(USER_STAGED_DIR)
+    moved: dict = {}
+    for aid, entry in staged_meta.items():
+        src = USER_STAGED_DIR / f"{aid}.{entry['ext']}"
+        if not src.exists():
+            continue
+        dst = USER_BUNDLE_DIR / f"{aid}.{entry['ext']}"
+        shutil.move(str(src), str(dst))
+        moved[aid] = entry
+    _write_user_meta(USER_BUNDLE_DIR, moved)
+    # Clear staged for the next round.
+    shutil.rmtree(USER_STAGED_DIR, ignore_errors=True)
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    return moved
+
+
+@app.post("/api/user_assets")
+def api_user_assets_upload():
+    """Upload one or more user-supplied assets (multipart 'files')."""
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "no files (multipart field 'files')"}), 400
+    USER_STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    meta = _read_user_meta(USER_STAGED_DIR)
+    added: list[dict] = []
+    errors: list[dict] = []
+    for f in files:
+        try:
+            entry = _stage_user_asset(f, meta)
+            added.append(entry)
+        except ValueError as e:
+            errors.append({"filename": f.filename or "?", "reason": str(e)})
+        except Exception as e:
+            errors.append({"filename": f.filename or "?",
+                           "reason": f"unexpected: {type(e).__name__}: {e}"})
+    _write_user_meta(USER_STAGED_DIR, meta)
+    return jsonify({"added": added, "errors": errors,
+                    "staged": list(meta.values())})
+
+
+@app.get("/api/user_assets")
+def api_user_assets_list():
+    meta = _read_user_meta(USER_STAGED_DIR)
+    return jsonify({
+        "staged": list(meta.values()),
+        "total_bytes": sum((e.get("size_bytes") or 0) for e in meta.values()),
+        "limits": {
+            "max_files": _USER_MAX_FILES,
+            "max_file_bytes": _USER_MAX_FILE_BYTES,
+            "max_total_bytes": _USER_MAX_TOTAL_BYTES,
+            "allowed_exts": sorted(_USER_EXT_KIND.keys()),
+        },
+    })
+
+
+@app.delete("/api/user_assets/<asset_id>")
+def api_user_assets_delete(asset_id):
+    meta = _read_user_meta(USER_STAGED_DIR)
+    entry = meta.pop(asset_id, None)
+    if entry is None:
+        return jsonify({"error": "asset id not staged"}), 404
+    bin_path = USER_STAGED_DIR / f"{asset_id}.{entry.get('ext', '')}"
+    bin_path.unlink(missing_ok=True)
+    _write_user_meta(USER_STAGED_DIR, meta)
+    return jsonify({"ok": True, "removed": asset_id})
+
+
+@app.get("/api/user_assets/<asset_id>/preview")
+def api_user_assets_preview(asset_id):
+    """Stream the binary for thumbnail display in the UI. Looks at staged
+    first, then bundle (so post-zip-gen UI still shows the same images)."""
+    for d in (USER_STAGED_DIR, USER_BUNDLE_DIR):
+        meta = _read_user_meta(d)
+        entry = meta.get(asset_id)
+        if entry is None:
+            continue
+        bin_path = d / f"{asset_id}.{entry.get('ext', '')}"
+        if bin_path.exists():
+            return send_file(bin_path)
+    abort(404, "user asset not found")
+
+
+# Clear staged dir on import so we don't surface zombie files from a
+# previous app session (per user preference: tmp-style staging).
+_clear_user_staged_on_startup()
 
 
 @app.post("/api/compose/run")
@@ -2264,6 +2767,40 @@ COMPOSE_HTML = r"""<!doctype html>
                           border-radius: 4px; font-size: 13px; flex: 1; }
     .preset-row .small { background: white; color: #0066cc;
                           border: 1px solid #0066cc; padding: 6px 10px; }
+    .ua-block { margin-top: 12px; }
+    .ua-header { display: flex; align-items: center; gap: 10px;
+                  font-size: 13px; color: #333; margin-bottom: 6px; }
+    .ua-header .ua-label { font-weight: 600; }
+    .ua-header .ua-counter { color: #888; font-size: 12px; margin-left: auto; }
+    .ua-dropzone { border: 1.5px dashed #c5d4ea; border-radius: 6px;
+                    padding: 14px; text-align: center; background: #fafcff;
+                    color: #555; font-size: 12px; cursor: pointer;
+                    transition: background 0.15s, border-color 0.15s; }
+    .ua-dropzone:hover, .ua-dropzone.drag-over {
+        background: #eef4ff; border-color: #0066cc; }
+    .ua-dropzone strong { color: #0066cc; }
+    .ua-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+                gap: 10px; margin-top: 10px; }
+    .ua-tile { border: 1px solid #ddd; border-radius: 6px; overflow: hidden;
+                background: white; display: flex; flex-direction: column;
+                position: relative; }
+    .ua-tile .thumb { height: 80px; background: #f5f5f5; display: flex;
+                       align-items: center; justify-content: center;
+                       overflow: hidden; }
+    .ua-tile .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    .ua-tile .thumb .non-img { font-size: 11px; color: #888;
+                                 font-family: ui-monospace, monospace; }
+    .ua-tile .meta { padding: 6px 8px; font-size: 11px; }
+    .ua-tile .meta .fn { font-weight: 600; color: #333; white-space: nowrap;
+                          overflow: hidden; text-overflow: ellipsis; }
+    .ua-tile .meta .sub { color: #888; margin-top: 2px; }
+    .ua-tile .remove { position: absolute; top: 4px; right: 4px;
+                        width: 22px; height: 22px; border-radius: 50%;
+                        background: rgba(0,0,0,0.55); color: white;
+                        border: none; cursor: pointer; font-size: 13px;
+                        line-height: 1; display: flex; align-items: center;
+                        justify-content: center; padding: 0; }
+    .ua-tile .remove:hover { background: rgba(180,0,0,0.85); }
     .brand-editor textarea { min-height: 140px; font-family: ui-monospace,
                               Menlo, monospace; font-size: 12px; }
     .brand-summary { font-size: 12px; color: #666; }
@@ -2321,6 +2858,24 @@ COMPOSE_HTML = r"""<!doctype html>
         <button class="small" id="deletePreset">Delete</button>
       </div>
       <textarea id="brief" class="brief-area" placeholder="e.g. 4-slide thesis-defense summary for an academic committee. Formal feel. Include the swimlane diagram on the methodology slide."></textarea>
+
+      <div class="ua-block">
+        <div class="ua-header">
+          <span class="ua-label">Attach your own assets (optional)</span>
+          <span class="ua-counter" id="uaCounter">0 files</span>
+        </div>
+        <div class="ua-dropzone" id="uaDropzone">
+          <strong>Click to choose files</strong> or drop here —
+          png / jpg / webp / gif / svg / xml.<br>
+          Sent to the agent as low-res previews; originals stay on this
+          machine and are spliced into the deck at compose time.
+        </div>
+        <input type="file" id="uaFileInput" multiple
+               accept=".png,.jpg,.jpeg,.webp,.gif,.svg,.xml"
+               style="display:none">
+        <div class="ua-grid" id="uaGrid"></div>
+      </div>
+
       <div class="actions">
         <button id="dlBundle">Download bundle (.zip)</button>
         <button id="copyText" class="ghost">Copy as text</button>
@@ -2493,6 +3048,10 @@ document.getElementById("dlBundle").onclick = async () => {
   a.remove();
   URL.revokeObjectURL(url);
   showMsg("bundleMsg", "downloaded " + a.download, true);
+  // Staged user assets just moved into the bundle snapshot — refresh the
+  // grid so the user sees the staged area cleared (their files are now
+  // persisted next to the saved bundle for the compose round-trip).
+  loadUserAssets();
 };
 
 async function fetchFlat() {
@@ -2644,6 +3203,115 @@ document.getElementById("deletePreset").onclick = async () => {
   await loadPresets();
 };
 
+// --- User-supplied assets ----------------------------------------------
+
+function _fmtBytes(n) {
+  if (!n) return "0 B";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return Math.round(n / 1024) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function renderUserAssets(staged) {
+  const grid = document.getElementById("uaGrid");
+  grid.innerHTML = "";
+  const counter = document.getElementById("uaCounter");
+  const totalBytes = staged.reduce((a, e) => a + (e.size_bytes || 0), 0);
+  counter.textContent = `${staged.length} file${staged.length === 1 ? "" : "s"} · ${_fmtBytes(totalBytes)}`;
+  for (const e of staged) {
+    const tile = document.createElement("div");
+    tile.className = "ua-tile";
+    const thumb = document.createElement("div");
+    thumb.className = "thumb";
+    const previewable = (e.kind === "image" || e.kind === "vector");
+    if (previewable) {
+      const img = document.createElement("img");
+      img.src = `/api/user_assets/${e.id}/preview`;
+      img.alt = e.filename || e.id;
+      thumb.appendChild(img);
+    } else {
+      const placeholder = document.createElement("div");
+      placeholder.className = "non-img";
+      placeholder.textContent = (e.ext || "?").toUpperCase();
+      thumb.appendChild(placeholder);
+    }
+    tile.appendChild(thumb);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const fn = document.createElement("div");
+    fn.className = "fn";
+    fn.textContent = e.filename || e.id;
+    fn.title = e.filename || e.id;
+    meta.appendChild(fn);
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    const dims = (e.width && e.height) ? `${e.width}×${e.height}px · ` : "";
+    sub.textContent = `${dims}${_fmtBytes(e.size_bytes)}`;
+    meta.appendChild(sub);
+    tile.appendChild(meta);
+    const rm = document.createElement("button");
+    rm.className = "remove";
+    rm.title = "Remove";
+    rm.textContent = "×";
+    rm.onclick = async () => {
+      rm.disabled = true;
+      await fetch(`/api/user_assets/${e.id}`, { method: "DELETE" });
+      await loadUserAssets();
+    };
+    tile.appendChild(rm);
+    grid.appendChild(tile);
+  }
+}
+
+async function loadUserAssets() {
+  const r = await fetch("/api/user_assets");
+  if (!r.ok) { renderUserAssets([]); return; }
+  const j = await r.json();
+  renderUserAssets(j.staged || []);
+}
+
+async function uploadUserAssets(files) {
+  if (!files || !files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  showMsg("bundleMsg", `uploading ${files.length} file(s)…`, true);
+  const r = await fetch("/api/user_assets", { method: "POST", body: fd });
+  if (!r.ok) {
+    showMsg("bundleMsg", "upload failed", false);
+    return;
+  }
+  const j = await r.json();
+  await loadUserAssets();
+  if (j.errors && j.errors.length) {
+    const reasons = j.errors.map(e => `${e.filename}: ${e.reason}`).join("; ");
+    showMsg("bundleMsg", `added ${j.added.length}, rejected: ${reasons}`, false);
+  } else {
+    showMsg("bundleMsg", `added ${j.added.length} file(s)`, true);
+  }
+}
+
+document.getElementById("uaDropzone").onclick = () => {
+  document.getElementById("uaFileInput").click();
+};
+document.getElementById("uaFileInput").onchange = (e) => {
+  uploadUserAssets(e.target.files);
+  e.target.value = "";  // allow re-selecting the same file later
+};
+(() => {
+  const dz = document.getElementById("uaDropzone");
+  ["dragenter", "dragover"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag-over"); })
+  );
+  ["dragleave", "drop"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag-over"); })
+  );
+  dz.addEventListener("drop", e => {
+    if (e.dataTransfer && e.dataTransfer.files) {
+      uploadUserAssets(e.dataTransfer.files);
+    }
+  });
+})();
+
 (async () => {
   const r = await fetch("/api/compose/options");
   state.options = await r.json();
@@ -2651,6 +3319,7 @@ document.getElementById("deletePreset").onclick = async () => {
   refreshCount();
   loadBrand();
   loadPresets();
+  loadUserAssets();
 })();
 </script>
 </body>
