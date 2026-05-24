@@ -294,6 +294,13 @@ templates/<id>/
   preview.png         optional
 assets/<id>.<ext>     binary — png/jpg/svg/emf/xml (xml = structured atom)
 assets/<id>.yaml      full sidecar
+user_assets/          optional — present only in prompt-bundles when the
+  <id>.<ext>          user attached their own images / SVGs / XML atoms
+  manifest.json       to THIS compose request. See section below.
+helpers/              optional — read-only kb_* Python utilities the
+                      agent can run against the bundle (filter, inspect,
+                      lint). Present in prompt-bundles, absent from
+                      cli-build skill.zip.
 reader.py             three-command entry point
 requirements.txt      python-pptx, pyyaml
 ```
@@ -301,6 +308,28 @@ requirements.txt      python-pptx, pyyaml
 `index.json` is regenerated on every authoring `build`. Treat it as
 the canonical filter index — individual sidecars carry the full
 detail.
+
+## User-supplied assets (prompt-bundle only)
+
+When `user_assets/` is present in the bundle, the user has attached
+their own assets to this specific compose request. They are a stronger
+signal than KB catalog matches — the user expects these to appear in
+the output.
+
+- `user_assets/manifest.json` lists each entry with id, original
+  filename, kind, and original dimensions.
+- Files at `user_assets/<id>.<ext>` are LOW-RES previews. The user's
+  machine holds the originals and splices them in at compose time —
+  the agent doesn't need to (and cannot) load the full-res versions.
+- Ids use the same `asset_<8>` format as the catalog. Reference them
+  the same way: `"<slot>": "<id>"` for image slots, or
+  `{"atom": "<id>", ...}` inside a compose-mode shape. The compose
+  pipeline resolves both KB and user assets through the same path.
+- User assets carry NO description. Read the brief, look at the
+  preview, infer intent.
+- If a user asset doesn't fit any slot: pick a different template,
+  drop into compose-mode, or (last resort) substitute with the closest
+  KB asset. Don't silently drop user assets.
 
 ## Backward compatibility
 

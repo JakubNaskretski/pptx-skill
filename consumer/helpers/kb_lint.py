@@ -31,6 +31,7 @@ from _kb_common import (
     has_leading_bullet_glyph,
     is_degraded_shape,
     load_index,
+    load_user_assets,
     templates_by_id,
 )
 
@@ -191,13 +192,19 @@ def _lint_compose_entry(entry: dict, idx: int,
     return out
 
 
-def lint(plan, index) -> list[dict]:
+def lint(plan, index, user_assets: dict | None = None) -> list[dict]:
     results: list[dict] = []
     if not isinstance(plan, list):
         return [{"level": "error",
                  "msg": "plan must be a JSON array at the top level"}]
     tpls = templates_by_id(index)
+    # Union of catalog + user-supplied assets — same id format on
+    # purpose; reader.py resolves both via assets/<id>.<ext> at compose
+    # time, and lint should accept both as valid references.
     assets = assets_by_id(index)
+    if user_assets:
+        for aid, entry in user_assets.items():
+            assets.setdefault(aid, entry)
     for idx, entry in enumerate(plan):
         if not isinstance(entry, dict):
             results.append({"entry": idx, "level": "error",
@@ -235,7 +242,7 @@ def main() -> int:
 
     bundle = args.bundle or default_bundle_root(__file__)
     index = load_index(bundle)
-    results = lint(plan, index)
+    results = lint(plan, index, load_user_assets(bundle))
 
     n_err = sum(1 for r in results if r.get("level") == "error")
     n_warn = sum(1 for r in results if r.get("level") == "warning")

@@ -110,6 +110,23 @@ def templates_by_id(index: dict) -> dict[str, dict]:
     return {t["id"]: t for t in index.get("templates", []) if t.get("id")}
 
 
+def load_user_assets(bundle_root: Path) -> dict[str, dict]:
+    """Read user_assets/manifest.json if present; return {id: entry}.
+
+    These are user-supplied attachments to the request — same id format
+    as catalog assets but listed separately (no descriptions). Empty
+    dict if the bundle has none.
+    """
+    p = bundle_root / "user_assets" / "manifest.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data.get("assets") or {}
+
+
 # --- plan-side helpers (used by kb_lint, kb_budget) ------------------------
 
 LEADING_BULLET_RE = re.compile(r"^\s*[•\-*–—]\s+")

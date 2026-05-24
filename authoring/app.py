@@ -998,12 +998,78 @@ def _read_skill_md() -> str:
     return (cli_mod.CONSUMER / "SKILL.md").read_text(encoding="utf-8")
 
 
-def _format_brief(brief: str) -> str:
+def _format_user_assets_section(user_meta: dict) -> str:
+    """Brief.md sub-section listing user-supplied assets and how to treat
+    them. Returns the empty string when none are attached.
+    """
+    if not user_meta:
+        return ""
+    lines = [
+        "## User-supplied assets — IMPORTANT",
+        "",
+        "The user attached the following assets to THIS request. They "
+        "are the primary intent and SHOULD be used in the deck wherever "
+        "they fit. Each file lives at `user_assets/<id>.<ext>` in this "
+        "bundle as a LOW-RES preview; the user's machine holds the "
+        "original at full resolution and will splice the original in at "
+        "compose time. The dimensions below are the originals'.",
+        "",
+        "Reference them in the plan exactly the same way you reference "
+        "any catalog asset — `\"<slot>\": \"<id>\"` for image slots, or "
+        "`{\"atom\": \"<id>\", ...}` inside a compose-mode shape. The id "
+        "format matches catalog assets on purpose so the compose "
+        "pipeline resolves them transparently.",
+        "",
+    ]
+    for aid, entry in sorted(user_meta.items()):
+        kind = entry.get("kind", "?")
+        ext = entry.get("ext", "?")
+        fname = entry.get("filename", "?")
+        size_kb = max(1, (entry.get("size_bytes") or 0) // 1024)
+        dims = ""
+        w, h = entry.get("width"), entry.get("height")
+        if w and h:
+            dims = f" {w}x{h}px"
+        lines.append(
+            f"- `{aid}` — {kind} ({ext}){dims}, "
+            f"{size_kb} KB original — original filename: `{fname}`"
+        )
+    lines += [
+        "",
+        "### How to treat these",
+        "",
+        "- The user expects these assets to appear in the output. Treat "
+        "them as a stronger signal than KB catalog matches.",
+        "- If a user asset fits a slot, use it — even if a KB asset "
+        "would score better on `feel` / `colors`. The user's intent "
+        "trumps the descriptive index here.",
+        "- If a user asset CANNOT fit any slot in your plan (wrong "
+        "aspect, no semantic match, etc.), prefer in this order:",
+        "  1. Pick a different template whose layout exposes a slot "
+        "this asset fits.",
+        "  2. Use compose-mode (free-form atoms) to place the user "
+        "asset alongside other shapes you control.",
+        "  3. Fall back to a similar KB catalog asset and explicitly "
+        "explain in the brief response that the user asset didn't fit.",
+        "  4. Last resort: omit the user asset, but flag it.",
+        "- The previews are LOW-RES (max 800px long side, possibly "
+        "re-encoded). Judge subject / composition / colors from them, "
+        "but don't reason about pixel-level detail.",
+        "- These assets do NOT carry descriptions. You see the file "
+        "itself plus the brief — combine the two to infer intent.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _format_brief(brief: str, user_meta: dict | None = None) -> str:
+    user_section = _format_user_assets_section(user_meta or {})
     return (
         "# Deck brief\n\n"
         f"{brief.strip() or '(no brief supplied)'}\n\n"
         "---\n\n"
-        "# Output rules\n\n"
+        + (user_section + "---\n\n" if user_section else "")
+        + "# Output rules\n\n"
         "- Read SKILL.md for the three-command surface and plan format.\n"
         "- Pick templates and assets ONLY from the attached `index.json`.\n"
         "- Return ONLY a JSON array. No prose, no markdown fences.\n"
@@ -1092,6 +1158,7 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
     clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
     clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
     index = cli_mod.build_index(clean_slides, clean_assets)
+    user_meta = _read_user_meta(USER_STAGED_DIR)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("SKILL.md", _read_skill_md())
@@ -1099,7 +1166,7 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
         if brand:
             zf.writestr("brand.md", brand + "\n")
         zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
-        zf.writestr("brief.md", _format_brief(brief))
+        zf.writestr("brief.md", _format_brief(brief, user_meta))
         # v4: per-deck theme.yaml. Filtered KB may have culled some
         # decks entirely — only ship themes whose deck still has at
         # least one template in the bundle (so the agent's bundle
@@ -1125,7 +1192,57 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
             for hp in sorted(helpers_dir.iterdir()):
                 if hp.is_file() and not hp.name.startswith("."):
                     zf.write(hp, f"helpers/{hp.name}")
-    return buf.getvalue()
+        # User-supplied assets: low-res previews + manifest with original
+        # dimensions. Full-res originals stay on the user's machine and
+        # are spliced into compose-run staging when the plan comes back.
+        if user_meta:
+            manifest_for_zip: dict = {}
+            for aid, entry in user_meta.items():
+                ext = entry.get("ext") or "bin"
+                src = USER_STAGED_DIR / f"{aid}.{ext}"
+                if not src.exists():
+                    continue
+                # Write a low-res copy directly into the zip via a tmp
+                # file so we don't materialize huge images in RAM.
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=f".{ext}",
+                ) as tf:
+                    low = Path(tf.name)
+                try:
+                    _make_low_res(src, low, entry.get("kind", "image"))
+                    zf.write(low, f"user_assets/{aid}.{ext}")
+                finally:
+                    low.unlink(missing_ok=True)
+                manifest_for_zip[aid] = {
+                    "id": aid,
+                    "filename": entry.get("filename"),
+                    "kind": entry.get("kind"),
+                    "ext": ext,
+                    "size_bytes": entry.get("size_bytes"),
+                    "width": entry.get("width"),
+                    "height": entry.get("height"),
+                }
+            zf.writestr(
+                "user_assets/manifest.json",
+                json_mod.dumps(
+                    {"note": (
+                        "User-supplied assets attached to this request. "
+                        "The files here are LOW-RES previews; the "
+                        "user's machine holds the full-resolution "
+                        "originals and will splice them in at compose "
+                        "time. See brief.md for usage guidance."
+                    ),
+                     "assets": manifest_for_zip},
+                    indent=2, ensure_ascii=False,
+                ),
+            )
+    blob = buf.getvalue()
+    # Move staged → bundle AFTER the zip is finalized: the bundle/ dir
+    # is now the canonical snapshot compose-run will use to resolve any
+    # user asset ids the agent references in the plan.
+    if user_meta:
+        _move_staged_to_bundle()
+    return blob
 
 
 def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str:
@@ -1138,7 +1255,15 @@ def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str
         sections.append("=== brand.md ===\n" + brand)
     sections.append("=== SKILL.md ===\n" + _read_skill_md())
     sections.append("=== index.json ===\n" + json_mod.dumps(index, indent=2, ensure_ascii=False))
-    sections.append("=== brief.md ===\n" + _format_brief(brief))
+    user_meta = _read_user_meta(USER_STAGED_DIR)
+    sections.append("=== brief.md ===\n" + _format_brief(brief, user_meta))
+    if user_meta:
+        sections.append(
+            "=== user_assets note ===\n"
+            "User-supplied asset BINARIES are not included in this "
+            "flat-text view. Use the .zip bundle path to see them; "
+            "metadata is listed in brief.md above."
+        )
     return "\n\n".join(sections) + "\n"
 
 
