@@ -2303,7 +2303,6 @@ def build(allow_pending: bool, out_path: Path | None, no_brand: bool) -> None:
 # Files included verbatim (path is relative to repo root). Globs allowed.
 PACKAGE_APP_ALLOWLIST = (
     "README.md",
-    "PLAN.md",
     ".gitignore",
     "authoring/cli.py",
     "authoring/app.py",
@@ -2315,6 +2314,8 @@ PACKAGE_APP_ALLOWLIST = (
     "consumer/reader.py",
     "consumer/requirements.txt",
     "consumer/index.example.json",
+    "consumer/helpers/*.py",
+    "consumer/helpers/*.md",
 )
 
 
@@ -2405,7 +2406,8 @@ built artifacts. Steps to get going on a fresh machine:
    the durable consumer skill.zip, or use the compose page to generate
    per-deck agent prompt bundles.
 
-See README.md and PLAN.md for the design.
+See README.md for the high-level overview. The consumer/SKILL.md file
+inside is the canonical reference the agent reads.
 """
 
 
