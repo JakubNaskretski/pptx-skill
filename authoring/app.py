@@ -1193,16 +1193,92 @@ def _format_brief(brief: str, user_meta: dict | None = None) -> str:
         f"{brief.strip() or '(no brief supplied)'}\n\n"
         "---\n\n"
         + (user_section + "---\n\n" if user_section else "")
-        + "# Output rules\n\n"
-        "- Read SKILL.md for the three-command surface and plan format.\n"
-        "- Pick templates and assets ONLY from the attached `index.json`.\n"
-        "- Return ONLY a JSON array. No prose, no markdown fences.\n"
-        "- Each entry: {\"template\": \"<id>\", \"slots\": { ... }}.\n"
-        "- Slot keys must match the template's declared slot ids.\n"
-        "- Image slot values: an asset id from index.json (not a file path).\n"
-        "- Text slot values: plain string, respect each slot's `max_chars`.\n"
-        "- Bullets slot values: array of strings.\n"
+        + "# How to plan this deck\n\n"
+        "Work through the problem in **four passes**, in this order. The\n"
+        "Compose page extracts ONLY the final JSON code-fence at the end\n"
+        "of your response; everything else is reasoning prose that helps\n"
+        "you think clearly and helps the human spot mistakes. Show your\n"
+        "work — don't jump straight to JSON.\n"
+        "\n"
+        "## Pass 1 — outline (plain text)\n"
+        "\n"
+        "Before picking any templates, sketch the deck as a numbered list\n"
+        "of slide titles + one-line intents. Decide the narrative arc and\n"
+        "slide count from the brief. Output under the heading `## Outline`.\n"
+        "\n"
+        "Example shape:\n"
+        "```\n"
+        "## Outline\n"
+        "1. Opener — thesis title + author + university\n"
+        "2. Problem statement — why this matters\n"
+        "3. Methodology — how the study was conducted\n"
+        "4. Results — key findings + chart\n"
+        "5. Closing — implications + Q&A invitation\n"
+        "```\n"
+        "\n"
+        "## Pass 2 — template picks\n"
+        "\n"
+        "For each outline entry, pick ONE template id from `index.json`.\n"
+        "Justify each pick in one line: which `feel` / `suitable_for` /\n"
+        "inventory anatomy matched, and how the template's `theme_colors`\n"
+        "compare to brand policy (see `brand.md` if present).\n"
+        "\n"
+        "Use `helpers/kb_filter.py` to find candidates, then\n"
+        "`helpers/kb_inspect.py <template_id>` to read the picked\n"
+        "template's slots + inventory in denormalized form. Pick templates\n"
+        "ONLY from `index.json` (or from `user_assets/manifest.json` for\n"
+        "assets — see the user-assets section above when present).\n"
+        "\n"
+        "If a brief calls for a layout no existing template provides,\n"
+        "switch that entry to compose-mode\n"
+        "(`{\"compose\": true, \"layout\": \"...\", \"shapes\": [...]}`)\n"
+        "rather than forcing a template that doesn't fit.\n"
+        "\n"
+        "Output as a table or list under `## Picks`.\n"
+        "\n"
+        "## Pass 3 — slot values\n"
+        "\n"
+        "Now fill each pick's slots. Walk `helpers/kb_inspect.py\n"
+        "<template_id>` to see what slots the template exposes + their\n"
+        "constraints, then:\n"
+        "\n"
+        "- **Text slots** — plain string, respect each slot's `max_chars`.\n"
+        "  Use `helpers/kb_budget.py <template_id> <slot_id> \"draft\"` to\n"
+        "  check fit on tight slots.\n"
+        "- **Bullets slots** — array of plain strings. NO leading `•`, `-`,\n"
+        "  or `*` glyphs — the template applies bullets via layout.\n"
+        "- **Image slots** — an `asset_<id>` from `index.json`, or from\n"
+        "  `user_assets/manifest.json` when present. User-supplied assets\n"
+        "  outrank KB matches.\n"
         "- If no asset fits a slot, omit the slot rather than forcing one.\n"
+        "\n"
+        "## Pass 4 — self-lint\n"
+        "\n"
+        "Save your draft as `plan.json` and run\n"
+        "`python helpers/kb_lint.py < plan.json` (or pipe directly). The\n"
+        "linter catches: slot ids not declared on the template, text over\n"
+        "`max_chars`, leading bullet glyphs, asset ids missing from both\n"
+        "index.json and user_assets, accepted-but-degraded shapes, and\n"
+        "compose-mode entries that the engine will currently skip. Fix\n"
+        "errors before emitting the final JSON.\n"
+        "\n"
+        "Exit code 0 = clean, 1 = errors — must be 0 to consider the plan\n"
+        "ready.\n"
+        "\n"
+        "## Final output\n"
+        "\n"
+        "End your response with the plan inside a single fenced block,\n"
+        "exactly like this (the fence is what the Compose page extracts):\n"
+        "\n"
+        "    ```json\n"
+        "    [\n"
+        "      {\"template\": \"<id>\", \"slots\": { ... }},\n"
+        "      ...\n"
+        "    ]\n"
+        "    ```\n"
+        "\n"
+        "Any prose before the fence is ignored by the system; any prose\n"
+        "after it is also ignored. Put only one JSON fence per response.\n"
         "\n"
         "## Helpers in this bundle\n"
         "\n"
@@ -3412,12 +3488,46 @@ document.getElementById("showText").onclick = async () => {
   el.hidden = false;
 };
 
+// Extract a JSON array from arbitrary pasted text. Tolerates:
+//   - bare JSON: `[ {...}, {...} ]`
+//   - fenced JSON: `... reasoning prose ... ```json\n[ ... ]\n``` ... trailing prose`
+//   - reasoning + bare array on the last lines.
+// Strategy: try straight parse first; then a ```json fence; then a `json
+// fenced block without language tag; finally fall back to the substring
+// from the first `[` to the matching last `]`. Returns the parsed array
+// or throws with a descriptive message.
+function extractPlanJSON(raw) {
+  // 1. Straight parse.
+  try { return JSON.parse(raw); } catch (e) {}
+
+  // 2. ```json ... ``` (case-insensitive language tag).
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try { return JSON.parse(fenced[1].trim()); } catch (e) {}
+  }
+
+  // 3. First `[` to last `]` substring.
+  const first = raw.indexOf("[");
+  const last = raw.lastIndexOf("]");
+  if (first !== -1 && last > first) {
+    try { return JSON.parse(raw.slice(first, last + 1)); } catch (e) {}
+  }
+
+  throw new Error(
+    "could not extract a JSON array — paste the model's response " +
+    "verbatim (with or without a ```json fence), or just the bare array."
+  );
+}
+
 document.getElementById("runCompose").onclick = async () => {
   const raw = document.getElementById("plan").value.trim();
   if (!raw) { showMsg("composeMsg", "paste a plan first", false); return; }
   let plan;
-  try { plan = JSON.parse(raw); }
-  catch (e) { showMsg("composeMsg", "invalid JSON: " + e.message, false); return; }
+  try { plan = extractPlanJSON(raw); }
+  catch (e) { showMsg("composeMsg", e.message, false); return; }
+  if (!Array.isArray(plan)) {
+    showMsg("composeMsg", "extracted JSON is not an array", false); return;
+  }
   showMsg("composeMsg", "composing…", true);
   const r = await fetch("/api/compose/run", {
     method: "POST",
