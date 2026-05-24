@@ -17,14 +17,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time as time_mod
 import webbrowser
 import zipfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from threading import Timer
+from threading import Lock, Timer
 
 import yaml
-from flask import Flask, abort, jsonify, render_template_string, request, send_file
+from flask import Flask, abort, g, jsonify, render_template_string, request, send_file
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -47,6 +49,103 @@ app = Flask(__name__)
 # Cap uploads at 200 MB — typical decks are <50 MB; this leaves headroom
 # without letting a stray multi-GB upload exhaust /tmp.
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Debug activity log — in-memory ring buffer surfaced to the UI widget.
+# ---------------------------------------------------------------------------
+
+_DEBUG_BUFFER_MAX = 250
+_debug_buffer: deque = deque(maxlen=_DEBUG_BUFFER_MAX)
+_debug_lock = Lock()
+_debug_next_id = 0
+
+
+def debug_event(level: str, kind: str, msg: str, **details) -> None:
+    """Push a named event into the debug ring buffer.
+
+    level: 'info' | 'warn' | 'error'
+    kind:  short tag for filtering (e.g. 'http', 'bundle', 'ingest',
+           'compose', 'batch', 'user_assets')
+    msg:   one-line human-readable summary shown verbatim in the widget
+    details: optional structured fields included alongside (not rendered
+             by default; available for future drill-downs)
+    """
+    global _debug_next_id
+    with _debug_lock:
+        _debug_next_id += 1
+        _debug_buffer.append({
+            "id": _debug_next_id,
+            "ts": time_mod.time(),
+            "level": level,
+            "kind": kind,
+            "msg": msg,
+            "details": details or None,
+        })
+
+
+# Skip request logging for our own polling endpoint (would feedback
+# loop) and for streamed media we don't care about.
+_DEBUG_SKIP_PATHS = ("/api/debug/log",)
+_DEBUG_SKIP_PREFIXES = ("/preview", "/api/user_assets/")  # binaries
+
+
+@app.before_request
+def _debug_req_start():
+    g._req_started_at = time_mod.time()
+
+
+@app.after_request
+def _debug_req_end(response):
+    started = getattr(g, "_req_started_at", None)
+    if started is None:
+        return response
+    path = request.path
+    if path in _DEBUG_SKIP_PATHS:
+        return response
+    if any(path.startswith(p) for p in _DEBUG_SKIP_PREFIXES):
+        return response
+    # Don't log page renders — the activity is what's interesting.
+    if not path.startswith("/api/"):
+        return response
+    duration_ms = int((time_mod.time() - started) * 1000)
+    code = response.status_code
+    level = "error" if code >= 500 else ("warn" if code >= 400 else "info")
+    debug_event(
+        level, "http",
+        f"{request.method} {path} → {code} · {duration_ms}ms",
+        method=request.method, path=path, status=code,
+        duration_ms=duration_ms,
+    )
+    return response
+
+
+@app.get("/api/debug/log")
+def api_debug_log():
+    """Return events newer than `since` (default 0). Cheap snapshot copy
+    under the lock; rendering happens client-side."""
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        since = 0
+    with _debug_lock:
+        latest = _debug_next_id
+        events = [e for e in _debug_buffer if e["id"] > since]
+    return jsonify({"latest_id": latest, "events": events})
+
+
+@app.post("/api/debug/clear")
+def api_debug_clear():
+    """Wipe the server-side buffer. Useful when the user wants a clean
+    slate before reproducing a specific scenario."""
+    global _debug_next_id
+    with _debug_lock:
+        _debug_buffer.clear()
+        # Keep ids monotonic across clears so client polls don't get
+        # confused by id wraparound — just bump and continue.
+        _debug_next_id += 1
+        last = _debug_next_id
+    return jsonify({"ok": True, "latest_id": last})
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +345,17 @@ def api_ingest():
                 "deck_stem": e.deck_stem,
             }), 409
         except Exception as e:
+            debug_event("error", "ingest",
+                        f"ingest failed for {safe_name}: {type(e).__name__}: {e}")
             return jsonify({"error": f"ingest failed: {e}"}), 500
+    debug_event(
+        "info", "ingest",
+        f"ingested {result.get('deck_stem','?')} — "
+        f"{result.get('slides',0)} slides, "
+        f"{result.get('pictures',0)} pictures, "
+        f"{result.get('atoms',0)} atoms",
+        **result,
+    )
     return jsonify(result)
 
 
@@ -645,6 +754,14 @@ def api_batch_create():
     )
 
     pruned = _prune_old_batches()
+    debug_event(
+        "info", "batch",
+        f"describe batch {batch_id} created — kind={kind}, "
+        f"{added}/{count} items, {len(skipped)} skipped"
+        + (f", pruned {pruned} old" if pruned else ""),
+        batch_id=batch_id, kind=kind, count=added, requested=count,
+        skipped=len(skipped),
+    )
 
     return jsonify({
         "batch_id": batch_id,
@@ -819,11 +936,18 @@ def api_batch_apply(batch_id):
         results.append({
             "id": key, "yaml": rel, "status": status, "errors": errs,
         })
+    matched = sum(1 for r in results if r["status"] not in ("no-match",))
+    n_err = sum(1 for r in results if r.get("errors"))
+    debug_event(
+        "warn" if n_err else "info", "batch",
+        f"batch {batch_id} applied — {matched} matched, {n_err} with errors",
+        batch_id=batch_id, matched=matched, errors=n_err,
+    )
     return jsonify({
         "batch_id": batch_id,
         "results": results,
         "found_keys": found_keys,
-        "matched": sum(1 for r in results if r["status"] not in ("no-match",)),
+        "matched": matched,
     })
 
 
@@ -1392,9 +1516,20 @@ def api_compose_bundle():
     brief = body.get("brief") or ""
     slides, assets = _filter_kb(filters)
     if not slides and not assets:
+        debug_event("warn", "bundle",
+                    "bundle request rejected — filters match nothing")
         return jsonify({"error": "filters match nothing — broaden them"}), 400
+    user_count = len(_read_user_meta(USER_STAGED_DIR))
     blob = _build_prompt_bundle_zip(slides, assets, brief)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    debug_event(
+        "info", "bundle",
+        f"prompt bundle built — {len(slides)} templates, "
+        f"{len(assets)} assets, {user_count} user assets, "
+        f"{len(blob) // 1024} KB",
+        templates=len(slides), assets=len(assets),
+        user_assets=user_count, size_bytes=len(blob),
+    )
     return send_file(
         io.BytesIO(blob),
         mimetype="application/zip",
@@ -1724,6 +1859,19 @@ def api_user_assets_upload():
             errors.append({"filename": f.filename or "?",
                            "reason": f"unexpected: {type(e).__name__}: {e}"})
     _write_user_meta(USER_STAGED_DIR, meta)
+    if added:
+        names = ", ".join(e.get("filename", "?") for e in added)
+        debug_event(
+            "info", "user_assets",
+            f"uploaded {len(added)} file(s): {names}",
+            count=len(added),
+        )
+    if errors:
+        debug_event(
+            "warn", "user_assets",
+            f"rejected {len(errors)} upload(s)",
+            errors=errors,
+        )
     return jsonify({"added": added, "errors": errors,
                     "staged": list(meta.values())})
 
@@ -1752,6 +1900,10 @@ def api_user_assets_delete(asset_id):
     bin_path = USER_STAGED_DIR / f"{asset_id}.{entry.get('ext', '')}"
     bin_path.unlink(missing_ok=True)
     _write_user_meta(USER_STAGED_DIR, meta)
+    debug_event(
+        "info", "user_assets",
+        f"removed staged user asset {asset_id} ({entry.get('filename','?')})",
+    )
     return jsonify({"ok": True, "removed": asset_id})
 
 
@@ -1800,8 +1952,15 @@ def api_compose_run():
                 timeout=60,
             )
         except subprocess.TimeoutExpired:
+            debug_event("error", "compose", "compose subprocess timed out (60s)")
             return jsonify({"error": "compose timed out"}), 500
         if result.returncode != 0 or not out_path.exists():
+            stderr_head = (result.stderr or "").splitlines()
+            debug_event(
+                "error", "compose",
+                f"compose failed (exit {result.returncode}): "
+                + (stderr_head[-1] if stderr_head else "no stderr"),
+            )
             return jsonify({
                 "error": "compose failed",
                 "stdout": result.stdout,
@@ -1818,6 +1977,14 @@ def api_compose_run():
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_persisted = persisted / f"deck-{ts}.pptx"
         shutil.copyfile(out_path, out_persisted)
+        debug_event(
+            "info", "compose",
+            f"compose finished — {out_persisted.name}, "
+            f"{out_persisted.stat().st_size // 1024} KB, "
+            f"{len(plan)} plan entries",
+            file=out_persisted.name, size_bytes=out_persisted.stat().st_size,
+            entries=len(plan),
+        )
 
     return send_file(
         out_persisted,
@@ -1831,6 +1998,169 @@ def api_compose_run():
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+
+
+DEBUG_WIDGET = r"""
+<style>
+.dbg-floater { position: fixed; bottom: 14px; right: 14px; z-index: 99999;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.dbg-toggle { padding: 7px 13px; background: #222; color: white; border: none;
+               border-radius: 999px; cursor: pointer; font-size: 12px;
+               font-weight: 600; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+               display: flex; align-items: center; gap: 6px; }
+.dbg-toggle:hover { background: #000; }
+.dbg-badge { background: #0066cc; color: white; border-radius: 10px;
+              padding: 1px 7px; font-size: 11px; font-weight: 600;
+              min-width: 14px; text-align: center; }
+.dbg-badge.err { background: #c92a2a; }
+.dbg-panel { position: absolute; bottom: 44px; right: 0; width: 480px;
+              height: 320px; background: white; border: 1px solid #ddd;
+              border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+              display: flex; flex-direction: column; overflow: hidden; }
+.dbg-header { padding: 7px 12px; border-bottom: 1px solid #e5e5e5;
+               background: #f6f7f8; display: flex; align-items: center;
+               font-size: 12px; gap: 6px; }
+.dbg-header strong { flex: 1; color: #333; }
+.dbg-header button { background: none; border: none; cursor: pointer;
+                      color: #666; font-size: 12px; padding: 2px 8px;
+                      border-radius: 3px; }
+.dbg-header button:hover { background: #ececec; color: #222; }
+.dbg-list { list-style: none; padding: 0; margin: 0; flex: 1;
+             overflow-y: auto; font-size: 11px;
+             font-family: ui-monospace, Menlo, monospace; }
+.dbg-row { padding: 3px 12px; border-bottom: 1px solid #f4f4f4;
+            display: flex; gap: 8px; align-items: baseline; }
+.dbg-row.dbg-warn { background: #fff8e6; }
+.dbg-row.dbg-error { background: #fdecea; color: #8a1818; }
+.dbg-ts { color: #aaa; flex-shrink: 0; }
+.dbg-kind { color: #0066cc; font-weight: 600; flex-shrink: 0;
+             min-width: 70px; }
+.dbg-row.dbg-error .dbg-kind { color: #8a1818; }
+.dbg-msg { color: #333; word-break: break-word; flex: 1; }
+.dbg-row.dbg-error .dbg-msg { color: #8a1818; }
+.dbg-empty { padding: 20px; text-align: center; color: #aaa; font-size: 11px; }
+</style>
+<div class="dbg-floater" id="dbgRoot">
+  <button class="dbg-toggle" id="dbgToggle" type="button" title="Toggle activity log">
+    <span>Activity</span>
+    <span class="dbg-badge" id="dbgBadge" hidden></span>
+  </button>
+  <div class="dbg-panel" id="dbgPanel" hidden>
+    <div class="dbg-header">
+      <strong>Activity log</strong>
+      <button id="dbgClear" type="button" title="Clear">clear</button>
+      <button id="dbgClose" type="button" title="Hide">×</button>
+    </div>
+    <ul class="dbg-list" id="dbgList">
+      <li class="dbg-empty" id="dbgEmpty">(waiting for activity…)</li>
+    </ul>
+  </div>
+</div>
+<script>
+(() => {
+  const root = document.getElementById("dbgRoot");
+  if (!root) return;
+  const list = document.getElementById("dbgList");
+  const panel = document.getElementById("dbgPanel");
+  const toggle = document.getElementById("dbgToggle");
+  const badge = document.getElementById("dbgBadge");
+  const emptyEl = document.getElementById("dbgEmpty");
+  let lastId = 0;
+  let panelOpen = false;
+  let unread = 0;
+  let unreadErr = 0;
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString();
+  }
+  function updateBadge() {
+    if (unread > 0) {
+      badge.textContent = unreadErr > 0 ? (unread + "!") : String(unread);
+      badge.className = "dbg-badge" + (unreadErr > 0 ? " err" : "");
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+  function appendEvents(events) {
+    if (!events.length) return;
+    if (emptyEl && emptyEl.parentNode) emptyEl.remove();
+    const wasNearBottom =
+      panel.scrollHeight - panel.scrollTop - panel.clientHeight < 80;
+    for (const e of events) {
+      const li = document.createElement("li");
+      li.className = "dbg-row dbg-" + (e.level || "info");
+      const ts = document.createElement("span");
+      ts.className = "dbg-ts";
+      ts.textContent = fmtTime(e.ts);
+      const kind = document.createElement("span");
+      kind.className = "dbg-kind";
+      kind.textContent = e.kind || "?";
+      const msg = document.createElement("span");
+      msg.className = "dbg-msg";
+      msg.textContent = e.msg || "";
+      li.append(ts, kind, msg);
+      list.appendChild(li);
+    }
+    // Trim if grown too long.
+    while (list.children.length > 400) list.removeChild(list.firstChild);
+    if (panelOpen && wasNearBottom) {
+      const inner = panel.querySelector(".dbg-list");
+      if (inner) inner.scrollTop = inner.scrollHeight;
+    }
+  }
+  async function poll() {
+    try {
+      const r = await fetch("/api/debug/log?since=" + lastId);
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.latest_id > lastId) lastId = j.latest_id;
+      if (j.events && j.events.length) {
+        appendEvents(j.events);
+        if (!panelOpen) {
+          for (const e of j.events) {
+            unread += 1;
+            if (e.level === "error") unreadErr += 1;
+          }
+          updateBadge();
+        }
+      }
+    } catch (err) {
+      // Silent — backend may be down briefly.
+    }
+  }
+  toggle.onclick = () => {
+    if (panelOpen) {
+      panel.hidden = true; panelOpen = false;
+    } else {
+      panel.hidden = false; panelOpen = true;
+      unread = 0; unreadErr = 0;
+      updateBadge();
+      const inner = panel.querySelector(".dbg-list");
+      if (inner) inner.scrollTop = inner.scrollHeight;
+    }
+  };
+  document.getElementById("dbgClose").onclick = () => {
+    panel.hidden = true; panelOpen = false;
+  };
+  document.getElementById("dbgClear").onclick = async () => {
+    list.innerHTML = '<li class="dbg-empty" id="dbgEmpty">(cleared)</li>';
+    unread = 0; unreadErr = 0;
+    updateBadge();
+    try {
+      const r = await fetch("/api/debug/clear", { method: "POST" });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.latest_id) lastId = j.latest_id;
+      }
+    } catch (err) {}
+  };
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+"""
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -2677,6 +3007,7 @@ loadVocab().then(loadItems).catch(err => {
   loadItems();
 });
 </script>
+{{ debug_widget|safe }}
 </body>
 </html>
 """
@@ -2684,7 +3015,7 @@ loadVocab().then(loadItems).catch(err => {
 
 @app.get("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(INDEX_HTML, debug_widget=DEBUG_WIDGET)
 
 
 COMPOSE_HTML = r"""<!doctype html>
@@ -3322,6 +3653,7 @@ document.getElementById("uaFileInput").onchange = (e) => {
   loadUserAssets();
 })();
 </script>
+{{ debug_widget|safe }}
 </body>
 </html>
 """
@@ -3329,7 +3661,7 @@ document.getElementById("uaFileInput").onchange = (e) => {
 
 @app.get("/compose")
 def compose_page():
-    return render_template_string(COMPOSE_HTML)
+    return render_template_string(COMPOSE_HTML, debug_widget=DEBUG_WIDGET)
 
 
 def main():
