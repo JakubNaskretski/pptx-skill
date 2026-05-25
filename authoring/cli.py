@@ -32,6 +32,8 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 
+import ingest_v5  # v5 redesign — self-contained, removable as a unit
+
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE / "workspace"
@@ -1701,6 +1703,11 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     # ingest — it is derived data, no human-edited fields to preserve.
     theme = extract_deck_theme(prs, deck_stem)
     write_yaml(deck_dir / "theme.yaml", theme)
+
+    # v5 (additive): write workspace/themes/<deck>/{theme.yaml, master.pptx}
+    # with semantic palette roles + master fragment for the new build engine.
+    # Purely additive — v4 path above is unaffected.
+    ingest_v5.digest_theme(original, deck_stem, theme, WORKSPACE / "themes")
 
     # Resolve slide-level theme_colors via aliases; pass palette into
     # slot detection so per-run colour refs become hex + role names.
