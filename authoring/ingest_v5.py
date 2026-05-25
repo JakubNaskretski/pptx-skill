@@ -429,11 +429,7 @@ def _slot_from_free_shape(
     if getattr(shape, "has_chart", False):
         return _slot_chart(shape, slide_w, slide_h, used_ids)
     if _shape_is_picture(shape):
-        # Conscious choice: free pictures > 15% slide area become image
-        # slots; smaller treated as decoration. Threshold from the v4
-        # heuristic, slightly relaxed (was 20%).
-        area_frac = _area_fraction(shape, slide_w, slide_h)
-        if area_frac > 0.15:
+        if _is_image_slot_worthy(shape, slide_w, slide_h):
             return _slot_image(shape, slide_w, slide_h, used_ids, slot_id_base="hero")
     # Freeforms / auto-shapes / connectors / groups — conscious drop
     # per REDESIGN.md. B4 may rescue some as frozen background.
@@ -1047,6 +1043,31 @@ def _shape_is_picture(shape) -> bool:
         return shape.shape_type == MSO_SHAPE_TYPE.PICTURE
     except (AttributeError, ValueError):
         return False
+
+
+def _is_image_slot_worthy(shape, slide_w: int, slide_h: int) -> bool:
+    """A free Picture becomes an image slot if it covers ≥5% of slide
+    area AND has a non-extreme aspect ratio. The aspect filter catches
+    brand banners (very wide / very thin strips) that would otherwise
+    be promoted to slots once we lowered the area threshold from the
+    old 15-20% to 5%.
+
+    Found by testing on Naskrętski_01: a portrait hero photo at 12.8%
+    area was being missed under the old > 15% rule, while a wide
+    decorative banner at 4% area + aspect 3.15:1 needed to stay
+    decoration. Combined filter handles both: hero gets in (13% > 5%
+    + 0.56 aspect is normal), banner stays out (4% < 5%, and even if
+    it were larger the 3.15 aspect would still filter it).
+    """
+    area = _area_fraction(shape, slide_w, slide_h)
+    if area < 0.05:
+        return False
+    w = shape.width or 0
+    h = shape.height or 0
+    if w <= 0 or h <= 0:
+        return False
+    aspect = w / h
+    return 0.3 < aspect < 3.0
 
 
 # ---------------------------------------------------------------------------
