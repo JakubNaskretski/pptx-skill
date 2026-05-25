@@ -2115,6 +2115,21 @@ def preview() -> None:
         click.echo(f"preview: {n_failed} slide(s) could not be rendered", err=True)
     click.echo(f"preview: built {n_built} thumbnail(s)")
 
+    # v5 (additive): mirror each rendered slide PNG into the matching
+    # skeleton dir so the C1 Flask UI is self-contained. Idempotent.
+    skeletons_root = WORKSPACE / "skeletons"
+    n_mirrored = 0
+    if skeletons_root.exists():
+        for slide_png in sorted(decks.glob("*/slides/slide_*.png")):
+            deck_stem = slide_png.parent.parent.name
+            slide_num = int(slide_png.stem.split("_")[-1])
+            sk_dir = skeletons_root / f"{deck_stem}_{slide_num:02d}"
+            if sk_dir.exists():
+                shutil.copyfile(slide_png, sk_dir / "preview.png")
+                n_mirrored += 1
+    if n_mirrored:
+        click.echo(f"preview: mirrored {n_mirrored} preview(s) into v5 skeleton dirs")
+
 
 # --- build -----------------------------------------------------------------
 

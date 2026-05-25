@@ -3774,6 +3774,390 @@ def compose_page():
     return render_template_string(COMPOSE_HTML, debug_widget=DEBUG_WIDGET)
 
 
+# ---------------------------------------------------------------------------
+# v5 redesign — read-only skeletons view (phase C1).
+# Self-contained block. To roll back v5, delete this section + the
+# V5_HTML constant + the route below.
+# ---------------------------------------------------------------------------
+
+
+V5_THEMES_DIR = WORKSPACE / "themes"
+V5_SKELETONS_DIR = WORKSPACE / "skeletons"
+
+
+def _v5_safe_path(root: Path, name: str) -> Path | None:
+    """Resolve <root>/<name> ensuring no traversal outside <root>."""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    target = (root / name).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+@app.get("/api/v5/skeletons")
+def api_v5_list_skeletons():
+    """Group skeleton summaries by source_deck."""
+    decks: dict = {}
+    if not V5_SKELETONS_DIR.exists():
+        return jsonify({"decks": decks})
+    for d in sorted(V5_SKELETONS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        sk_path = d / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        try:
+            data = yaml.safe_load(sk_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        deck = data.get("source_deck", "unknown")
+        decks.setdefault(deck, []).append({
+            "id": data.get("id"),
+            "source_slide_index": data.get("source_slide_index"),
+            "status": data.get("status", "pending"),
+            "categories": data.get("categories", []),
+            "has_warnings": bool(data.get("digest_warnings")),
+            "slot_count": len(data.get("slots", [])),
+            "has_preview": (d / "preview.png").exists(),
+        })
+    for deck in decks:
+        decks[deck].sort(key=lambda s: s.get("source_slide_index", 0))
+    return jsonify({"decks": decks})
+
+
+@app.get("/api/v5/skeleton/<skeleton_id>")
+def api_v5_get_skeleton(skeleton_id):
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None or not (safe / "skeleton.yaml").exists():
+        abort(404)
+    try:
+        data = yaml.safe_load((safe / "skeleton.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        abort(500)
+    return jsonify(data)
+
+
+@app.get("/v5/skeleton/<skeleton_id>/preview.png")
+def v5_skeleton_preview(skeleton_id):
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None:
+        abort(404)
+    p = safe / "preview.png"
+    if not p.exists():
+        abort(404)
+    return send_file(str(p), mimetype="image/png")
+
+
+@app.get("/api/v5/themes")
+def api_v5_list_themes():
+    out: list[dict] = []
+    if not V5_THEMES_DIR.exists():
+        return jsonify({"themes": out})
+    for d in sorted(V5_THEMES_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        t_path = d / "theme.yaml"
+        if not t_path.exists():
+            continue
+        try:
+            data = yaml.safe_load(t_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        out.append({
+            "id": data.get("id"),
+            "palette": data.get("palette", {}),
+            "fonts": data.get("fonts", {}),
+            "decoration_count": len(data.get("decorations", [])),
+        })
+    return jsonify({"themes": out})
+
+
+@app.get("/api/v5/theme/<theme_id>")
+def api_v5_get_theme(theme_id):
+    safe = _v5_safe_path(V5_THEMES_DIR, theme_id)
+    if safe is None or not (safe / "theme.yaml").exists():
+        abort(404)
+    try:
+        data = yaml.safe_load((safe / "theme.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        abort(500)
+    return jsonify(data)
+
+
+@app.get("/v5")
+def v5_page():
+    return render_template_string(V5_HTML, debug_widget=DEBUG_WIDGET)
+
+
+V5_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pptx-skill v5 — skeletons</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           margin: 0; height: 100vh; display: flex; color: #222; }
+
+    .sidebar { width: 280px; border-right: 1px solid #ddd; background: #fafafa;
+               overflow-y: auto; display: flex; flex-direction: column; }
+    .sidebar header { padding: 12px 14px; border-bottom: 1px solid #ddd; }
+    .sidebar header h1 { font-size: 14px; margin: 0 0 4px; font-weight: 600; }
+    .sidebar header .nav { font-size: 11px; color: #666; }
+    .sidebar header .nav a { color: #0066cc; text-decoration: none; margin-right: 8px; }
+    .sidebar header .nav a:hover { text-decoration: underline; }
+    .deck-group h2 { font-size: 11px; text-transform: uppercase;
+                     letter-spacing: 0.5px; color: #555; padding: 12px 14px 6px;
+                     margin: 0; background: #f0f0f0; border-bottom: 1px solid #e0e0e0; }
+    .item-list { list-style: none; padding: 0; margin: 0; }
+    .item-list li { padding: 8px 14px; cursor: pointer; font-size: 12px;
+                    display: flex; justify-content: space-between; align-items: center;
+                    border-bottom: 1px solid #eee; gap: 8px; }
+    .item-list li:hover { background: #eef4ff; }
+    .item-list li.active { background: #d8e8ff; }
+    .item-list .label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .item-list .label .top { display: flex; align-items: center; gap: 4px; }
+    .item-list .cats { font-size: 10px; color: #888; white-space: nowrap;
+                       overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+    .pill { font-size: 9px; padding: 2px 6px; border-radius: 8px;
+            text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; flex-shrink: 0; }
+    .pill.pending { background: #ffeaa7; color: #8c6900; }
+    .pill.done { background: #c8e6c9; color: #1b5e20; }
+    .pill.rejected { background: #e0e0e0; color: #555; }
+    .warn-dot { color: #d68b00; font-weight: 700; }
+
+    .preview-area { flex: 1; background: #1c1c1c; display: flex; align-items: center;
+                    justify-content: center; padding: 20px; min-width: 0; }
+    .preview-wrap { position: relative; max-width: 100%; max-height: 100%;
+                    background: white; box-shadow: 0 4px 30px rgba(0,0,0,0.4); }
+    .preview-wrap img { display: block; max-width: 100%;
+                        max-height: calc(100vh - 80px); object-fit: contain; }
+    .slot-overlay { position: absolute; border: 2px solid;
+                    cursor: pointer; transition: background 0.1s; }
+    .slot-overlay:hover { background: rgba(255,255,255,0.18) !important; }
+    .slot-overlay .slot-label { position: absolute; top: 2px; left: 2px;
+                                background: rgba(0,0,0,0.85); color: white;
+                                padding: 2px 6px; font-size: 10px; border-radius: 3px;
+                                font-family: ui-monospace, monospace; white-space: nowrap; }
+    .slot-overlay.heading   { border-color: #e53935; }
+    .slot-overlay.paragraph { border-color: #fb8c00; }
+    .slot-overlay.bullets   { border-color: #1e88e5; }
+    .slot-overlay.table     { border-color: #43a047; }
+    .slot-overlay.chart     { border-color: #8e24aa; }
+    .slot-overlay.image     { border-color: #00acc1; }
+    .slot-overlay.footer    { border-color: #757575; }
+
+    .preview-empty { color: #999; font-size: 13px; text-align: center; padding: 40px;
+                     line-height: 1.5; }
+    .preview-empty .hint { font-size: 11px; color: #777; margin-top: 8px;
+                           font-family: ui-monospace, monospace; }
+
+    .panel { width: 440px; border-left: 1px solid #ddd; padding: 16px;
+             overflow-y: auto; background: white; }
+    .panel h2 { margin: 0 0 4px; font-size: 15px; word-break: break-all;
+                font-family: ui-monospace, monospace; }
+    .panel .subtitle { color: #777; font-size: 12px; margin-bottom: 14px; }
+    .panel .cats-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px;
+                       align-items: center; }
+    .cats-row .label { font-size: 11px; color: #555; text-transform: uppercase;
+                        letter-spacing: 0.5px; margin-right: 4px; }
+    .cat-tag { background: #e8eaf6; color: #3949ab; padding: 3px 8px;
+               border-radius: 10px; font-size: 11px; font-weight: 500; }
+    .warning-banner { background: #fff4e0; border: 1px solid #ffcc80; color: #8c5400;
+                      padding: 8px 12px; border-radius: 4px; font-size: 12px;
+                      margin-bottom: 14px; line-height: 1.4; }
+
+    .slots-header { font-size: 11px; text-transform: uppercase;
+                    letter-spacing: 0.5px; color: #555; margin: 0 0 8px; }
+    .slot-card { border: 1px solid #e0e0e0; border-radius: 4px; padding: 10px 12px;
+                 margin-bottom: 10px; background: #fafafa; transition: background 0.1s; }
+    .slot-card.active { background: #fff8e1; border-color: #ffc107; }
+    .slot-head { display: flex; justify-content: space-between;
+                 align-items: center; margin-bottom: 6px; gap: 8px; }
+    .slot-id { font-weight: 600; font-size: 13px; font-family: ui-monospace, monospace; }
+    .kind-btns { display: flex; gap: 2px; flex-wrap: wrap; }
+    .kind-btn { padding: 2px 6px; border: 1px solid #ccc; background: white;
+                font-size: 10px; cursor: not-allowed; border-radius: 3px;
+                color: #888; font-family: ui-monospace, monospace; }
+    .kind-btn.active { background: #1e88e5; color: white; border-color: #1565c0;
+                       cursor: default; font-weight: 600; }
+    .excerpt { font-size: 12px; color: #444; margin-bottom: 6px;
+               font-style: italic; word-break: break-word; line-height: 1.4; }
+    .constraints { font-size: 11px; color: #666;
+                   font-family: ui-monospace, monospace; }
+    .constraints .req { color: #d32f2f; font-weight: 600; }
+    .constraints .sep { color: #bbb; margin: 0 4px; }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <header>
+      <h1>pptx-skill v5 — skeletons</h1>
+      <div class="nav"><a href="/">describe</a><a href="/compose">compose</a></div>
+    </header>
+    <div id="skeletons-list"></div>
+  </aside>
+  <main class="preview-area" id="preview-area">
+    <div class="preview-empty">
+      <div>Select a skeleton on the left.</div>
+      <div class="hint">colored boxes = our digest proposal · hover for details</div>
+    </div>
+  </main>
+  <aside class="panel" id="panel">
+    <div class="preview-empty" style="text-align:center;padding-top:40px;">
+      No skeleton selected.
+    </div>
+  </aside>
+  {{ debug_widget|safe }}
+
+  <script>
+    const KIND_LIST = ['heading', 'paragraph', 'bullets', 'table', 'chart', 'image', 'footer'];
+
+    async function loadSkeletons() {
+      const r = await fetch('/api/v5/skeletons');
+      const data = await r.json();
+      const root = document.getElementById('skeletons-list');
+      root.innerHTML = '';
+      const decks = Object.keys(data.decks).sort();
+      if (decks.length === 0) {
+        root.innerHTML = '<div style="padding:14px;color:#888;font-size:12px;line-height:1.5;">No skeletons yet.<br>Run:<br><code style="font-size:11px;">python3 authoring/cli.py ingest your_deck.pptx</code></div>';
+        return;
+      }
+      decks.forEach(deck => {
+        const group = document.createElement('div');
+        group.className = 'deck-group';
+        const h = document.createElement('h2');
+        h.textContent = deck;
+        group.appendChild(h);
+        const ul = document.createElement('ul');
+        ul.className = 'item-list';
+        data.decks[deck].forEach(sk => {
+          const li = document.createElement('li');
+          li.dataset.id = sk.id;
+          const cats = (sk.categories || []).join(', ') || '—';
+          const warn = sk.has_warnings ? '<span class="warn-dot" title="overlap_detected">⚠</span> ' : '';
+          li.innerHTML = `
+            <span class="label">
+              <span class="top">${warn}slide ${sk.source_slide_index} · ${sk.slot_count} slots</span>
+              <span class="cats">${cats}</span>
+            </span>
+            <span class="pill ${sk.status}">${sk.status}</span>
+          `;
+          li.onclick = () => selectSkeleton(sk.id);
+          ul.appendChild(li);
+        });
+        group.appendChild(ul);
+        root.appendChild(group);
+      });
+    }
+
+    async function selectSkeleton(id) {
+      document.querySelectorAll('.item-list li').forEach(li => {
+        li.classList.toggle('active', li.dataset.id === id);
+      });
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}`);
+      const sk = await r.json();
+      renderPreview(sk);
+      renderPanel(sk);
+    }
+
+    function renderPreview(sk) {
+      const area = document.getElementById('preview-area');
+      area.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'preview-wrap';
+      const img = document.createElement('img');
+      img.src = `/v5/skeleton/${encodeURIComponent(sk.id)}/preview.png?cb=${Date.now()}`;
+      img.onerror = () => {
+        wrap.style.background = 'transparent';
+        wrap.style.boxShadow = 'none';
+        wrap.innerHTML = `<div class="preview-empty">
+          <div>No preview rendered for this skeleton yet.</div>
+          <div class="hint">Run: python3 authoring/cli.py preview</div>
+          <div class="hint" style="margin-top:14px;">Slot inventory is still visible on the right →</div>
+        </div>`;
+      };
+      img.onload = () => {
+        (sk.slots || []).forEach(slot => {
+          const g = slot.geometry || {};
+          const d = document.createElement('div');
+          d.className = `slot-overlay ${slot.kind}`;
+          d.style.left = `${(g.x || 0) * 100}%`;
+          d.style.top = `${(g.y || 0) * 100}%`;
+          d.style.width = `${(g.w || 0) * 100}%`;
+          d.style.height = `${(g.h || 0) * 100}%`;
+          d.dataset.slotId = slot.id;
+          d.innerHTML = `<span class="slot-label">${slot.id} · ${slot.kind}</span>`;
+          d.onmouseenter = () => highlightSlot(slot.id, true);
+          d.onmouseleave = () => highlightSlot(slot.id, false);
+          wrap.appendChild(d);
+        });
+      };
+      wrap.appendChild(img);
+      area.appendChild(wrap);
+    }
+
+    function renderPanel(sk) {
+      const panel = document.getElementById('panel');
+      const cats = (sk.categories || []).map(c => `<span class="cat-tag">${escapeHtml(c)}</span>`).join('');
+      const warnings = sk.digest_warnings || [];
+      const warnHtml = warnings.length
+        ? `<div class="warning-banner"><strong>⚠ ${warnings.join(', ')}</strong> · picture may be a frozen background underlay; the agent shouldn't swap it. Review the overlay.</div>`
+        : '';
+      const slotCards = (sk.slots || []).map(slot => {
+        const kindBtns = KIND_LIST.map(k =>
+          `<span class="kind-btn ${k === slot.kind ? 'active' : ''}">${k}</span>`
+        ).join('');
+        const c = slot.constraints || {};
+        const parts = [];
+        if (c.max_chars) parts.push(`max ${c.max_chars} chars`);
+        if (c.max_lines) parts.push(`${c.max_lines} lines`);
+        if (c.max_items) parts.push(`${c.max_items} items`);
+        if (c.max_chars_per_item) parts.push(`${c.max_chars_per_item} chars/item`);
+        if (c.max_rows && c.max_cols) parts.push(`${c.max_rows}×${c.max_cols}${c.has_header ? ' +hdr' : ''}`);
+        if (c.chart_type) parts.push(`${c.chart_type}, ${c.max_series}s×${c.max_categories}c`);
+        if (c.aspect) parts.push(`aspect ${c.aspect}`);
+        if (c.required) parts.push('<span class="req">required</span>');
+        return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
+          <div class="slot-head">
+            <span class="slot-id">${escapeHtml(slot.id)}</span>
+            <span class="kind-btns">${kindBtns}</span>
+          </div>
+          ${slot.source_excerpt ? `<div class="excerpt">${escapeHtml(slot.source_excerpt)}</div>` : ''}
+          <div class="constraints">${parts.join('<span class="sep">·</span>')}</div>
+        </div>`;
+      }).join('');
+      panel.innerHTML = `
+        <h2>${escapeHtml(sk.id)}</h2>
+        <div class="subtitle">${escapeHtml(sk.source_deck)} · slide ${sk.source_slide_index} · ${(sk.slots || []).length} slot${(sk.slots || []).length === 1 ? '' : 's'}</div>
+        <div class="cats-row"><span class="label">categories</span>${cats || '<span style="color:#888;font-size:11px;">none</span>'}</div>
+        ${warnHtml}
+        <h3 class="slots-header">slots (proposed)</h3>
+        ${slotCards}
+      `;
+    }
+
+    function highlightSlot(slotId, on) {
+      document.querySelectorAll(`.slot-card[data-slot-id="${CSS.escape(slotId)}"]`).forEach(c => {
+        c.classList.toggle('active', on);
+      });
+    }
+
+    function escapeHtml(s) {
+      return (s == null ? '' : String(s)).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    loadSkeletons();
+  </script>
+</body>
+</html>
+"""
+
+
 def main():
     port = int(os.environ.get("PPTX_SKILL_PORT", "5050"))
     url = f"http://127.0.0.1:{port}/"
