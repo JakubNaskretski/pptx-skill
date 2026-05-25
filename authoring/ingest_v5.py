@@ -74,6 +74,7 @@ def _resolve_palette_v5(theme_v4: dict) -> dict:
 
 
 def digest_theme(
+    prs,
     original_path: Path,
     deck_stem: str,
     theme_v4: dict,
@@ -83,8 +84,10 @@ def digest_theme(
 
     Reads from the v4 theme dict (palette + fonts + aliases from
     cli.extract_deck_theme) and emits the v5 schema: semantic palette
-    roles, fonts, master_pptx + preview references, empty decorations
-    array (B3 populates).
+    roles, fonts, master_pptx + preview references, plus the
+    auto-classified decorations array from B3 (master shapes tagged
+    as top_bar / bottom_bar / corner_logo / page_number / section_panel
+    / background_image via geometric heuristics).
 
     master.pptx is currently a copy of original.pptx. Proper master-only
     extraction (drop slides, keep masters + layouts + theme + media)
@@ -97,6 +100,7 @@ def digest_theme(
 
     palette_v5 = {k: v for k, v in _resolve_palette_v5(theme_v4).items() if v}
     fonts = {k: v for k, v in (theme_v4.get("fonts") or {}).items() if v}
+    decorations = _classify_decorations(prs, palette_v5)
 
     out = {
         "id": deck_stem,
@@ -104,7 +108,7 @@ def digest_theme(
         "fonts": fonts,
         "master_pptx": "master.pptx",
         "preview": "preview.png",
-        "decorations": [],
+        "decorations": decorations,
     }
     _write_yaml(theme_dir / "theme.yaml", out)
     return out
@@ -118,6 +122,122 @@ def _extract_master_pptx(src: Path, dst: Path) -> None:
     correctness-equivalent, just larger than the minimal artifact.
     """
     shutil.copyfile(src, dst)
+
+
+# ---------------------------------------------------------------------------
+# B3 — Decoration auto-classification
+# ---------------------------------------------------------------------------
+
+
+def _classify_decorations(prs, palette_v5: dict) -> list[dict]:
+    """Walk slide masters; classify each shape per geometric heuristics
+    into top_bar / bottom_bar / corner_logo / page_number / section_panel
+    / background_image. Returns a list of decoration entries with kind
+    + fractional geometry + optional color_role.
+
+    Decorations are informational only in v5 (they ride along with the
+    master at build time, not addressable from plans). Captured for
+    future v5.x decoration-mixer; user verifies in the Flask UI.
+    """
+    slide_w = prs.slide_width or 9144000
+    slide_h = prs.slide_height or 6858000
+
+    out: list[dict] = []
+    for master in prs.slide_masters:
+        for shape in list(master.shapes):
+            deco = _classify_one_decoration(shape, slide_w, slide_h, palette_v5)
+            if deco is not None:
+                out.append(deco)
+    return out
+
+
+def _classify_one_decoration(shape, slide_w: int, slide_h: int, palette_v5: dict) -> dict | None:
+    geom = _fractional_geometry(shape, slide_w, slide_h)
+    x, y, w, h = geom["x"], geom["y"], geom["w"], geom["h"]
+    if w <= 0 or h <= 0:
+        return None
+
+    kind = _infer_decoration_kind(shape, x, y, w, h)
+    if kind is None:
+        return None
+
+    entry: dict = {"kind": kind, "geometry": geom}
+    color_role = _shape_fill_role(shape, palette_v5)
+    if color_role:
+        entry["color_role"] = color_role
+    return entry
+
+
+def _infer_decoration_kind(shape, x: float, y: float, w: float, h: float) -> str | None:
+    # Slide-number placeholder wins regardless of geometry — masters
+    # typically place it in a corner but custom templates may differ.
+    if _is_page_number(shape):
+        return "page_number"
+
+    # Full-width thin bars: top_bar / bottom_bar
+    if w > 0.9 and h < 0.02:
+        if y < 0.03:
+            return "top_bar"
+        if y + h > 0.97:
+            return "bottom_bar"
+
+    # Small corner artifact: logo if Picture, decoration otherwise
+    if w < 0.10 and h < 0.10:
+        near_left = x < 0.05
+        near_right = (x + w) > 0.95
+        near_top = y < 0.05
+        near_bottom = (y + h) > 0.95
+        if (near_left or near_right) and (near_top or near_bottom):
+            if _shape_is_picture(shape):
+                return "corner_logo"
+            return "corner_decoration"
+
+    # Background image: covers nearly whole slide
+    if w > 0.9 and h > 0.9 and _shape_is_picture(shape):
+        return "background_image"
+
+    # Section panel: large solid fill (>30% × >30%) likely a divider
+    # background. Lower priority than the more specific kinds above.
+    if w > 0.30 and h > 0.30 and _shape_has_solid_fill(shape):
+        return "section_panel"
+
+    return None
+
+
+def _is_page_number(shape) -> bool:
+    try:
+        if shape.is_placeholder and shape.placeholder_format.type == PP_PLACEHOLDER.SLIDE_NUMBER:
+            return True
+    except (AttributeError, ValueError):
+        pass
+    # PPT stores the page-number field as <a:fld type="slidenum">; the
+    # surface text on extracted shape.text often comes through as ‹#›
+    # (per locale). Check both shapes commonly seen in real decks.
+    try:
+        text = (shape.text_frame.text or "")
+        if "‹#›" in text or "<#>" in text or "#" == text.strip():
+            return True
+    except (AttributeError, ValueError):
+        pass
+    return False
+
+
+def _shape_has_solid_fill(shape) -> bool:
+    try:
+        rgb = shape.fill.fore_color.rgb
+        return rgb is not None
+    except (AttributeError, ValueError, TypeError):
+        return False
+
+
+def _shape_fill_role(shape, palette_v5: dict) -> str | None:
+    try:
+        rgb = shape.fill.fore_color.rgb
+        if rgb is None:
+            return None
+        return _resolve_color_role(f"#{str(rgb).upper()}", palette_v5)
+    except (AttributeError, ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -1705,9 +1705,9 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     write_yaml(deck_dir / "theme.yaml", theme)
 
     # v5 (additive): write workspace/themes/<deck>/{theme.yaml, master.pptx}
-    # with semantic palette roles + master fragment for the new build engine.
-    # Purely additive — v4 path above is unaffected.
-    ingest_v5.digest_theme(original, deck_stem, theme, WORKSPACE / "themes")
+    # with semantic palette roles + master fragment + auto-classified
+    # decorations for the new build engine. v4 path above is unaffected.
+    ingest_v5.digest_theme(prs, original, deck_stem, theme, WORKSPACE / "themes")
 
     # Resolve slide-level theme_colors via aliases; pass palette into
     # slot detection so per-run colour refs become hex + role names.
