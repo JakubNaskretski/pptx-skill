@@ -2406,8 +2406,10 @@ INDEX_HTML = r"""<!doctype html>
     <header>
       <strong>pptx-skill</strong>
       <span id="counts" style="color:#888;font-size:11px;margin-left:6px;"></span>
-      <a href="/compose" style="float:right;font-size:11px;color:#0066cc;
-         text-decoration:none;">Compose →</a>
+      <span style="float:right;font-size:11px;">
+        <a href="/v5" style="color:#0066cc;text-decoration:none;margin-right:8px;">Skeletons →</a>
+        <a href="/compose" style="color:#0066cc;text-decoration:none;">Compose →</a>
+      </span>
     </header>
     <div class="ingest-row">
       <input type="file" id="ingestFile" accept=".pptx"
@@ -2423,8 +2425,14 @@ INDEX_HTML = r"""<!doctype html>
       <button data-view="batch">Bulk</button>
     </div>
     <div class="tabs" id="kindTabs">
-      <button data-tab="slides" class="active">Slides</button>
-      <button data-tab="assets">Assets</button>
+      <button data-tab="slides" title="Slides moved to /v5 — describe page now owns assets only"
+              style="display:none;">Slides</button>
+      <button data-tab="assets" class="active">Assets</button>
+    </div>
+    <div style="padding:6px 14px;font-size:11px;color:#888;border-bottom:1px solid #eee;
+                line-height:1.4;">
+      Slide review moved to <a href="/v5" style="color:#0066cc;text-decoration:none;">/v5 →</a>
+      — this page now describes assets only.
     </div>
     <div class="filter-row" id="filterRow">
       <label><input type="checkbox" id="hideDone" checked> Hide done</label>
@@ -2542,7 +2550,7 @@ async function loadVocab() {
   ASSET_TAGS = v.asset.suitable_for;
 }
 
-let activeTab = "slides";
+let activeTab = "assets";  // v5: slide tab hidden; describe page owns assets only
 let items = {slides: [], assets: []};
 let current = null;
 let mode = localStorage.getItem("describe.mode") || "form";
