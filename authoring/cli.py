@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterable
@@ -2092,13 +2093,143 @@ def available_renderers() -> list[str]:
     return out
 
 
+# --- B4-render: background.png for freeze-as-background skeletons ---------
+#
+# Renders the non-slottable underlay of overlap-flagged slides
+# (picture + freeforms + decorations) to a flat PNG so compose-v5 can
+# paint it under fresh slot content. Same _RENDERERS chain as preview
+# — PowerPoint COM first on Windows, then LibreOffice, then macOS
+# Quick Look. Fail-soft: every error is caught and logged; on total
+# failure the skeleton stays in freeze_pending state without a
+# background and compose-v5 emits the existing background_pending
+# warning so the user can paint manually.
+
+
+def _render_background_png(
+    skeleton_id: str,
+    skeleton_dir: Path,
+    slide_pptx: Path,
+    slot_shape_ids: set[int],
+) -> tuple[bool, str]:
+    """Strip every slot-bound shape from a single-slide pptx, render
+    the remainder, save the PNG into skeleton_dir/background.png.
+
+    Returns ``(ok, message)``. On any failure, message describes the
+    cause for the preview command to surface; the skeleton is
+    untouched. Caller should only flip ``background_image: background.png``
+    in the skeleton YAML when ok=True.
+    """
+    if not slide_pptx.exists():
+        return False, f"source slide pptx missing: {slide_pptx}"
+    if not skeleton_dir.exists():
+        return False, f"skeleton dir missing: {skeleton_dir}"
+
+    out_png = skeleton_dir / "background.png"
+    # Always render fresh — a stale background from a previous ingest
+    # would silently win the mtime cache.
+    try:
+        out_png.unlink()
+    except FileNotFoundError:
+        pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stripped = Path(tmp) / f"{skeleton_id}_bg.pptx"
+        try:
+            prs = Presentation(str(slide_pptx))
+            if len(prs.slides) == 0:
+                return False, "source pptx has no slides"
+            slide = prs.slides[0]
+            for shape in list(slide.shapes):
+                sid = getattr(shape, "shape_id", None)
+                if sid is not None and sid in slot_shape_ids:
+                    shape._element.getparent().remove(shape._element)
+            prs.save(str(stripped))
+        except Exception as e:
+            return False, f"failed to strip slot shapes: {type(e).__name__}: {e}"
+
+        produced_name = None
+        for name, fn in _RENDERERS:
+            try:
+                if fn(stripped, out_png, 1920):
+                    produced_name = name
+                    break
+            except Exception:
+                continue
+
+    if produced_name is None or not out_png.exists():
+        # Clean up any partial output from a failed renderer.
+        try:
+            out_png.unlink()
+        except (OSError, FileNotFoundError):
+            pass
+        return False, ("no renderer could produce a PNG — install "
+                       "PowerPoint (Windows) or LibreOffice, "
+                       "or set the background manually after compose")
+    return True, f"rendered via {produced_name}"
+
+
+def _render_pending_backgrounds() -> tuple[int, int]:
+    """Walk skeletons with overlap_decision='freeze_pending' and try to
+    paint background.png for each. Idempotent — re-running re-renders
+    every flagged skeleton (cheap, and lets the user fix a missing
+    renderer mid-flight). Returns (built, failed) counts.
+    """
+    skeletons_root = WORKSPACE / "skeletons"
+    if not skeletons_root.exists():
+        return 0, 0
+    built = 0
+    failed = 0
+    for sk_dir in sorted(skeletons_root.iterdir()):
+        if not sk_dir.is_dir():
+            continue
+        sk_path = sk_dir / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        try:
+            sk = read_yaml(sk_path)
+        except Exception:
+            continue
+        if sk.get("overlap_decision") != "freeze_pending":
+            continue
+        deck = sk.get("source_deck")
+        idx = sk.get("source_slide_index")
+        if not deck or not idx:
+            continue
+        slide_pptx = WORKSPACE / "decks" / deck / "slides" / f"slide_{idx:02d}.pptx"
+        slot_shape_ids = {s.get("shape_id") for s in (sk.get("slots") or [])
+                          if s.get("shape_id") is not None}
+        ok, msg = _render_background_png(sk["id"], sk_dir, slide_pptx, slot_shape_ids)
+        if ok:
+            sk["background_image"] = "background.png"
+            try:
+                write_yaml(sk_path, sk)
+                built += 1
+            except Exception as e:
+                failed += 1
+                click.echo(
+                    f"preview: rendered background for {sk['id']!r} but "
+                    f"failed to update skeleton.yaml: {e}",
+                    err=True,
+                )
+        else:
+            failed += 1
+            click.echo(
+                f"preview: background for {sk['id']!r} not rendered: {msg}",
+                err=True,
+            )
+    return built, failed
+
+
 # --- preview ---------------------------------------------------------------
 
 
 @cli.command()
 def preview() -> None:
     """Best-effort PNG thumbnails of slide fragments. Tries PowerPoint
-    (Windows), LibreOffice, then macOS Quick Look in order."""
+    (Windows), LibreOffice, then macOS Quick Look in order. Also
+    paints background.png for any skeleton in overlap_decision=
+    freeze_pending state — fails silently per skeleton if no renderer
+    can handle it."""
     if not available_renderers():
         click.echo(
             "preview: no slide renderer available — install LibreOffice, "
@@ -2138,6 +2269,11 @@ def preview() -> None:
                 n_mirrored += 1
     if n_mirrored:
         click.echo(f"preview: mirrored {n_mirrored} preview(s) into v5 skeleton dirs")
+
+    bg_built, bg_failed = _render_pending_backgrounds()
+    if bg_built or bg_failed:
+        click.echo(f"preview: built {bg_built} freeze-as-background "
+                   f"underlay(s); {bg_failed} failed")
 
 
 # --- build -----------------------------------------------------------------

@@ -2293,14 +2293,35 @@ def cmd_v5_compose(args: argparse.Namespace) -> None:
             slots_by_id = {s["id"]: s for s in (sk.get("slots") or [])}
             filled = entry.get("slots") or {}
 
-            # Apply background_image if the skeleton has one (B4-render
-            # territory — for now we just warn it's set but unrendered).
-            if sk.get("background_image"):
-                warnings.append({
-                    "slide_index": i, "slot_id": "_background",
-                    "violation": "background_pending",
-                    "message": "background_image set but B4-render not implemented",
-                })
+            # Apply background_image (B4-render) if the skeleton has
+            # one. Paint full-bleed FIRST so subsequent slot shapes
+            # stack on top via python-pptx's natural z-order. Fail-soft:
+            # missing file or any add_picture error → warn and proceed
+            # without the underlay (deck still renders, just without
+            # the structural illustration baked in).
+            bg_rel = sk.get("background_image")
+            if bg_rel:
+                bg_path = _v5_skeletons_dir() / sk_id / bg_rel
+                if not bg_path.exists():
+                    warnings.append({
+                        "slide_index": i, "slot_id": "_background",
+                        "violation": "background_missing",
+                        "message": f"background_image set to {bg_rel!r} "
+                                   f"but file not in bundle; slide built without underlay",
+                    })
+                else:
+                    try:
+                        slide.shapes.add_picture(
+                            str(bg_path), 0, 0,
+                            width=slide_w, height=slide_h,
+                        )
+                    except Exception as e:
+                        warnings.append({
+                            "slide_index": i, "slot_id": "_background",
+                            "violation": "background_place_failed",
+                            "message": f"{type(e).__name__}: {e}; "
+                                       f"slide built without underlay",
+                        })
 
             for slot_id, value in filled.items():
                 slot = slots_by_id.get(slot_id)

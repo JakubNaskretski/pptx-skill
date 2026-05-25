@@ -915,5 +915,191 @@ class TestChartPlacement(unittest.TestCase):
         )
 
 
+class TestBackgroundImageCompose(unittest.TestCase):
+    """compose-v5 paints background.png when the skeleton specifies one.
+    Tests cover happy path (background placed as first shape), missing-
+    file fail-soft (warns and proceeds), and the no-background path
+    (the absence of warnings).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        themes = self.root / "themes" / "synth"
+        themes.mkdir(parents=True)
+        synth_prs = make_title_body_deck(1)
+        synth_prs.save(str(themes / "master.pptx"))
+        (themes / "theme.yaml").write_text(
+            "id: synth\n"
+            "palette: {primary: '#FF0000'}\n"
+            "fonts: {major: Calibri, minor: Calibri}\n"
+            "master_pptx: master.pptx\n",
+        )
+        self.sk_dir = self.root / "skeletons" / "sk_bg"
+        self.sk_dir.mkdir(parents=True)
+        self._patcher = mock.patch.object(reader_mod, "_v5_bundle_root",
+                                          return_value=self.root)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmpdir.cleanup()
+
+    def _write_skeleton(self, *, background_image: str | None):
+        bg_line = f"background_image: {background_image}\n" if background_image else ""
+        (self.sk_dir / "skeleton.yaml").write_text(
+            "id: sk_bg\n"
+            "source_deck: synth\n"
+            "source_slide_index: 1\n"
+            "status: pending\n"
+            "categories: [content]\n"
+            f"{bg_line}"
+            "slots:\n"
+            "  - id: title\n"
+            "    kind: heading\n"
+            "    geometry: {x: 0.1, y: 0.1, w: 0.8, h: 0.2}\n"
+            "    constraints: {max_chars: 50, required: false}\n",
+        )
+
+    def test_background_is_placed_when_present(self):
+        # Drop a 1x1 PNG into the skeleton dir as background.png
+        (self.sk_dir / "background.png").write_bytes(_TINY_PNG)
+        self._write_skeleton(background_image="background.png")
+
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        # No background-related warnings on the happy path
+        for w in result.get("warnings") or []:
+            self.assertNotIn(w.get("violation"),
+                             {"background_missing", "background_place_failed",
+                              "background_pending"})
+        prs = Presentation(str(out_pptx))
+        shapes = list(prs.slides[0].shapes)
+        # First shape should be the background picture (full-bleed)
+        from pptx.enum.shapes import MSO_SHAPE_TYPE as _MST
+        self.assertEqual(shapes[0].shape_type, _MST.PICTURE,
+                         "background picture must be the first shape")
+
+    def test_missing_background_file_warns_but_compose_still_runs(self):
+        # Skeleton claims a background but the file isn't there.
+        self._write_skeleton(background_image="background.png")
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        violations = [w.get("violation") for w in result.get("warnings") or []]
+        self.assertIn("background_missing", violations)
+
+    def test_no_background_no_warnings(self):
+        self._write_skeleton(background_image=None)
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings") or []]
+        self.assertNotIn("background_missing", violations)
+        self.assertNotIn("background_pending", violations)
+
+
+class TestRenderBackgroundHelper(unittest.TestCase):
+    """_render_background_png strips slot shapes and routes through the
+    _RENDERERS chain. We can't run a real renderer in CI, so the tests
+    mock the chain to verify (a) the right shapes are stripped before
+    rendering and (b) total-failure path returns ok=False without
+    crashing.
+    """
+
+    def test_no_renderer_returns_failure_message(self):
+        # Mocking _RENDERERS to empty tuple makes the function take
+        # the no-renderer-found path.
+        import importlib, sys as _sys
+        if "cli" in _sys.modules:
+            cli_mod = _sys.modules["cli"]
+        else:
+            import cli as cli_mod  # noqa: F401
+            cli_mod = _sys.modules["cli"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sk_dir = root / "sk"
+            sk_dir.mkdir()
+            # Need a real single-slide pptx to strip from
+            prs = make_title_body_deck(1)
+            slide_pptx = root / "slide_01.pptx"
+            prs.save(str(slide_pptx))
+
+            with mock.patch.object(cli_mod, "_RENDERERS", ()):
+                ok, msg = cli_mod._render_background_png(
+                    "sk", sk_dir, slide_pptx, set(),
+                )
+            self.assertFalse(ok)
+            self.assertIn("no renderer", msg.lower())
+
+    def test_strips_slot_shapes_before_render(self):
+        """Verify the temp stripped pptx has the slot shape removed
+        before being handed to a renderer."""
+        import sys as _sys
+        if "cli" not in _sys.modules:
+            import cli as cli_mod  # noqa: F401
+        cli_mod = _sys.modules["cli"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sk_dir = root / "sk"
+            sk_dir.mkdir()
+            prs = make_title_body_deck(1)
+            slide_pptx = root / "slide_01.pptx"
+            prs.save(str(slide_pptx))
+
+            # Pick a shape id to strip
+            src_prs = Presentation(str(slide_pptx))
+            shape_to_strip_id = next(iter(src_prs.slides[0].shapes)).shape_id
+            shape_count_before = len(list(src_prs.slides[0].shapes))
+
+            recorded = {}
+
+            def fake_renderer(stripped_path, out_png, size):
+                # Open the stripped pptx and check the shape is gone
+                p = Presentation(str(stripped_path))
+                shape_ids = [s.shape_id for s in p.slides[0].shapes]
+                recorded["shape_ids"] = shape_ids
+                recorded["count"] = len(shape_ids)
+                # Pretend success — write a tiny PNG
+                out_png.write_bytes(_TINY_PNG)
+                return True
+
+            with mock.patch.object(cli_mod, "_RENDERERS",
+                                   (("fake", fake_renderer),)):
+                ok, _ = cli_mod._render_background_png(
+                    "sk", sk_dir, slide_pptx, {shape_to_strip_id},
+                )
+            self.assertTrue(ok)
+            self.assertNotIn(shape_to_strip_id, recorded["shape_ids"])
+            self.assertEqual(recorded["count"], shape_count_before - 1)
+            self.assertTrue((sk_dir / "background.png").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
