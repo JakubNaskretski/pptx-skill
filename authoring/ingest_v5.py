@@ -474,6 +474,8 @@ def _slot_text_or_bullets(
             "required": required,
         }
         kind = "bullets"
+        items = [(p.text or "").strip() for p in non_empty[:3]]
+        excerpt = _truncate(" / ".join(f"• {it}" for it in items), 80)
     else:
         constraints = {
             "max_chars": max(20, int(len(text) * 1.5)) if text else 60,
@@ -481,6 +483,7 @@ def _slot_text_or_bullets(
             "required": required,
         }
         kind = "heading" if is_heading else "paragraph"
+        excerpt = _truncate(text.strip(), 80) if text else ""
 
     return {
         "id": slot_id,
@@ -488,6 +491,7 @@ def _slot_text_or_bullets(
         "geometry": geometry,
         "style": style,
         "constraints": constraints,
+        "source_excerpt": excerpt,
     }
 
 
@@ -507,6 +511,10 @@ def _slot_footer(
         text = (shape.text_frame.text or "")
     except (AttributeError, ValueError):
         pass
+    excerpt = (
+        "auto page number" if ph_type == PP_PLACEHOLDER.SLIDE_NUMBER
+        else _truncate(text.strip(), 80) if text else ""
+    )
     return {
         "id": slot_id,
         "kind": "footer",
@@ -518,21 +526,24 @@ def _slot_footer(
             "required": False,
             "auto_from_host": (ph_type == PP_PLACEHOLDER.SLIDE_NUMBER),
         },
+        "source_excerpt": excerpt,
     }
 
 
 def _slot_image(
     shape, slide_w: int, slide_h: int, used_ids: set[str], slot_id_base: str = "hero",
 ) -> dict:
+    aspect = _aspect_ratio(shape.width or 0, shape.height or 0)
     return {
         "id": _unique(slot_id_base, used_ids),
         "kind": "image",
         "geometry": _fractional_geometry(shape, slide_w, slide_h),
         "constraints": {
-            "aspect": _aspect_ratio(shape.width or 0, shape.height or 0),
+            "aspect": aspect,
             "required": _is_required(shape, slide_w, slide_h, True),
             "auto_fit": "cover",
         },
+        "source_excerpt": f"image ({aspect})",
     }
 
 
@@ -545,6 +556,9 @@ def _slot_table(shape, slide_w: int, slide_h: int, used_ids: set[str]) -> dict:
         has_header = bool(getattr(shape.table, "first_row", False))
     except (AttributeError, ValueError):
         pass
+    excerpt = f"{max(1, rows)}×{max(1, cols)} table"
+    if has_header:
+        excerpt += " (header row)"
     return {
         "id": _unique("data_table", used_ids),
         "kind": "table",
@@ -555,6 +569,7 @@ def _slot_table(shape, slide_w: int, slide_h: int, used_ids: set[str]) -> dict:
             "has_header": has_header,
             "required": _is_required(shape, slide_w, slide_h, True),
         },
+        "source_excerpt": excerpt,
     }
 
 
@@ -581,7 +596,17 @@ def _slot_chart(shape, slide_w: int, slide_h: int, used_ids: set[str]) -> dict:
             "max_categories": max(1, n_categories),
             "required": _is_required(shape, slide_w, slide_h, True),
         },
+        "source_excerpt": f"{chart_type} chart, {max(1, n_series)} series × {max(1, n_categories)} cats",
     }
+
+
+def _truncate(s: str, n: int) -> str:
+    if not s:
+        return ""
+    s = " ".join(s.split())  # collapse newlines/extra spaces for excerpt display
+    if len(s) <= n:
+        return s
+    return s[: n - 1].rstrip() + "…"
 
 
 # ---------------------------------------------------------------------------
