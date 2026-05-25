@@ -378,18 +378,32 @@ def digest_skeleton(
     theme_fonts = theme_v4.get("fonts") or {}
     palette_v4 = theme_v4.get("palette") or {}
 
-    slots = _extract_slots(
+    fresh_slots = _extract_slots(
         slide, slide_w, slide_h, palette_v4, palette_v5, theme_fonts,
         repeated_picture_info=repeated_picture_info or {},
     )
+
+    existing = _read_existing_skeleton(skeleton_dir / "skeleton.yaml")
+    # C-actions: if a slot the user promoted exists in skeleton.yaml
+    # but isn't in fresh_slots (heuristic doesn't claim it), AND its
+    # shape_id still exists in the source slide, preserve it verbatim.
+    slots = _merge_user_promoted_slots(fresh_slots, existing, slide)
+    consumed_shape_ids = {s["shape_id"] for s in slots if "shape_id" in s}
+
+    # Capture everything else as unmapped_shapes so the user can
+    # promote anything our heuristic missed via the /v5 UI.
+    unmapped_shapes = _extract_unmapped_shapes(
+        slide, slide_w, slide_h, consumed_shape_ids, repeated_picture_info or {},
+    )
+
     overlap_info = _detect_overlap_candidates(slide, slide_w, slide_h, slots)
 
     # Preserve existing descriptive fields on re-ingest so user
     # categorisation isn't blown away. Status is preserved too — if
     # the user has already rejected, re-ingest doesn't auto-recategorise.
-    existing = _read_existing_skeleton(skeleton_dir / "skeleton.yaml")
     preserved_status = existing.get("status") if existing else None
     preserved_categories = existing.get("categories") if existing else None
+    preserved_overlap_decision = existing.get("overlap_decision") if existing else None
 
     # B5: propose categories from slot inventory only if user hasn't
     # set their own. User-set categories survive re-ingest verbatim.
@@ -408,7 +422,10 @@ def digest_skeleton(
         "preview": "preview.png",
         "background_image": None,
         "slots": slots,
+        "unmapped_shapes": unmapped_shapes,
     }
+    if preserved_overlap_decision:
+        out["overlap_decision"] = preserved_overlap_decision
     if overlap_info:
         out["digest_warnings"] = overlap_info["warnings"]
         out["overlap_candidates"] = overlap_info["candidates"]
@@ -418,6 +435,33 @@ def digest_skeleton(
         shutil.copyfile(v4_preview_path, skeleton_dir / "preview.png")
 
     return out
+
+
+def _merge_user_promoted_slots(fresh_slots: list[dict], existing: dict | None, slide) -> list[dict]:
+    """Re-ingest preservation for user-promoted slots.
+
+    When the C-actions UI promotes an unmapped_shape to a slot, that
+    slot lands in skeleton.yaml with a shape_id matching the source
+    shape. On re-ingest the heuristic won't re-claim that shape (else
+    it wouldn't have been unmapped originally). Without preservation
+    the user's promotion would silently disappear.
+
+    Rule: an existing slot is preserved iff its shape_id is still
+    present in the source slide AND not already in fresh_slots
+    (the heuristic would have claimed it if it could).
+    """
+    if not existing:
+        return list(fresh_slots)
+    existing_slots = existing.get("slots") or []
+    fresh_shape_ids = {s["shape_id"] for s in fresh_slots if "shape_id" in s}
+    source_shape_ids = {sh.shape_id for sh in slide.shapes}
+    promoted = [
+        s for s in existing_slots
+        if s.get("shape_id") is not None
+        and s["shape_id"] in source_shape_ids
+        and s["shape_id"] not in fresh_shape_ids
+    ]
+    return list(fresh_slots) + promoted
 
 
 def _read_existing_skeleton(path: Path) -> dict | None:
@@ -450,6 +494,7 @@ def _extract_slots(
             shape, slide_w, slide_h, palette_v4, palette_v5, theme_fonts, used_ids,
         )
         if slot is not None:
+            slot["shape_id"] = shape.shape_id
             slots.append(slot)
             consumed_shape_ids.add(shape.shape_id)
 
@@ -465,9 +510,124 @@ def _extract_slots(
             repeated_picture_info=repeated_picture_info,
         )
         if slot is not None:
+            slot["shape_id"] = shape.shape_id
             slots.append(slot)
 
     return slots
+
+
+# ---------------------------------------------------------------------------
+# C-actions: unmapped-shapes capture
+# ---------------------------------------------------------------------------
+
+
+def _extract_unmapped_shapes(
+    slide, slide_w: int, slide_h: int,
+    consumed_shape_ids: set[int],
+    repeated_picture_info: dict[str, float],
+) -> list[dict]:
+    """Walk every shape on the slide; emit an entry for each one the
+    heuristic skipped (i.e. shape_id NOT in consumed_shape_ids). Lets
+    the C-actions UI surface what was filtered so the user can promote
+    real content the heuristic missed.
+
+    Each entry carries shape_id (for re-ingest matching and the
+    promote-shape endpoint), kind_hint (what the source shape is),
+    fractional geometry, source_excerpt (first 80 chars of text if
+    any), and skipped_reason (human-readable explanation).
+    """
+    out: list[dict] = []
+    for shape in slide.shapes:
+        if shape.shape_id in consumed_shape_ids:
+            continue
+        entry: dict = {
+            "shape_id": shape.shape_id,
+            "kind_hint": _shape_kind_hint(shape),
+            "geometry": _fractional_geometry(shape, slide_w, slide_h),
+            "skipped_reason": _infer_skipped_reason(shape, slide_w, slide_h, repeated_picture_info),
+        }
+        excerpt = _shape_text_excerpt(shape)
+        if excerpt:
+            entry["source_excerpt"] = excerpt
+        out.append(entry)
+    return out
+
+
+def _shape_kind_hint(shape) -> str:
+    """Human-friendly tag for shape.shape_type — used in the UI to
+    say 'this is what was here'.
+    """
+    try:
+        st = shape.shape_type
+    except (AttributeError, ValueError):
+        return "unknown"
+    mapping = {
+        MSO_SHAPE_TYPE.AUTO_SHAPE: "auto_shape",
+        MSO_SHAPE_TYPE.PICTURE: "picture",
+        MSO_SHAPE_TYPE.TEXT_BOX: "text_box",
+        MSO_SHAPE_TYPE.FREEFORM: "freeform",
+        MSO_SHAPE_TYPE.GROUP: "group",
+        MSO_SHAPE_TYPE.LINE: "line",
+        MSO_SHAPE_TYPE.CHART: "chart",
+        MSO_SHAPE_TYPE.TABLE: "table",
+        MSO_SHAPE_TYPE.PLACEHOLDER: "placeholder",
+    }
+    return mapping.get(st, "other")
+
+
+def _shape_text_excerpt(shape) -> str:
+    try:
+        if not getattr(shape, "has_text_frame", False):
+            return ""
+        text = (shape.text_frame.text or "").strip()
+        return _truncate(text, 80) if text else ""
+    except (AttributeError, ValueError):
+        return ""
+
+
+def _infer_skipped_reason(shape, slide_w: int, slide_h: int,
+                          repeated_picture_info: dict[str, float]) -> str:
+    """Best-effort retroactive explanation for why a shape was skipped.
+    Mirrors the filters in _slot_from_placeholder + _slot_from_free_shape.
+    """
+    if getattr(shape, "is_placeholder", False):
+        try:
+            ph_type = shape.placeholder_format.type
+        except (AttributeError, ValueError):
+            ph_type = None
+        if ph_type is not None and ph_type not in _PLACEHOLDER_TEXTUAL \
+                and ph_type not in _PLACEHOLDER_FOOTER \
+                and ph_type != PP_PLACEHOLDER.PICTURE:
+            return f"placeholder kind {_safe_enum_short_name(ph_type)} not yet supported"
+
+    if _shape_is_picture(shape):
+        area = _area_fraction(shape, slide_w, slide_h)
+        if area < 0.005:
+            return "sub-pixel area"
+        if repeated_picture_info:
+            sha = _picture_sha(shape)
+            if sha and sha in repeated_picture_info:
+                median = repeated_picture_info[sha]
+                if median > 0 and area / median < _FEATURED_SIZE_MULTIPLIER:
+                    return f"repeated brand mark ({len(repeated_picture_info)} decks-wide pictures detected)"
+        return "decoration"
+
+    try:
+        st = shape.shape_type
+    except (AttributeError, ValueError):
+        return "unknown shape type"
+
+    if st in (MSO_SHAPE_TYPE.AUTO_SHAPE, MSO_SHAPE_TYPE.FREEFORM):
+        if _shape_has_meaningful_text(shape):
+            return "auto-shape with text (would be captured if free text box)"
+        return "conscious-drop: freeform / auto-shape"
+    if st == MSO_SHAPE_TYPE.GROUP:
+        return "conscious-drop: group"
+    if st == MSO_SHAPE_TYPE.LINE:
+        return "conscious-drop: line / connector"
+    if st == MSO_SHAPE_TYPE.TEXT_BOX and not _shape_has_meaningful_text(shape):
+        return "empty text box"
+    return "skipped (no matching slot rule)"
 
 
 def _slot_from_placeholder(

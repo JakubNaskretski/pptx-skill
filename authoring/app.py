@@ -3902,6 +3902,139 @@ def v5_page():
     return render_template_string(V5_HTML)
 
 
+# --- C-actions: write-back endpoints ------------------------------------
+
+
+_V5_VALID_STATUSES = {"pending", "done", "rejected"}
+_V5_VALID_OVERLAP_DECISIONS = {"image_slot", "reject", "freeze_pending"}
+_V5_VALID_KINDS = {"heading", "paragraph", "bullets", "image", "table", "chart", "footer"}
+
+
+def _v5_load_skeleton(skeleton_id: str) -> tuple[Path | None, dict | None, str | None]:
+    """Resolve <id> safely and load skeleton.yaml. Returns (yaml_path,
+    data, error_message). On any failure path returns (None, None, msg)
+    suitable for the caller to JSON-error.
+    """
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None:
+        return None, None, "invalid skeleton id"
+    p = safe / "skeleton.yaml"
+    if not p.exists():
+        return None, None, "skeleton not found"
+    try:
+        return p, yaml.safe_load(p.read_text(encoding="utf-8")) or {}, None
+    except Exception as e:
+        return None, None, f"failed to read skeleton.yaml: {e}"
+
+
+def _v5_save_skeleton(p: Path, data: dict) -> None:
+    p.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=100),
+        encoding="utf-8",
+    )
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/status")
+def api_v5_set_status(skeleton_id):
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_status = payload.get("status")
+    if new_status not in _V5_VALID_STATUSES:
+        return jsonify({"error": f"status must be one of {sorted(_V5_VALID_STATUSES)}"}), 400
+    data["status"] = new_status
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "status": new_status})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/overlap-decision")
+def api_v5_set_overlap_decision(skeleton_id):
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    if decision not in _V5_VALID_OVERLAP_DECISIONS:
+        return jsonify({"error": f"decision must be one of {sorted(_V5_VALID_OVERLAP_DECISIONS)}"}), 400
+    data["overlap_decision"] = decision
+    # "reject" decision also flips the skeleton status — it's the
+    # explicit "this slide is unusable" outcome of overlap review.
+    if decision == "reject":
+        data["status"] = "rejected"
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "overlap_decision": decision, "status": data["status"]})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/promote-shape")
+def api_v5_promote_shape(skeleton_id):
+    """Move an unmapped_shapes entry into slots with the chosen kind.
+
+    Constraint defaults match what the slot builders in ingest_v5 would
+    have produced for that kind — agent doesn't see this slot as
+    'different' from heuristic-derived ones, just stamped with a
+    user-chosen kind. shape_id is preserved so re-ingest doesn't undo
+    the promotion.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    idx = payload.get("shape_index")
+    kind = payload.get("kind")
+    if kind not in _V5_VALID_KINDS:
+        return jsonify({"error": f"kind must be one of {sorted(_V5_VALID_KINDS)}"}), 400
+    unmapped = data.get("unmapped_shapes") or []
+    if not isinstance(idx, int) or idx < 0 or idx >= len(unmapped):
+        return jsonify({"error": "shape_index out of range"}), 400
+    entry = unmapped.pop(idx)
+    used_ids = {s.get("id") for s in (data.get("slots") or []) if s.get("id")}
+    new_slot = _v5_default_slot_for_kind(kind, entry, used_ids)
+    slots = data.get("slots") or []
+    slots.append(new_slot)
+    data["slots"] = slots
+    data["unmapped_shapes"] = unmapped
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "slot": new_slot})
+
+
+def _v5_default_slot_for_kind(kind: str, unmapped_entry: dict, used_ids: set) -> dict:
+    """Reasonable default constraints per kind — matches the shape the
+    heuristic in ingest_v5 produces, so the agent sees no difference
+    between heuristic-derived and user-promoted slots.
+    """
+    base_id_for_kind = {
+        "heading": "heading", "paragraph": "body", "bullets": "body",
+        "image": "hero", "table": "data_table", "chart": "data_chart",
+        "footer": "footer",
+    }
+    base = base_id_for_kind.get(kind, "field")
+    slot_id = base if base not in used_ids else next(
+        f"{base}_{i}" for i in range(2, 99) if f"{base}_{i}" not in used_ids
+    )
+    constraints_for_kind = {
+        "heading": {"max_chars": 60, "max_lines": 1, "required": True},
+        "paragraph": {"max_chars": 200, "max_lines": 4, "required": False},
+        "bullets": {"max_items": 5, "max_chars_per_item": 80, "required": False},
+        "image": {"aspect": "free", "required": True, "auto_fit": "cover"},
+        "table": {"max_rows": 8, "max_cols": 4, "has_header": True, "required": True},
+        "chart": {"chart_type": "unknown", "max_series": 4, "max_categories": 12, "required": True},
+        "footer": {"max_chars": 40, "max_lines": 1, "required": False},
+    }
+    excerpt = unmapped_entry.get("source_excerpt", "")
+    out: dict = {
+        "id": slot_id,
+        "kind": kind,
+        "geometry": unmapped_entry.get("geometry", {}),
+        "constraints": constraints_for_kind.get(kind, {"required": False}),
+        "shape_id": unmapped_entry.get("shape_id"),
+        "user_promoted": True,
+    }
+    if excerpt:
+        out["source_excerpt"] = excerpt
+    return out
+
+
 V5_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -3959,6 +4092,8 @@ V5_HTML = r"""<!doctype html>
     .slot-overlay.chart     { border-color: #8e24aa; }
     .slot-overlay.image     { border-color: #00acc1; }
     .slot-overlay.footer    { border-color: #757575; }
+    .slot-overlay.unmapped  { border-color: #999; border-style: dashed; opacity: 0.7; }
+    .slot-overlay.unmapped .slot-label { background: rgba(80,80,80,0.85); }
 
     .preview-empty { color: #999; font-size: 13px; text-align: center; padding: 40px;
                      line-height: 1.5; }
@@ -4000,6 +4135,49 @@ V5_HTML = r"""<!doctype html>
                    font-family: ui-monospace, monospace; }
     .constraints .req { color: #d32f2f; font-weight: 600; }
     .constraints .sep { color: #bbb; margin: 0 4px; }
+
+    .actions-row { display: flex; gap: 6px; margin: 8px 0 14px; flex-wrap: wrap; }
+    .action-btn { padding: 4px 10px; border: 1px solid #ccc; background: white;
+                  font-size: 11px; cursor: pointer; border-radius: 3px;
+                  font-family: inherit; }
+    .action-btn:hover { background: #f0f4ff; border-color: #0066cc; color: #0066cc; }
+    .action-btn.danger:hover { background: #ffeaea; border-color: #d32f2f; color: #d32f2f; }
+    .action-btn.primary { background: #1e88e5; color: white; border-color: #1565c0; }
+    .action-btn.primary:hover { background: #1565c0; color: white; }
+    .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .action-btn:disabled:hover { background: white; border-color: #ccc; color: #888; }
+
+    .overlap-banner { background: #fff4e0; border: 1px solid #ffcc80; color: #8c5400;
+                      padding: 10px 12px; border-radius: 4px; font-size: 12px;
+                      margin-bottom: 14px; line-height: 1.4; }
+    .overlap-banner .head { font-weight: 600; margin-bottom: 6px; }
+    .overlap-banner .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+
+    .unmapped-section { margin-top: 18px; padding-top: 14px;
+                        border-top: 1px solid #e0e0e0; }
+    .unmapped-section h3 { font-size: 11px; text-transform: uppercase;
+                           letter-spacing: 0.5px; color: #555; margin: 0 0 8px;
+                           display: flex; justify-content: space-between;
+                           align-items: center; cursor: pointer; user-select: none; }
+    .unmapped-section h3 .toggle { color: #999; font-weight: normal; font-size: 12px; }
+    .unmapped-card { border: 1px dashed #bbb; border-radius: 4px; padding: 8px 12px;
+                     margin-bottom: 8px; background: #f9f9f9; }
+    .unmapped-card.active { background: #f0f4ff; border-color: #0066cc; }
+    .unmapped-card .hint-head { display: flex; justify-content: space-between;
+                                align-items: center; margin-bottom: 4px; gap: 6px; }
+    .unmapped-card .kind-hint { font-family: ui-monospace, monospace; font-size: 11px;
+                                color: #555; background: #e8e8e8; padding: 1px 5px;
+                                border-radius: 2px; }
+    .unmapped-card .reason { font-size: 10px; color: #888; font-style: italic; }
+    .unmapped-card .excerpt { font-size: 12px; color: #444; margin: 4px 0;
+                              word-break: break-word; }
+    .unmapped-card .promote-row { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 4px;
+                                  align-items: center; }
+    .unmapped-card .promote-label { font-size: 10px; color: #666; margin-right: 4px; }
+    .promote-btn { padding: 2px 7px; border: 1px solid #aaa; background: white;
+                   font-size: 10px; cursor: pointer; border-radius: 3px;
+                   font-family: ui-monospace, monospace; color: #333; }
+    .promote-btn:hover { background: #1e88e5; color: white; border-color: #1565c0; }
   </style>
 </head>
 <body>
@@ -4104,6 +4282,20 @@ V5_HTML = r"""<!doctype html>
           d.onmouseleave = () => highlightSlot(slot.id, false);
           wrap.appendChild(d);
         });
+        (sk.unmapped_shapes || []).forEach((entry, idx) => {
+          const g = entry.geometry || {};
+          const d = document.createElement('div');
+          d.className = 'slot-overlay unmapped';
+          d.style.left = `${(g.x || 0) * 100}%`;
+          d.style.top = `${(g.y || 0) * 100}%`;
+          d.style.width = `${(g.w || 0) * 100}%`;
+          d.style.height = `${(g.h || 0) * 100}%`;
+          d.dataset.unmappedIndex = idx;
+          d.innerHTML = `<span class="slot-label">unmapped · ${entry.kind_hint}</span>`;
+          d.onmouseenter = () => highlightUnmapped(idx, true);
+          d.onmouseleave = () => highlightUnmapped(idx, false);
+          wrap.appendChild(d);
+        });
       };
       wrap.appendChild(img);
       area.appendChild(wrap);
@@ -4112,10 +4304,44 @@ V5_HTML = r"""<!doctype html>
     function renderPanel(sk) {
       const panel = document.getElementById('panel');
       const cats = (sk.categories || []).map(c => `<span class="cat-tag">${escapeHtml(c)}</span>`).join('');
+
+      // Status action row depends on current status.
+      const status = sk.status || 'pending';
+      let statusActions = '';
+      if (status === 'pending') {
+        statusActions = `
+          <button class="action-btn primary" onclick="setStatus('${sk.id}', 'done')">Mark done</button>
+          <button class="action-btn danger" onclick="setStatus('${sk.id}', 'rejected')">Reject</button>`;
+      } else if (status === 'done') {
+        statusActions = `
+          <button class="action-btn" onclick="setStatus('${sk.id}', 'pending')">Back to pending</button>
+          <button class="action-btn danger" onclick="setStatus('${sk.id}', 'rejected')">Reject</button>`;
+      } else if (status === 'rejected') {
+        statusActions = `
+          <button class="action-btn primary" onclick="setStatus('${sk.id}', 'pending')">Restore</button>`;
+      }
+
+      // Overlap banner — actionable only if no decision recorded yet.
       const warnings = sk.digest_warnings || [];
-      const warnHtml = warnings.length
-        ? `<div class="warning-banner"><strong>⚠ ${warnings.join(', ')}</strong> · picture may be a frozen background underlay; the agent shouldn't swap it. Review the overlay.</div>`
-        : '';
+      const overlapDecided = !!sk.overlap_decision;
+      let warnHtml = '';
+      if (warnings.length && !overlapDecided) {
+        warnHtml = `
+          <div class="overlap-banner">
+            <div class="head">⚠ overlap_detected</div>
+            <div>A picture sits under text on this slide. The agent shouldn't blindly swap it (cross-slide misalignment risk). Choose:</div>
+            <div class="actions">
+              <button class="action-btn" onclick="setOverlapDecision('${sk.id}', 'image_slot')">Keep as image slot</button>
+              <button class="action-btn" disabled title="B4-render not yet implemented">Freeze as background</button>
+              <button class="action-btn danger" onclick="setOverlapDecision('${sk.id}', 'reject')">Reject slide</button>
+            </div>
+          </div>`;
+      } else if (overlapDecided) {
+        warnHtml = `<div class="overlap-banner" style="background:#e8f5e9;border-color:#a5d6a7;color:#1b5e20;">
+          <div class="head">✓ overlap decision: ${escapeHtml(sk.overlap_decision)}</div>
+        </div>`;
+      }
+
       const slotCards = (sk.slots || []).map(slot => {
         const kindBtns = KIND_LIST.map(k =>
           `<span class="kind-btn ${k === slot.kind ? 'active' : ''}">${k}</span>`
@@ -4130,6 +4356,7 @@ V5_HTML = r"""<!doctype html>
         if (c.chart_type) parts.push(`${c.chart_type}, ${c.max_series}s×${c.max_categories}c`);
         if (c.aspect) parts.push(`aspect ${c.aspect}`);
         if (c.required) parts.push('<span class="req">required</span>');
+        if (slot.user_promoted) parts.push('<span style="color:#1565c0;">(user-promoted)</span>');
         return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
           <div class="slot-head">
             <span class="slot-id">${escapeHtml(slot.id)}</span>
@@ -4139,14 +4366,91 @@ V5_HTML = r"""<!doctype html>
           <div class="constraints">${parts.join('<span class="sep">·</span>')}</div>
         </div>`;
       }).join('');
+
+      const unmapped = sk.unmapped_shapes || [];
+      const unmappedHtml = unmapped.length ? `
+        <div class="unmapped-section">
+          <h3>Unmapped shapes <span class="toggle">(${unmapped.length}) — promote any our heuristic missed</span></h3>
+          ${unmapped.map((entry, idx) => {
+            const promoteBtns = KIND_LIST.map(k =>
+              `<button class="promote-btn" onclick="promoteShape('${sk.id}', ${idx}, '${k}')">${k}</button>`
+            ).join('');
+            return `<div class="unmapped-card" data-unmapped-index="${idx}">
+              <div class="hint-head">
+                <span class="kind-hint">${escapeHtml(entry.kind_hint)}</span>
+                <span class="reason">${escapeHtml(entry.skipped_reason || '')}</span>
+              </div>
+              ${entry.source_excerpt
+                ? `<div class="excerpt">${escapeHtml(entry.source_excerpt)}</div>`
+                : '<div class="excerpt" style="color:#999;">(no text)</div>'}
+              <div class="promote-row">
+                <span class="promote-label">promote to →</span>
+                ${promoteBtns}
+              </div>
+            </div>`;
+          }).join('')}
+        </div>` : '';
+
       panel.innerHTML = `
         <h2>${escapeHtml(sk.id)}</h2>
-        <div class="subtitle">${escapeHtml(sk.source_deck)} · slide ${sk.source_slide_index} · ${(sk.slots || []).length} slot${(sk.slots || []).length === 1 ? '' : 's'}</div>
+        <div class="subtitle">
+          ${escapeHtml(sk.source_deck)} · slide ${sk.source_slide_index}
+          · ${(sk.slots || []).length} slot${(sk.slots || []).length === 1 ? '' : 's'}
+          · <span class="pill ${status}">${status}</span>
+        </div>
+        <div class="actions-row">${statusActions}</div>
         <div class="cats-row"><span class="label">categories</span>${cats || '<span style="color:#888;font-size:11px;">none</span>'}</div>
         ${warnHtml}
         <h3 class="slots-header">slots (proposed)</h3>
         ${slotCards}
+        ${unmappedHtml}
       `;
+    }
+
+    async function setStatus(id, status) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/status`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({status})
+      });
+      if (!r.ok) {
+        alert('Status update failed: ' + (await r.text()));
+        return;
+      }
+      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+    }
+
+    async function setOverlapDecision(id, decision) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/overlap-decision`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({decision})
+      });
+      if (!r.ok) { alert('Overlap decision failed: ' + (await r.text())); return; }
+      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+    }
+
+    async function promoteShape(id, shape_index, kind) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/promote-shape`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({shape_index, kind})
+      });
+      if (!r.ok) { alert('Promote failed: ' + (await r.text())); return; }
+      await refreshCurrent(id);
+    }
+
+    async function refreshCurrent(id) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}`);
+      const sk = await r.json();
+      renderPreview(sk);
+      renderPanel(sk);
+    }
+
+    function highlightUnmapped(idx, on) {
+      document.querySelectorAll(`.unmapped-card[data-unmapped-index="${idx}"]`).forEach(c => {
+        c.classList.toggle('active', on);
+      });
     }
 
     function highlightSlot(slotId, on) {
