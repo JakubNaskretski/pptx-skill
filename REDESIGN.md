@@ -1,8 +1,14 @@
 # pptx-skill — v5 redesign: structural skeletons
 
-Branch: `redesign/structural-slides` (off `main`). v5 is a
-directional pivot, not an incremental v4.x release. v3 and v4 stay
-on `main` until v5 is end-to-end working.
+> **Status (merged to main):** phases A → G complete, plus v5.1
+> (slot roles, aspect-aware crop, propagate-promote / demote, kind
+> reclassify). v4 paths untouched and still callable. See
+> "Implementation status" + "Picking up v5 work" at the bottom for a
+> fresh-session orientation.
+
+Branch `redesign/structural-slides` carried the work; merged to
+`main` via no-ff. v3 and v4 paths remain operational alongside —
+v5 is purely additive, no v4 callers were modified.
 
 ---
 
@@ -587,3 +593,174 @@ descriptions are reusable (assets are content-addressable by SHA).
 - All v5 work lands on `redesign/structural-slides`. No premature
   merges to `main`; v5 is a directional pivot and ships as a clean
   cut once phases A-G are end-to-end working.
+
+---
+
+## Implementation status (as of merge to main)
+
+| Phase | Status | Notes |
+|---|---|---|
+| A schemas + doc | ✅ done | This file. |
+| B1 theme extraction | ✅ done | `workspace/themes/<deck>/{theme.yaml, master.pptx}` |
+| B2 slot inventory | ✅ done | + free-text-box capture, source_excerpt, shape_id |
+| B3 decoration classifier | ✅ done | Geometric heuristics on master shapes |
+| B4-detect overlap | ✅ done | Flags only; rendering deferred (see below) |
+| B5 auto-classifier | ✅ done | 8-category enum, English + Polish closing patterns |
+| C1 read-only /v5 view | ✅ done | Three-pane Flask UI with CSS slot overlays |
+| C-actions write-back | ✅ done | status / overlap_decision / promote / demote / reclassify-kind / role-edit |
+| D reader methods | ✅ done | list / get / match-skeletons / validate-plan / check-asset-fit / measure-text |
+| E compose engine | ✅ done | Build slides from primitives on host master; aspect-aware crop (cover / contain / stretch) |
+| F build cutover | ✅ done | `cli.py build-v5` → `dist/skill-v5.zip` + SKILL_v5.md; v4 `build` untouched |
+| G tests | ✅ done | 26 v5 tests; 73 total with v4 |
+| **v5.1** slot roles | ✅ done | Auto-derived `role` on slots; match-skeletons prefers role over first-of-kind |
+| **v5.1** brand-mark UX | ✅ done | Confirm-dialog on promoting repeated brand marks; propagate flag on promote + demote |
+
+### Deferred (intentional — not blocking the cutover)
+
+1. **B4-render** — actually paint `background.png` for freeze-as-
+   background skeletons. Schema stores `overlap_decision:
+   freeze_pending`, UI shows it; compose-v5 warns "background pending"
+   for any skeleton with `background_image` set. Needs headless render
+   of the non-slottable underlay via LibreOffice.
+
+2. **Chart placement in compose-v5** — same blocker as v4.1 item 1:
+   chart `<p:graphicFrame>` references parts that live outside the
+   slide XML (chart1.xml + embedded spreadsheet). Currently leaves
+   chart slots empty + emits a warning. Needs related-parts copy +
+   rId rewrite.
+
+3. **Master-only extraction** — `themes/<id>/master.pptx` is currently
+   a full copy of the source deck. compose-v5 strips slides at build
+   time so the output is correct, but the bundle ships heavier than
+   needed (~250 KB-1 MB per theme).
+
+4. **UI unification** — `/` (v4 describe, asset-only after the slide-
+   tab hide) and `/v5` (skeleton review) are separate pages with
+   bidirectional nav. Some users may want one tabbed app.
+
+5. **Free-text role heuristic** — small + bottom = footnote; short =
+   caption; else body. Conservative — frequently falls through to
+   None on real decks. Could be tightened with more signal.
+
+---
+
+## Picking up v5 work — quickstart for future sessions
+
+If you're a fresh agent landing in this repo, read in this order:
+
+1. **README.md** — high-level quickstart
+2. **This file (REDESIGN.md)** — architecture, conscious-drops,
+   slot/theme/asset schemas, agent contract
+3. **consumer/SKILL_v5.md** — the agent-facing contract shipped in
+   the v5 skill bundle. Concise version of the agent flow.
+4. **authoring/ingest_v5.py** — self-contained v5 ingest module
+   (~1000 LOC). Read top-to-bottom — the constants at the top
+   (`_FEATURED_SIZE_MULTIPLIER`, `_ENABLE_SLOT_ROLES`, etc.) are
+   the tunable knobs.
+5. **consumer/reader.py v5 section** — search for "v5 redesign —
+   read-side methods (phase D)" header (~line 1380). All v5 reader
+   methods live below it. Above it = v4, leave alone.
+6. **authoring/app.py v5 section** — search for "v5 redesign —
+   read-only skeletons view (phase C1)" header (~line 3780). All
+   v5 endpoints + V5_HTML template live below.
+
+### Commands you'll run
+
+```bash
+# Ingest a deck (populates v4 + v5 workspace artifacts):
+python3 authoring/cli.py ingest path/to/deck.pptx
+
+# Render preview thumbnails (LibreOffice / qlmanage / PowerPoint COM):
+python3 authoring/cli.py preview
+
+# Review skeletons + assets in the browser:
+python3 authoring/app.py          # auto-opens /v5
+# - /v5 → skeleton review (the v5 surface)
+# - /  → asset describe (v4 path, still used for asset narrative)
+# - /compose → v4 compose page (still works against v4 build)
+
+# Run tests:
+python3 -m unittest tests.test_v4 tests.test_v5    # 73 expected
+
+# Build the v5 bundle:
+python3 authoring/cli.py build-v5
+# → authoring/dist/skill-v5.zip
+
+# Test the bundle (extracts + uses reader.py against it):
+mkdir -p /tmp/bundle && unzip -q authoring/dist/skill-v5.zip -d /tmp/bundle
+python3 /tmp/bundle/reader.py list-themes
+python3 /tmp/bundle/reader.py match-skeletons --content '{"title":"X"}'
+python3 /tmp/bundle/reader.py compose-v5 plan.json out.pptx --theme <id>
+```
+
+### Easy revert flags (one-line)
+
+If a v5.x change misbehaves on real decks:
+
+| Symptom | Flip |
+|---|---|
+| Slot roles look wrong | `authoring/ingest_v5.py` → `_ENABLE_SLOT_ROLES = False`, re-ingest |
+| Agent picks wrong slot despite roles | `consumer/reader.py` → `_V5_ENABLE_ROLE_MATCHING = False` (no re-ingest needed) |
+| Brand marks flooding slot inventory | adjust `_FEATURED_SIZE_MULTIPLIER` (currently 2.0; raise to 3.0+ to be stricter) |
+| Image crop placements look off | per-slot `auto_fit: stretch` to opt out of cover/contain |
+| Overlap detection false positives | comment out `_detect_overlap_candidates` call in `digest_skeleton` |
+
+### Conventions (project-wide)
+
+- **No `Co-Authored-By:` trailers in commits.** Project convention.
+- **Per-commit verbose multi-paragraph body.** WHY (the motivation),
+  WHAT (the change), VERIFICATION (what you ran to check). See any
+  v5 commit for the pattern (`git log --grep 'feat(v5'`).
+- **Allowlist over denylist for distribution.** New files that should
+  ship in `package-app` or `build-v5` zips must be added to the
+  allowlist in `authoring/cli.py:PACKAGE_APP_ALLOWLIST`.
+- **Single-file modules, no package boilerplate.** `ingest_v5.py`,
+  `reader.py`, `app.py`, `cli.py` are flat files. Helpers live
+  alongside the functions that use them.
+- **Defensive normalisation over agent compliance.** When a contract
+  has a "the agent should" rule, also build a server-side check that
+  works if the agent forgets.
+- **v4 paths stay untouched** until a future cleanup pass removes
+  them. v5 is purely additive; don't refactor v4 internals incidentally.
+
+### Test workspace
+
+For testing locally without polluting:
+
+```bash
+# Source decks are stored as workspace/decks/<name>/original.pptx —
+# both decks share the filename "original.pptx" which makes cli.py
+# ingest use the wrong deck_stem. Workaround:
+cp authoring/workspace/decks/testPres2/original.pptx /tmp/testPres2.pptx
+cp authoring/workspace/decks/Naskretski/original.pptx /tmp/Naskretski.pptx
+# now ingest with proper deck_stem:
+python3 authoring/cli.py ingest /tmp/testPres2.pptx
+python3 authoring/cli.py ingest /tmp/Naskretski.pptx
+```
+
+### Where the agent contract lives
+
+- **consumer/SKILL_v5.md** — what ships inside `skill-v5.zip` as
+  `SKILL.md`. Concise, agent-facing. Update when changing the API.
+- **consumer/reader.py main()** — the CLI surface the agent calls.
+  Sub-commands: `list-themes`, `list-skeletons`, `get-skeleton`,
+  `get-theme`, `match-skeletons`, `validate-plan`, `check-asset-fit`,
+  `measure-text`, `compose-v5`. v4 commands (`list`, `get`,
+  `compose`) live alongside and still work for v4 bundles.
+
+### What NOT to touch
+
+- v4 reader methods (`cmd_list`, `cmd_get`, `cmd_compose`) — leave
+  alone. They're for v4 bundles only.
+- v4 `build` command in cli.py — `build-v5` is the v5 entry point.
+- `consumer/SKILL.md` — that's the v4 contract. v5 uses `SKILL_v5.md`.
+- v4 slide.yaml descriptive fields (`intent`, `feel`, `suitable_for`)
+  — these are still written at ingest but not read by v5. Don't
+  spend time filling them.
+
+### If you want to push further
+
+The deferred list above is roughly ordered by user-visible impact.
+B4-render is the biggest gap (freeze-as-background skeletons are
+flagged but not built). Chart placement is the second-biggest (charts
+silently empty). Then master-only extraction (bundle size).
