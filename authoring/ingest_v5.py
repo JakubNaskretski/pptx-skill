@@ -308,12 +308,20 @@ def digest_skeleton(
     preserved_status = existing.get("status") if existing else None
     preserved_categories = existing.get("categories") if existing else None
 
+    # B5: propose categories from slot inventory only if user hasn't
+    # set their own. User-set categories survive re-ingest verbatim.
+    categories = (
+        preserved_categories
+        if preserved_categories
+        else _propose_categories(slots)
+    )
+
     out = {
         "id": skeleton_id,
         "source_deck": deck_stem,
         "source_slide_index": slide_number,
         "status": preserved_status or "pending",
-        "categories": preserved_categories or [],
+        "categories": categories,
         "preview": "preview.png",
         "background_image": None,
         "slots": slots,
@@ -430,6 +438,136 @@ def _slot_from_free_shape(
     # Freeforms / auto-shapes / connectors / groups — conscious drop
     # per REDESIGN.md. B4 may rescue some as frozen background.
     return None
+
+
+# ---------------------------------------------------------------------------
+# B5 — Auto-classifier (category proposal)
+#
+# Heuristic rules over the slot inventory only; no NLP, no content
+# semantics beyond simple substring matches. The user confirms in the
+# Flask UI (C2, future) so wrong proposals are easy to fix. Multiple
+# categories per slide are valid — a data slide with a quote tag is
+# both. Fallback to "content" if nothing else fires.
+# ---------------------------------------------------------------------------
+
+
+# Categories enum mirrors REDESIGN.md.
+_CATEGORIES = (
+    "opening", "section_divider", "content", "comparison",
+    "data", "metric", "quote", "closing",
+)
+
+
+def _propose_categories(slots: list[dict]) -> list[str]:
+    if not slots:
+        return ["content"]
+
+    kinds = [s.get("kind") for s in slots]
+    excerpts = [s.get("source_excerpt", "") or "" for s in slots]
+
+    proposed: list[str] = []
+
+    # data — has a structured data slot
+    if "table" in kinds or "chart" in kinds:
+        proposed.append("data")
+
+    # opening — small slot count, dominant heading, no body content
+    heading_slots = [s for s in slots if s.get("kind") == "heading"]
+    body_slots = [s for s in slots if s.get("kind") in ("bullets", "paragraph")]
+    if (
+        len(slots) <= 3
+        and heading_slots
+        and not body_slots
+        and any((h.get("geometry") or {}).get("h", 0) > 0.10 for h in heading_slots)
+    ):
+        proposed.append("opening")
+
+    # comparison — 2 slots of same kind, mirrored horizontally
+    if _has_side_by_side_pair(slots):
+        proposed.append("comparison")
+
+    # quote — any source excerpt contains quote glyphs
+    if any(_looks_like_quote(t) for t in excerpts):
+        proposed.append("quote")
+
+    # closing — any source excerpt matches farewell / Q&A patterns
+    if any(_looks_like_closing(t) for t in excerpts):
+        proposed.append("closing")
+
+    # Fallback so the user always sees at least one suggestion.
+    if not proposed:
+        proposed.append("content")
+
+    return proposed
+
+
+def _has_side_by_side_pair(slots: list[dict]) -> bool:
+    """Two slots of the same kind that mirror horizontally — same y/h,
+    different x, similar w. Catches 2-column compare/contrast slides.
+    """
+    eligible = [s for s in slots if s.get("kind") in ("bullets", "paragraph", "image")]
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            a, b = eligible[i], eligible[j]
+            if a.get("kind") != b.get("kind"):
+                continue
+            ga = a.get("geometry") or {}
+            gb = b.get("geometry") or {}
+            if (
+                abs(ga.get("y", 0) - gb.get("y", 0)) < 0.05
+                and abs(ga.get("h", 0) - gb.get("h", 0)) < 0.10
+                and abs(ga.get("w", 0) - gb.get("w", 0)) < 0.10
+                and abs(ga.get("x", 0) - gb.get("x", 0)) > 0.15
+            ):
+                return True
+    return False
+
+
+# Quote-character pairs. "Quote" fires only if a paired span is
+# substantial (>=30 chars) or makes up half the excerpt — bare quotes
+# on a single noun (company name, "Suplemencik") shouldn't fire.
+_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("“", "”"),
+    ("„", "”"),   # German / Polish low-9 + high-9
+    ("„", '"'),   # Polish low-9 + straight (common in extracted text)
+    ("‟", "”"),
+    ("«", "»"),
+)
+_CLOSING_PATTERNS = (
+    # English
+    "thank you", "thanks", "questions?", "any questions",
+    "q&a", "q & a", "next steps", "contact us", "get in touch",
+    # Polish (test deck Naskrętski is Polish-language; add more as
+    # other-language decks land)
+    "dziękuję", "dziekuje", "pytania", "kontakt",
+)
+
+
+def _looks_like_quote(text: str) -> bool:
+    if not text or len(text) < 20:
+        return False
+    longest_span = 0
+    for open_c, close_c in _QUOTE_PAIRS:
+        start = text.find(open_c)
+        if start < 0:
+            continue
+        end = text.find(close_c, start + len(open_c))
+        if end < 0:
+            continue
+        span = end - start - len(open_c)
+        if span > longest_span:
+            longest_span = span
+    return longest_span >= 30 or (
+        longest_span >= 15 and longest_span / max(1, len(text)) >= 0.5
+    )
+
+
+def _looks_like_closing(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return any(p in lower for p in _CLOSING_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
