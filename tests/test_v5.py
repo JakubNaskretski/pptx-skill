@@ -218,6 +218,38 @@ class TestReingestPreservation(unittest.TestCase):
         self.assertEqual(out["overlap_decision"], "image_slot")
         self.assertEqual(out["categories"], ["data"])
 
+    def test_user_edited_slot_kind_survives_reingest(self):
+        """User clicks a kind button to reclassify a slot; the new
+        kind must NOT be reverted on re-ingest. Mirrors what the
+        C-actions reclassify endpoint does, then re-runs digest.
+        """
+        prs = make_title_body_deck(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = ingest_v5.digest_skeleton(
+                prs.slides[0], prs.slide_width, prs.slide_height,
+                "deckA", 1, stub_theme_v4(), root,
+            )
+            # Find a slot the heuristic put as one kind; flip it to another
+            sk_path = root / "deckA_01" / "skeleton.yaml"
+            import yaml
+            data = yaml.safe_load(sk_path.read_text())
+            target = data["slots"][0]
+            original_kind = target["kind"]
+            new_kind = "paragraph" if original_kind == "heading" else "heading"
+            target["kind"] = new_kind
+            target["user_edited"] = True
+            sk_path.write_text(yaml.safe_dump(data, sort_keys=False))
+            # Re-ingest
+            out2 = ingest_v5.digest_skeleton(
+                prs.slides[0], prs.slide_width, prs.slide_height,
+                "deckA", 1, stub_theme_v4(), root,
+            )
+        slot = next(s for s in out2["slots"] if s["id"] == target["id"])
+        self.assertEqual(slot["kind"], new_kind,
+                         "user-edited kind must survive re-ingest")
+        self.assertTrue(slot.get("user_edited"))
+
 
 # ---------------------------------------------------------------------------
 # Constraint helpers
@@ -382,6 +414,107 @@ class TestValidatePlan(unittest.TestCase):
         # Title isn't a hard error because overflow:shrink covers it
         error_slots = [e.get("slot_id") for e in out["errors"]]
         self.assertNotIn("title", error_slots)
+
+
+# ---------------------------------------------------------------------------
+# Aspect-aware image crop (compose-v5 _v5_place_image)
+# ---------------------------------------------------------------------------
+
+
+def _wide_png_bytes() -> bytes:
+    """Generate a 200x100 (2:1 wide) PNG."""
+    from PIL import Image
+    img = Image.new("RGB", (200, 100), color="red")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _tall_png_bytes() -> bytes:
+    """Generate a 100x200 (1:2 tall) PNG."""
+    from PIL import Image
+    img = Image.new("RGB", (100, 200), color="blue")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+class TestImageAutoFit(unittest.TestCase):
+    """The aspect-aware crop in _v5_place_image. Slot is square; asset
+    is non-square. cover should center-crop preserving aspect;
+    contain should letterbox; stretch should distort (legacy).
+    """
+
+    def _build_slot(self, auto_fit: str):
+        return {
+            "id": "hero", "kind": "image",
+            "geometry": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},  # square slot
+            "constraints": {"auto_fit": auto_fit, "required": True},
+        }
+
+    def _place(self, png_bytes: bytes, slot: dict):
+        from pptx import Presentation
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            asset_path = d / "asset_test.png"
+            asset_path.write_bytes(png_bytes)
+            (d / "assets").mkdir()
+            (d / "assets" / "asset_test.png").write_bytes(png_bytes)
+
+            with mock.patch.object(reader_mod, "_v5_bundle_root", return_value=d):
+                prs = Presentation()
+                slide = prs.slides.add_slide(prs.slide_layouts[5])
+                ws = reader_mod._v5_place_image(
+                    slide, slot, "asset_test", prs.slide_width, prs.slide_height, {},
+                )
+            pics = [s for s in slide.shapes if s.shape_type == 13]  # PICTURE
+            return pics, ws
+
+    def test_cover_wide_asset_in_square_slot_crops_sides(self):
+        pics, _ = self._place(_wide_png_bytes(), self._build_slot("cover"))
+        self.assertEqual(len(pics), 1)
+        pic = pics[0]
+        # 2:1 asset in 1:1 slot, cover policy → height-matched, sides cropped.
+        # crop_left + crop_right should be > 0 (we lopped off width).
+        self.assertGreater(pic.crop_left, 0)
+        self.assertGreater(pic.crop_right, 0)
+        # Top/bottom shouldn't be touched.
+        self.assertEqual(pic.crop_top, 0)
+        self.assertEqual(pic.crop_bottom, 0)
+
+    def test_cover_tall_asset_in_square_slot_crops_top_bottom(self):
+        pics, _ = self._place(_tall_png_bytes(), self._build_slot("cover"))
+        pic = pics[0]
+        self.assertGreater(pic.crop_top, 0)
+        self.assertGreater(pic.crop_bottom, 0)
+        self.assertEqual(pic.crop_left, 0)
+        self.assertEqual(pic.crop_right, 0)
+
+    def test_contain_wide_asset_letterboxes(self):
+        pics, _ = self._place(_wide_png_bytes(), self._build_slot("contain"))
+        pic = pics[0]
+        # Letterbox: no cropping, image just shrunk to fit
+        self.assertEqual(pic.crop_left, 0)
+        self.assertEqual(pic.crop_right, 0)
+        self.assertEqual(pic.crop_top, 0)
+        # Placed shape height should be smaller than the slot height
+        # because asset aspect is wider.
+        # Slot is 0.2 * slide_height tall; placed should be less.
+        from pptx.util import Emu
+        # No precise numeric check — just that it's smaller than the slot.
+        slot_h_emu = int(0.2 * 6858000)
+        self.assertLess(pic.height, slot_h_emu)
+
+    def test_stretch_uses_slot_dims_directly(self):
+        pics, _ = self._place(_wide_png_bytes(), self._build_slot("stretch"))
+        pic = pics[0]
+        self.assertEqual(pic.crop_left, 0)
+        self.assertEqual(pic.crop_right, 0)
+        # Stretched: placed dimensions match the slot exactly.
+        slot_w_emu = int(0.2 * 9144000)
+        slot_h_emu = int(0.2 * 6858000)
+        self.assertEqual(pic.width, slot_w_emu)
+        self.assertEqual(pic.height, slot_h_emu)
 
 
 # ---------------------------------------------------------------------------

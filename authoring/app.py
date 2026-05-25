@@ -3966,6 +3966,36 @@ def api_v5_set_overlap_decision(skeleton_id):
     return jsonify({"ok": True, "overlap_decision": decision, "status": data["status"]})
 
 
+@app.post("/api/v5/skeleton/<skeleton_id>/slot/<slot_id>/kind")
+def api_v5_reclassify_slot_kind(skeleton_id, slot_id):
+    """Change a slot's kind in-place. Resets constraints to defaults
+    for the new kind and stamps user_edited:true so re-ingest preserves
+    the change instead of reverting to the heuristic-derived kind.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_kind = payload.get("kind")
+    if new_kind not in _V5_VALID_KINDS:
+        return jsonify({"error": f"kind must be one of {sorted(_V5_VALID_KINDS)}"}), 400
+
+    slots = data.get("slots") or []
+    target = next((s for s in slots if s.get("id") == slot_id), None)
+    if target is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    if target.get("kind") == new_kind:
+        return jsonify({"ok": True, "unchanged": True})
+
+    # Reset constraints to the new kind's defaults — the old kind's
+    # constraints don't carry meaning when the type changes.
+    target["kind"] = new_kind
+    target["constraints"] = _v5_default_slot_for_kind(new_kind, {}, set())["constraints"]
+    target["user_edited"] = True
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "slot": target})
+
+
 @app.post("/api/v5/skeleton/<skeleton_id>/promote-shape")
 def api_v5_promote_shape(skeleton_id):
     """Move an unmapped_shapes entry into slots with the chosen kind.
@@ -4125,10 +4155,14 @@ V5_HTML = r"""<!doctype html>
     .slot-id { font-weight: 600; font-size: 13px; font-family: ui-monospace, monospace; }
     .kind-btns { display: flex; gap: 2px; flex-wrap: wrap; }
     .kind-btn { padding: 2px 6px; border: 1px solid #ccc; background: white;
-                font-size: 10px; cursor: not-allowed; border-radius: 3px;
-                color: #888; font-family: ui-monospace, monospace; }
+                font-size: 10px; cursor: pointer; border-radius: 3px;
+                color: #555; font-family: ui-monospace, monospace; }
+    .kind-btn:hover { background: #eef4ff; color: #0066cc; border-color: #0066cc; }
     .kind-btn.active { background: #1e88e5; color: white; border-color: #1565c0;
                        cursor: default; font-weight: 600; }
+    .kind-btn.active:hover { background: #1e88e5; color: white; border-color: #1565c0; }
+    .user-edited-flag { color: #1565c0; font-size: 10px; font-style: italic;
+                         margin-left: 6px; }
     .excerpt { font-size: 12px; color: #444; margin-bottom: 6px;
                font-style: italic; word-break: break-word; line-height: 1.4; }
     .constraints { font-size: 11px; color: #666;
@@ -4344,7 +4378,11 @@ V5_HTML = r"""<!doctype html>
 
       const slotCards = (sk.slots || []).map(slot => {
         const kindBtns = KIND_LIST.map(k =>
-          `<span class="kind-btn ${k === slot.kind ? 'active' : ''}">${k}</span>`
+          `<button class="kind-btn ${k === slot.kind ? 'active' : ''}"
+                   onclick="reclassifySlot('${sk.id}', '${escapeHtml(slot.id)}', '${k}')"
+                   title="${k === slot.kind ? 'current kind' : 'click to reclassify to ' + k}">
+             ${k}
+           </button>`
         ).join('');
         const c = slot.constraints || {};
         const parts = [];
@@ -4356,10 +4394,12 @@ V5_HTML = r"""<!doctype html>
         if (c.chart_type) parts.push(`${c.chart_type}, ${c.max_series}s×${c.max_categories}c`);
         if (c.aspect) parts.push(`aspect ${c.aspect}`);
         if (c.required) parts.push('<span class="req">required</span>');
-        if (slot.user_promoted) parts.push('<span style="color:#1565c0;">(user-promoted)</span>');
+        const editedFlag = slot.user_edited
+          ? '<span class="user-edited-flag">(user-edited)</span>'
+          : (slot.user_promoted ? '<span class="user-edited-flag">(user-promoted)</span>' : '');
         return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
           <div class="slot-head">
-            <span class="slot-id">${escapeHtml(slot.id)}</span>
+            <span class="slot-id">${escapeHtml(slot.id)}${editedFlag}</span>
             <span class="kind-btns">${kindBtns}</span>
           </div>
           ${slot.source_excerpt ? `<div class="excerpt">${escapeHtml(slot.source_excerpt)}</div>` : ''}
@@ -4437,6 +4477,16 @@ V5_HTML = r"""<!doctype html>
         body: JSON.stringify({shape_index, kind})
       });
       if (!r.ok) { alert('Promote failed: ' + (await r.text())); return; }
+      await refreshCurrent(id);
+    }
+
+    async function reclassifySlot(id, slot_id, kind) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/slot/${encodeURIComponent(slot_id)}/kind`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({kind})
+      });
+      if (!r.ok) { alert('Reclassify failed: ' + (await r.text())); return; }
       await refreshCurrent(id);
     }
 

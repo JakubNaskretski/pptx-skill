@@ -438,30 +438,52 @@ def digest_skeleton(
 
 
 def _merge_user_promoted_slots(fresh_slots: list[dict], existing: dict | None, slide) -> list[dict]:
-    """Re-ingest preservation for user-promoted slots.
+    """Re-ingest preservation for user-curated slots.
 
-    When the C-actions UI promotes an unmapped_shape to a slot, that
-    slot lands in skeleton.yaml with a shape_id matching the source
-    shape. On re-ingest the heuristic won't re-claim that shape (else
-    it wouldn't have been unmapped originally). Without preservation
-    the user's promotion would silently disappear.
+    Two cases:
+    1. **user-promoted**: an existing slot whose shape_id is in the
+       source slide but not in fresh_slots (heuristic skipped it; the
+       user promoted it via C-actions). Preserve verbatim.
+    2. **user-edited**: an existing slot whose shape_id matches a
+       fresh slot AND carries `user_edited: true` (kind was changed
+       in the UI). Replace the fresh slot with the user's verbatim
+       version — heuristic's kind/constraints lose to user intent.
 
-    Rule: an existing slot is preserved iff its shape_id is still
-    present in the source slide AND not already in fresh_slots
-    (the heuristic would have claimed it if it could).
+    Without preservation, a re-ingest would silently revert both
+    kinds of user curation.
     """
     if not existing:
         return list(fresh_slots)
     existing_slots = existing.get("slots") or []
-    fresh_shape_ids = {s["shape_id"] for s in fresh_slots if "shape_id" in s}
+    fresh_by_shape_id = {s["shape_id"]: s for s in fresh_slots if "shape_id" in s}
     source_shape_ids = {sh.shape_id for sh in slide.shapes}
-    promoted = [
-        s for s in existing_slots
-        if s.get("shape_id") is not None
-        and s["shape_id"] in source_shape_ids
-        and s["shape_id"] not in fresh_shape_ids
-    ]
-    return list(fresh_slots) + promoted
+
+    out: list[dict] = []
+    consumed_shape_ids: set[int] = set()
+    for fresh in fresh_slots:
+        sid = fresh.get("shape_id")
+        existing_match = next(
+            (e for e in existing_slots if e.get("shape_id") == sid),
+            None,
+        )
+        if existing_match and existing_match.get("user_edited"):
+            # User overrode the heuristic's kind — keep the user version
+            out.append(existing_match)
+        else:
+            out.append(fresh)
+        if sid is not None:
+            consumed_shape_ids.add(sid)
+
+    # Append user-promoted slots (in existing but not in fresh)
+    for e in existing_slots:
+        sid = e.get("shape_id")
+        if sid is None or sid in consumed_shape_ids:
+            continue
+        if sid not in source_shape_ids:
+            continue
+        out.append(e)
+
+    return out
 
 
 def _read_existing_skeleton(path: Path) -> dict | None:

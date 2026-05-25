@@ -2175,8 +2175,73 @@ def _v5_place_image(slide, slot: dict, value, slide_w, slide_h, theme) -> list[d
     if bin_path is None:
         warnings.append({"violation": "asset_not_found", "message": f"asset {asset_id} binary missing"})
         return warnings
-    slide.shapes.add_picture(str(bin_path), left, top, w, h)
+
+    # Aspect-aware placement per the slot's auto_fit policy. Default
+    # "cover" matches the agent contract — center-crop preserving
+    # aspect to fill the slot. "contain" letterboxes; "stretch" is
+    # the old distorting behaviour, kept for opt-in compatibility.
+    fit = (slot.get("constraints") or {}).get("auto_fit") or "cover"
+    asset_w, asset_h = _v5_image_dimensions(bin_path)
+    if asset_w <= 0 or asset_h <= 0 or fit == "stretch":
+        # Unknown dims or explicit stretch → fall back to direct fit
+        # (matches the pre-aspect behaviour; cheaper than refusing).
+        slide.shapes.add_picture(str(bin_path), left, top, w, h)
+        if fit != "stretch" and (asset_w <= 0 or asset_h <= 0):
+            warnings.append({
+                "violation": "asset_dims_unknown",
+                "message": f"could not read dimensions of {bin_path.name}; placed stretched",
+            })
+        return warnings
+
+    asset_aspect = asset_w / asset_h
+    slot_aspect = w / h if h > 0 else 1.0
+
+    if fit == "contain":
+        # Letterbox: shrink to fit inside slot, leave bands.
+        if asset_aspect > slot_aspect:
+            placed_w = w
+            placed_h = int(w / asset_aspect)
+        else:
+            placed_h = h
+            placed_w = int(h * asset_aspect)
+        placed_left = left + (w - placed_w) // 2
+        placed_top = top + (h - placed_h) // 2
+        slide.shapes.add_picture(str(bin_path), placed_left, placed_top, placed_w, placed_h)
+        return warnings
+
+    # Default "cover": scale image larger than slot, crop overflow.
+    # python-pptx exposes pic.crop_left/right/top/bottom as fractions
+    # of the *displayed* image size (i.e. of placed_w / placed_h).
+    if asset_aspect > slot_aspect:
+        # Asset wider than slot → match height, crop sides
+        placed_h = h
+        placed_w = int(h * asset_aspect)
+        crop_amount = (placed_w - w) / placed_w / 2
+        pic = slide.shapes.add_picture(str(bin_path), left - int(placed_w - w) // 2, top, placed_w, placed_h)
+        pic.crop_left = crop_amount
+        pic.crop_right = crop_amount
+    else:
+        # Asset taller than slot → match width, crop top/bottom
+        placed_w = w
+        placed_h = int(w / asset_aspect)
+        crop_amount = (placed_h - h) / placed_h / 2
+        pic = slide.shapes.add_picture(str(bin_path), left, top - int(placed_h - h) // 2, placed_w, placed_h)
+        pic.crop_top = crop_amount
+        pic.crop_bottom = crop_amount
     return warnings
+
+
+def _v5_image_dimensions(path: Path) -> tuple[int, int]:
+    """Return (width, height) of a raster image in pixels, or (0, 0)
+    on any failure. PIL is the existing dependency for v4 dominant-
+    colour extraction, so it's already available.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return img.size
+    except Exception:
+        return 0, 0
 
 
 def _v5_place_table(slide, slot: dict, value, slide_w, slide_h, theme) -> list[dict]:
