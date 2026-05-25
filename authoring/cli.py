@@ -1768,6 +1768,15 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
             inventory=inventory,
         )
 
+        # v5 (additive): structural skeleton with fractional geometry,
+        # font_role / color_role, per-kind constraints. v4 path above
+        # is unaffected; v5 writes to workspace/skeletons/<deck>_<NN>/.
+        v4_preview = slide_pptx.with_suffix(".png")
+        ingest_v5.digest_skeleton(
+            slide, slide_w, slide_h, deck_stem, slide_number,
+            theme, WORKSPACE / "skeletons", v4_preview_path=v4_preview,
+        )
+
     return {
         "deck_stem": deck_stem,
         "slides": n_slides,
