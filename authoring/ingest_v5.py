@@ -571,6 +571,13 @@ def _extract_unmapped_shapes(
         excerpt = _shape_text_excerpt(shape)
         if excerpt:
             entry["source_excerpt"] = excerpt
+        # For picture shapes, record the SHA so "promote on all" can
+        # find sibling instances across other slides without re-opening
+        # the source pptx.
+        if _shape_is_picture(shape):
+            sha = _picture_sha(shape)
+            if sha:
+                entry["sha"] = sha
         out.append(entry)
     return out
 

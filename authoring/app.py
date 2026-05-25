@@ -4005,6 +4005,11 @@ def api_v5_promote_shape(skeleton_id):
     'different' from heuristic-derived ones, just stamped with a
     user-chosen kind. shape_id is preserved so re-ingest doesn't undo
     the promotion.
+
+    Optional `propagate: true` finds the same picture SHA in OTHER
+    skeletons' unmapped_shapes and promotes there too. Use when the
+    user wants consistent treatment of a deck-wide repeated picture.
+    Returns counts of how many other skeletons were touched.
     """
     p, data, err = _v5_load_skeleton(skeleton_id)
     if err:
@@ -4012,6 +4017,7 @@ def api_v5_promote_shape(skeleton_id):
     payload = request.get_json(silent=True) or {}
     idx = payload.get("shape_index")
     kind = payload.get("kind")
+    propagate = bool(payload.get("propagate"))
     if kind not in _V5_VALID_KINDS:
         return jsonify({"error": f"kind must be one of {sorted(_V5_VALID_KINDS)}"}), 400
     unmapped = data.get("unmapped_shapes") or []
@@ -4025,7 +4031,122 @@ def api_v5_promote_shape(skeleton_id):
     data["slots"] = slots
     data["unmapped_shapes"] = unmapped
     _v5_save_skeleton(p, data)
-    return jsonify({"ok": True, "slot": new_slot})
+
+    propagated_to: list[str] = []
+    target_sha = entry.get("sha")
+    if propagate and target_sha:
+        for sk_dir in V5_SKELETONS_DIR.iterdir():
+            if not sk_dir.is_dir() or sk_dir.name == skeleton_id:
+                continue
+            sk_yaml = sk_dir / "skeleton.yaml"
+            if not sk_yaml.exists():
+                continue
+            try:
+                sk_data = yaml.safe_load(sk_yaml.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            sk_unmapped = sk_data.get("unmapped_shapes") or []
+            match_idx = next(
+                (i for i, u in enumerate(sk_unmapped) if u.get("sha") == target_sha),
+                None,
+            )
+            if match_idx is None:
+                continue
+            sib_entry = sk_unmapped.pop(match_idx)
+            sk_used_ids = {s.get("id") for s in (sk_data.get("slots") or []) if s.get("id")}
+            sib_slot = _v5_default_slot_for_kind(kind, sib_entry, sk_used_ids)
+            sk_slots = sk_data.get("slots") or []
+            sk_slots.append(sib_slot)
+            sk_data["slots"] = sk_slots
+            sk_data["unmapped_shapes"] = sk_unmapped
+            _v5_save_skeleton(sk_yaml, sk_data)
+            propagated_to.append(sk_dir.name)
+
+    return jsonify({"ok": True, "slot": new_slot, "propagated_to": propagated_to})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/demote-slot")
+def api_v5_demote_slot(skeleton_id):
+    """Reverse a promote — move a user-promoted slot back to
+    unmapped_shapes so it stops being addressable by the agent.
+
+    Optional `propagate: true` finds slots in OTHER skeletons with the
+    same SHA + user_promoted flag and demotes them all in one shot.
+    Useful for undoing a mass promote, or cleaning up leftovers from
+    earlier experimentation.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    slot_id = payload.get("slot_id")
+    propagate = bool(payload.get("propagate"))
+    slots = data.get("slots") or []
+    target_idx = next((i for i, s in enumerate(slots) if s.get("id") == slot_id), None)
+    if target_idx is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    target = slots[target_idx]
+    if not target.get("user_promoted"):
+        return jsonify({
+            "error": "only user_promoted slots can be demoted — heuristic-derived "
+            "slots come back on re-ingest anyway",
+        }), 400
+    # Reconstruct an unmapped entry from the slot.
+    unmapped_entry = {
+        "shape_id": target.get("shape_id"),
+        "kind_hint": "picture" if target.get("kind") == "image" else target.get("kind"),
+        "geometry": target.get("geometry") or {},
+        "skipped_reason": "user-demoted from slot",
+    }
+    if target.get("sha"):
+        unmapped_entry["sha"] = target["sha"]
+    if target.get("source_excerpt"):
+        unmapped_entry["source_excerpt"] = target["source_excerpt"]
+    # Apply locally.
+    slots.pop(target_idx)
+    unmapped = data.get("unmapped_shapes") or []
+    unmapped.append(unmapped_entry)
+    data["slots"] = slots
+    data["unmapped_shapes"] = unmapped
+    _v5_save_skeleton(p, data)
+
+    propagated_to: list[str] = []
+    target_sha = target.get("sha")
+    if propagate and target_sha:
+        for sk_dir in V5_SKELETONS_DIR.iterdir():
+            if not sk_dir.is_dir() or sk_dir.name == skeleton_id:
+                continue
+            sk_yaml = sk_dir / "skeleton.yaml"
+            if not sk_yaml.exists():
+                continue
+            try:
+                sk_data = yaml.safe_load(sk_yaml.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            sk_slots = sk_data.get("slots") or []
+            sib_idx = next(
+                (i for i, s in enumerate(sk_slots)
+                 if s.get("sha") == target_sha and s.get("user_promoted")),
+                None,
+            )
+            if sib_idx is None:
+                continue
+            sib = sk_slots.pop(sib_idx)
+            sib_unmapped = {
+                "shape_id": sib.get("shape_id"),
+                "kind_hint": "picture",
+                "geometry": sib.get("geometry") or {},
+                "skipped_reason": "user-demoted from slot",
+                "sha": target_sha,
+            }
+            sk_unmapped = sk_data.get("unmapped_shapes") or []
+            sk_unmapped.append(sib_unmapped)
+            sk_data["slots"] = sk_slots
+            sk_data["unmapped_shapes"] = sk_unmapped
+            _v5_save_skeleton(sk_yaml, sk_data)
+            propagated_to.append(sk_dir.name)
+
+    return jsonify({"ok": True, "demoted": slot_id, "propagated_to": propagated_to})
 
 
 def _v5_default_slot_for_kind(kind: str, unmapped_entry: dict, used_ids: set) -> dict:
@@ -4060,6 +4181,10 @@ def _v5_default_slot_for_kind(kind: str, unmapped_entry: dict, used_ids: set) ->
         "shape_id": unmapped_entry.get("shape_id"),
         "user_promoted": True,
     }
+    # Carry the SHA forward for picture promotes — demote-slot uses it
+    # to find this slot's entry in unmapped_shapes after re-ingest.
+    if unmapped_entry.get("sha"):
+        out["sha"] = unmapped_entry["sha"]
     if excerpt:
         out["source_excerpt"] = excerpt
     return out
@@ -4397,9 +4522,14 @@ V5_HTML = r"""<!doctype html>
         const editedFlag = slot.user_edited
           ? '<span class="user-edited-flag">(user-edited)</span>'
           : (slot.user_promoted ? '<span class="user-edited-flag">(user-promoted)</span>' : '');
+        const demoteBtn = slot.user_promoted
+          ? `<button class="action-btn danger" style="margin-left:6px;font-size:10px;padding:2px 6px;"
+                     onclick="demoteSlot('${sk.id}', '${escapeHtml(slot.id)}', ${JSON.stringify(slot.sha || null)})"
+                     title="Move this slot back to unmapped decoration">demote</button>`
+          : '';
         return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
           <div class="slot-head">
-            <span class="slot-id">${escapeHtml(slot.id)}${editedFlag}</span>
+            <span class="slot-id">${escapeHtml(slot.id)}${editedFlag}${demoteBtn}</span>
             <span class="kind-btns">${kindBtns}</span>
           </div>
           ${slot.source_excerpt ? `<div class="excerpt">${escapeHtml(slot.source_excerpt)}</div>` : ''}
@@ -4471,12 +4601,58 @@ V5_HTML = r"""<!doctype html>
     }
 
     async function promoteShape(id, shape_index, kind) {
+      // If the target unmapped entry is a deck-wide repeated brand mark,
+      // ask whether to propagate so the user doesn't accidentally create
+      // a slide-N-only swappable hero while the same picture stays
+      // decoration on every other slide. The /v5 panel already has the
+      // skeleton in scope; we look up the entry from the cached render.
+      const panel = document.getElementById('panel');
+      const card = panel.querySelector(`.unmapped-card[data-unmapped-index="${shape_index}"]`);
+      let propagate = false;
+      if (card) {
+        const reason = card.querySelector('.reason')?.textContent || '';
+        if (reason.toLowerCase().includes('repeated brand mark')) {
+          const choice = confirm(
+            "This picture appears on multiple slides as deck-wide decoration.\n\n" +
+            "OK   = promote on all slides where it appears (consistent)\n" +
+            "Cancel = promote on this slide only (may cause cross-slide inconsistency)"
+          );
+          propagate = choice === true;
+        }
+      }
       const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/promote-shape`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({shape_index, kind})
+        body: JSON.stringify({shape_index, kind, propagate})
       });
       if (!r.ok) { alert('Promote failed: ' + (await r.text())); return; }
+      const result = await r.json();
+      if (result.propagated_to?.length) {
+        // Refresh the sidebar list so other skeletons show updated state.
+        await loadSkeletons();
+      }
+      await refreshCurrent(id);
+    }
+
+    async function demoteSlot(id, slot_id, sha) {
+      let propagate = false;
+      if (sha) {
+        propagate = confirm(
+          "Demote this slot back to decoration.\n\n" +
+          "OK   = demote on all slides where the same picture is user-promoted\n" +
+          "Cancel = demote on this slide only"
+        );
+      }
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/demote-slot`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({slot_id, propagate})
+      });
+      if (!r.ok) { alert('Demote failed: ' + (await r.text())); return; }
+      const result = await r.json();
+      if (result.propagated_to?.length) {
+        await loadSkeletons();
+      }
       await refreshCurrent(id);
     }
 
