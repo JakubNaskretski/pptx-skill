@@ -13,6 +13,7 @@ function docstrings reference sub-phases B1-B5 + C1.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -266,6 +267,78 @@ _PLACEHOLDER_FOOTER = frozenset({
 })
 
 
+def compute_repeated_picture_info(prs, threshold: float = 0.5) -> dict[str, float]:
+    """Return {sha: median_area_fraction} for pictures appearing on
+    >= `threshold` fraction of slides — i.e. deck-wide brand decoration.
+
+    The median area is the *typical* rendered size of the picture across
+    the deck. Callers compare a specific instance's area against this:
+    if a brand mark is rendered noticeably larger on one slide (e.g. a
+    cover/title slide that features the logo at hero size), that
+    instance is treated as a content slot rather than decoration.
+
+    SHA1 of the image binary collapses visually-identical pictures
+    inserted as separate shape instances. A picture appearing multiple
+    times on the SAME slide counts once toward the deck-wide repeat
+    fraction but all instances contribute their areas to the median.
+
+    Call once per deck at the start of ingest; pass the result into
+    digest_skeleton via `repeated_picture_info`.
+    """
+    sha_to_areas: dict[str, list[float]] = {}
+    sha_to_slide_count: dict[str, int] = {}
+    n_slides = len(prs.slides)
+    if n_slides == 0:
+        return {}
+
+    sw = prs.slide_width or 9144000
+    sh = prs.slide_height or 6858000
+    slide_area = sw * sh
+
+    for slide in prs.slides:
+        seen_on_slide: set[str] = set()
+        for shape in slide.shapes:
+            if getattr(shape, "is_placeholder", False):
+                continue
+            if not _shape_is_picture(shape):
+                continue
+            sha = _picture_sha(shape)
+            if sha is None:
+                continue
+            area = ((shape.width or 0) * (shape.height or 0)) / slide_area if slide_area else 0
+            sha_to_areas.setdefault(sha, []).append(area)
+            if sha not in seen_on_slide:
+                seen_on_slide.add(sha)
+                sha_to_slide_count[sha] = sha_to_slide_count.get(sha, 0) + 1
+
+    out: dict[str, float] = {}
+    for sha, slide_count in sha_to_slide_count.items():
+        if slide_count / n_slides < threshold:
+            continue
+        areas = sorted(sha_to_areas[sha])
+        m = len(areas)
+        median = areas[m // 2] if m % 2 == 1 else (areas[m // 2 - 1] + areas[m // 2]) / 2
+        out[sha] = median
+    return out
+
+
+# Backwards-compat name during this session — alias for callers that
+# may have imported the old name. Remove once cli.py is updated.
+def compute_repeated_picture_shas(prs, threshold: float = 0.5) -> set[str]:
+    return set(compute_repeated_picture_info(prs, threshold).keys())
+
+
+def _picture_sha(shape) -> str | None:
+    try:
+        return hashlib.sha1(shape.image.blob).hexdigest()
+    except (AttributeError, ValueError):
+        return None
+
+
+_FEATURED_SIZE_MULTIPLIER = 2.0  # >= 2x median area = treat as featured slot
+                                 # even if SHA is repeated deck-wide
+
+
 def digest_skeleton(
     slide,
     slide_w: int,
@@ -275,6 +348,7 @@ def digest_skeleton(
     theme_v4: dict,
     skeletons_root: Path,
     v4_preview_path: Path | None = None,
+    repeated_picture_info: dict[str, float] | None = None,
 ) -> dict:
     """Write workspace/skeletons/<deck>_<NN>/skeleton.yaml.
 
@@ -283,6 +357,14 @@ def digest_skeleton(
     per-kind constraints with max_chars / max_items / max_rows /
     max_cols / required). Status is `pending`; categories list empty
     (B5 populates), background_image null (B4 may set).
+
+    `repeated_picture_info`: {sha: median_area_fraction} for pictures
+    appearing on >= 50% of slides — caller obtains via
+    compute_repeated_picture_info(prs) once per deck. A picture whose
+    SHA is in this map is skipped UNLESS its area on this specific
+    slide is >= 2x the median (then it's "featured" content for this
+    slide — e.g. the brand logo at hero size on the cover slide).
+    Passing None disables the filter.
 
     If v4_preview_path is supplied and exists, copies the file into
     the skeleton dir so the skeleton dir is self-contained for the
@@ -298,6 +380,7 @@ def digest_skeleton(
 
     slots = _extract_slots(
         slide, slide_w, slide_h, palette_v4, palette_v5, theme_fonts,
+        repeated_picture_info=repeated_picture_info or {},
     )
     overlap_info = _detect_overlap_candidates(slide, slide_w, slide_h, slots)
 
@@ -354,6 +437,7 @@ def _read_existing_skeleton(path: Path) -> dict | None:
 def _extract_slots(
     slide, slide_w: int, slide_h: int,
     palette_v4: dict, palette_v5: dict, theme_fonts: dict,
+    repeated_picture_info: dict[str, float],
 ) -> list[dict]:
     slots: list[dict] = []
     used_ids: set[str] = set()
@@ -378,6 +462,7 @@ def _extract_slots(
             continue
         slot = _slot_from_free_shape(
             shape, slide_w, slide_h, palette_v4, palette_v5, theme_fonts, used_ids,
+            repeated_picture_info=repeated_picture_info,
         )
         if slot is not None:
             slots.append(slot)
@@ -423,12 +508,25 @@ def _slot_from_free_shape(
     shape, slide_w: int, slide_h: int,
     palette_v4: dict, palette_v5: dict, theme_fonts: dict,
     used_ids: set[str],
+    repeated_picture_info: dict[str, float] | None = None,
 ) -> dict | None:
     if getattr(shape, "has_table", False):
         return _slot_table(shape, slide_w, slide_h, used_ids)
     if getattr(shape, "has_chart", False):
         return _slot_chart(shape, slide_w, slide_h, used_ids)
     if _shape_is_picture(shape):
+        # Deck-wide brand marks are usually decoration — skip them.
+        # BUT if this instance is rendered much larger than typical
+        # (e.g. a logo featured at hero size on a cover slide), the
+        # author has used the asset as featured content; capture it.
+        if repeated_picture_info:
+            sha = _picture_sha(shape)
+            if sha and sha in repeated_picture_info:
+                median_area = repeated_picture_info[sha]
+                this_area = _area_fraction(shape, slide_w, slide_h)
+                if median_area > 0 and this_area / median_area < _FEATURED_SIZE_MULTIPLIER:
+                    return None  # typical size → decoration
+                # else fall through — featured instance, treat as slot
         if _is_image_slot_worthy(shape, slide_w, slide_h):
             return _slot_image(shape, slide_w, slide_h, used_ids, slot_id_base="hero")
     # Freeforms / auto-shapes / connectors / groups — conscious drop
@@ -1046,28 +1144,18 @@ def _shape_is_picture(shape) -> bool:
 
 
 def _is_image_slot_worthy(shape, slide_w: int, slide_h: int) -> bool:
-    """A free Picture becomes an image slot if it covers ≥5% of slide
-    area AND has a non-extreme aspect ratio. The aspect filter catches
-    brand banners (very wide / very thin strips) that would otherwise
-    be promoted to slots once we lowered the area threshold from the
-    old 15-20% to 5%.
+    """Per-shape filter; very permissive after the per-deck repeat
+    detection took over the "is this a brand mark" job.
 
-    Found by testing on Naskrętski_01: a portrait hero photo at 12.8%
-    area was being missed under the old > 15% rule, while a wide
-    decorative banner at 4% area + aspect 3.15:1 needed to stay
-    decoration. Combined filter handles both: hero gets in (13% > 5%
-    + 0.56 aspect is normal), banner stays out (4% < 5%, and even if
-    it were larger the 3.15 aspect would still filter it).
+    Only excludes sub-0.5% area pictures — i.e. tiny inline icons used
+    as bullet markers or list separators where promoting them to slots
+    would be noise. Aspect filter dropped (banners at extreme aspect
+    are legitimate slots when they're not deck-wide brand decoration).
+
+    The real decoration filter lives at compute_repeated_picture_shas;
+    THIS check is just a sub-pixel safety floor.
     """
-    area = _area_fraction(shape, slide_w, slide_h)
-    if area < 0.05:
-        return False
-    w = shape.width or 0
-    h = shape.height or 0
-    if w <= 0 or h <= 0:
-        return False
-    aspect = w / h
-    return 0.3 < aspect < 3.0
+    return _area_fraction(shape, slide_w, slide_h) >= 0.005
 
 
 # ---------------------------------------------------------------------------

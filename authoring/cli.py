@@ -1709,6 +1709,14 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     # decorations for the new build engine. v4 path above is unaffected.
     ingest_v5.digest_theme(prs, original, deck_stem, theme, WORKSPACE / "themes")
 
+    # Pre-compute repeated-picture info (sha → median area) across the
+    # whole deck so each per-slide digest can either skip a deck-wide
+    # brand mark (typical size = decoration) or capture it as a slot
+    # when it's rendered much larger on a specific slide (featured
+    # content, e.g. a logo at hero size on the cover). One pass, used
+    # by all per-slide digests below.
+    v5_repeated_info = ingest_v5.compute_repeated_picture_info(prs)
+
     # Resolve slide-level theme_colors via aliases; pass palette into
     # slot detection so per-run colour refs become hex + role names.
     theme_palette = theme.get("palette") or {}
@@ -1775,6 +1783,7 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
         ingest_v5.digest_skeleton(
             slide, slide_w, slide_h, deck_stem, slide_number,
             theme, WORKSPACE / "skeletons", v4_preview_path=v4_preview,
+            repeated_picture_info=v5_repeated_info,
         )
 
     return {
