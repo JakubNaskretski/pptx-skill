@@ -1101,5 +1101,131 @@ class TestRenderBackgroundHelper(unittest.TestCase):
             self.assertTrue((sk_dir / "background.png").exists())
 
 
+class TestComposeRunV5Routing(unittest.TestCase):
+    """The /api/compose/run endpoint now auto-routes v5-shaped plans
+    to reader.py compose-v5 with an auto-picked theme. Tests cover the
+    plan-shape detection, theme-picking strategy, and staged bundle
+    layout — without actually invoking the subprocess (that's covered
+    by TestComposeRoundTrip).
+    """
+
+    def setUp(self):
+        # Import app lazily so the module sees the patched WORKSPACE.
+        import importlib
+        import sys as _sys
+        # Pre-clear cached app/cli modules so they pick up the
+        # workspace override below.
+        for mod in ("app", "cli"):
+            if mod in _sys.modules:
+                del _sys.modules[mod]
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+        # Patch cli.WORKSPACE before importing app so app.WORKSPACE
+        # follows the override.
+        import cli as cli_mod
+        self._cli_workspace_patch = mock.patch.object(
+            cli_mod, "WORKSPACE", self.workspace,
+        )
+        self._cli_workspace_patch.start()
+        import app as app_mod
+        self._app_workspace_patch = mock.patch.object(
+            app_mod, "WORKSPACE", self.workspace,
+        )
+        self._app_workspace_patch.start()
+        self.app_mod = app_mod
+        self.cli_mod = cli_mod
+
+    def tearDown(self):
+        self._app_workspace_patch.stop()
+        self._cli_workspace_patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_detects_v5_plan_by_skeleton_id(self):
+        v5_plan = [{"skeleton_id": "sk_01", "slots": {"title": "x"}}]
+        v4_plan = [{"template": "tpl_01", "slots": {"title": "x"}}]
+        self.assertTrue(self.app_mod._plan_looks_like_v5(v5_plan))
+        self.assertFalse(self.app_mod._plan_looks_like_v5(v4_plan))
+
+    def test_stage_v5_bundle_includes_themes_skeletons_index(self):
+        # Lay down a tiny workspace
+        (self.workspace / "themes" / "deckA").mkdir(parents=True)
+        (self.workspace / "themes" / "deckA" / "theme.yaml").write_text(
+            "id: deckA\npalette: {primary: '#FF0000'}\nfonts: {major: Calibri}\n"
+        )
+        # Build a real master.pptx so the staging path doesn't choke
+        make_title_body_deck(1).save(
+            str(self.workspace / "themes" / "deckA" / "master.pptx"))
+
+        (self.workspace / "skeletons" / "sk_01").mkdir(parents=True)
+        (self.workspace / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+            "id: sk_01\nsource_deck: deckA\nsource_slide_index: 1\n"
+            "status: done\ncategories: [content]\n"
+            "slots:\n  - id: t\n    kind: heading\n"
+            "    geometry: {x: 0, y: 0, w: 1, h: 0.2}\n"
+            "    constraints: {max_chars: 50}\n"
+        )
+        # A rejected skeleton — should be excluded from staging
+        (self.workspace / "skeletons" / "sk_bad").mkdir(parents=True)
+        (self.workspace / "skeletons" / "sk_bad" / "skeleton.yaml").write_text(
+            "id: sk_bad\nsource_deck: deckA\nsource_slide_index: 2\n"
+            "status: rejected\ncategories: [content]\nslots: []\n"
+        )
+
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            self.app_mod._stage_compose_v5_bundle(staging)
+
+            self.assertTrue((staging / "reader.py").exists())
+            self.assertTrue((staging / "index.json").exists())
+            self.assertTrue((staging / "themes" / "deckA" / "theme.yaml").exists())
+            self.assertTrue((staging / "themes" / "deckA" / "master.pptx").exists())
+            self.assertTrue((staging / "skeletons" / "sk_01" / "skeleton.yaml").exists())
+            self.assertFalse((staging / "skeletons" / "sk_bad").exists(),
+                             "rejected skeletons must not be staged")
+
+            idx = json.loads((staging / "index.json").read_text())
+            self.assertEqual(idx["version"], 5)
+            sk_ids = [s["id"] for s in idx["skeletons"]]
+            self.assertIn("sk_01", sk_ids)
+            self.assertNotIn("sk_bad", sk_ids)
+
+    def test_pick_theme_matches_source_deck(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            # Two themes; skeleton points at deckB
+            for tid in ("deckA", "deckB"):
+                (staging / "themes" / tid).mkdir(parents=True)
+            (staging / "skeletons" / "sk_01").mkdir(parents=True)
+            (staging / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+                "id: sk_01\nsource_deck: deckB\nstatus: done\nslots: []\n"
+            )
+            plan = [{"skeleton_id": "sk_01", "slots": {}}]
+            theme, reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertEqual(theme, "deckB")
+            self.assertIn("deckB", reason)
+
+    def test_pick_theme_honors_explicit_plan_theme(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            for tid in ("deckA", "deckB"):
+                (staging / "themes" / tid).mkdir(parents=True)
+            (staging / "skeletons" / "sk_01").mkdir(parents=True)
+            (staging / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+                "id: sk_01\nsource_deck: deckB\nstatus: done\nslots: []\n"
+            )
+            plan = [{"skeleton_id": "sk_01", "slots": {}, "theme": "deckA"}]
+            theme, _reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertEqual(theme, "deckA")
+
+    def test_pick_theme_returns_none_when_no_themes(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            plan = [{"skeleton_id": "x", "slots": {}}]
+            theme, reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertIsNone(theme)
+            self.assertIn("no themes", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

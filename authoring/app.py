@@ -2003,6 +2003,179 @@ def api_user_assets_preview(asset_id):
 _clear_user_staged_on_startup()
 
 
+def _plan_looks_like_v5(plan: list) -> bool:
+    """A v5 plan entry has `skeleton_id`. v4 entries use `template` or
+    `compose: true`. Detect by the *first* entry that's a dict — keeps
+    detection cheap and consistent across the whole plan."""
+    for entry in plan:
+        if isinstance(entry, dict):
+            return "skeleton_id" in entry
+    return False
+
+
+def _stage_compose_v5_bundle(staging: Path) -> None:
+    """Stage a v5 skill bundle under `staging` for compose-v5 to read.
+
+    Layout mirrors cli.py build-v5 (themes/, skeletons/, assets/,
+    reader.py, index.json) so the subprocess sees the same shape it'd
+    get from an unzipped skill-v5.zip. SKILL.md is omitted — compose-
+    v5 doesn't read it, and shipping it would just bloat the staging
+    dir.
+    """
+    consumer_reader = cli_mod.CONSUMER / "reader.py"
+    (staging / "reader.py").write_text(
+        consumer_reader.read_text(encoding="utf-8"), encoding="utf-8",
+    )
+
+    themes_root = cli_mod.WORKSPACE / "themes"
+    skeletons_root = cli_mod.WORKSPACE / "skeletons"
+    assets_root = cli_mod.WORKSPACE / "assets"
+
+    # Themes
+    themes_summary = []
+    if themes_root.exists():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir() or not (d / "theme.yaml").exists():
+                continue
+            t = cli_mod.read_yaml(d / "theme.yaml")
+            tid = t.get("id", d.name)
+            t_dir = staging / "themes" / tid
+            t_dir.mkdir(parents=True, exist_ok=True)
+            for fn in ("theme.yaml", "master.pptx", "preview.png"):
+                src = d / fn
+                if src.exists():
+                    shutil.copyfile(src, t_dir / fn)
+            themes_summary.append({"id": tid, "palette": t.get("palette", {}),
+                                   "fonts": t.get("fonts", {})})
+
+    # Skeletons (skip rejected ones — same filter as build-v5)
+    skeletons_summary = []
+    if skeletons_root.exists():
+        for d in sorted(skeletons_root.iterdir()):
+            if not d.is_dir() or not (d / "skeleton.yaml").exists():
+                continue
+            sk = cli_mod.read_yaml(d / "skeleton.yaml")
+            if sk.get("status") == "rejected":
+                continue
+            sid = sk.get("id", d.name)
+            sk_dir = staging / "skeletons" / sid
+            sk_dir.mkdir(parents=True, exist_ok=True)
+            for fn in ("skeleton.yaml", "preview.png", "background.png"):
+                src = d / fn
+                if src.exists():
+                    shutil.copyfile(src, sk_dir / fn)
+            skeletons_summary.append({
+                "id": sid,
+                "source_deck": sk.get("source_deck"),
+                "categories": sk.get("categories") or [],
+                "slot_count": len(sk.get("slots") or []),
+                "slot_kinds": sorted({s.get("kind") for s in (sk.get("slots") or [])}),
+                "status": sk.get("status", "pending"),
+            })
+
+    # Assets (binary + sidecar). Re-use the v4 staging logic so user-
+    # supplied assets ride along too.
+    ast_dir = staging / "assets"
+    ast_dir.mkdir(parents=True, exist_ok=True)
+    asset_summary = []
+    if assets_root.exists():
+        for yaml_path in sorted(assets_root.glob("*.yaml")):
+            ad = cli_mod.read_yaml(yaml_path)
+            aid = ad.get("id")
+            if not aid:
+                continue
+            binary = _asset_binary(yaml_path)
+            if binary is not None:
+                ext = binary.suffix.lstrip(".") or "bin"
+                shutil.copyfile(binary, ast_dir / f"{aid}.{ext}")
+            clean = {k: v for k, v in ad.items() if not k.startswith("_")}
+            (ast_dir / f"{aid}.yaml").write_text(
+                yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            asset_summary.append({"id": aid, "kind": ad.get("kind"),
+                                  "subject": ad.get("subject", "")})
+
+    # User-supplied assets from the last bundle generation — mirror
+    # _stage_compose_bundle so v5 plans referencing user assets work too.
+    user_meta = _read_user_meta(USER_BUNDLE_DIR)
+    for aid, entry in user_meta.items():
+        ext = entry.get("ext") or "bin"
+        src = USER_BUNDLE_DIR / f"{aid}.{ext}"
+        if not src.exists():
+            continue
+        dst = ast_dir / f"{aid}.{ext}"
+        if dst.exists():
+            continue
+        shutil.copyfile(src, dst)
+        stub = {
+            "id": aid,
+            "kind": entry.get("kind") or "image",
+            "subject": f"User-supplied {entry.get('kind') or 'asset'} "
+                       f"({entry.get('filename') or '?'})",
+            "sources": [],
+        }
+        (ast_dir / f"{aid}.yaml").write_text(
+            yaml.safe_dump(stub, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
+    # index.json — v5 shape, mirroring build-v5
+    index = {
+        "version": 5,
+        "themes": themes_summary,
+        "skeletons": skeletons_summary,
+        "assets": asset_summary,
+    }
+    (staging / "index.json").write_text(
+        json_mod.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _pick_v5_theme(plan: list, staging: Path) -> tuple[str | None, str]:
+    """Pick a host theme for a v5 plan.
+
+    Strategy:
+      1. If any plan entry includes an explicit "theme" key, use that.
+      2. Else look up the first plan entry's skeleton, take its
+         source_deck — if a theme with that id exists, use it.
+      3. Else fall back to the first theme alphabetically.
+
+    Returns (theme_id, reason). theme_id is None when no theme is
+    available — caller should error with reason.
+    """
+    themes_dir = staging / "themes"
+    available = sorted([d.name for d in themes_dir.iterdir() if d.is_dir()]) \
+        if themes_dir.exists() else []
+    if not available:
+        return None, "no themes in workspace — run ingest first"
+
+    # 1. Explicit theme in plan
+    for entry in plan:
+        if isinstance(entry, dict) and entry.get("theme"):
+            t = entry["theme"]
+            if t in available:
+                return t, f"explicit theme {t!r} from plan"
+            return None, f"plan requested theme {t!r} but only {available} available"
+
+    # 2. Match first skeleton's source_deck
+    first_sk_id = next((e.get("skeleton_id") for e in plan
+                        if isinstance(e, dict) and e.get("skeleton_id")), None)
+    if first_sk_id:
+        sk_yaml = staging / "skeletons" / first_sk_id / "skeleton.yaml"
+        if sk_yaml.exists():
+            try:
+                sk = cli_mod.read_yaml(sk_yaml)
+                deck = sk.get("source_deck")
+                if deck and deck in available:
+                    return deck, f"matched source_deck {deck!r} of skeleton {first_sk_id!r}"
+            except Exception:
+                pass
+
+    # 3. First alphabetically
+    return available[0], f"defaulted to first theme {available[0]!r}"
+
+
 @app.post("/api/compose/run")
 def api_compose_run():
     body = request.get_json(force=True) or {}
@@ -2010,22 +2183,42 @@ def api_compose_run():
     if not isinstance(plan, list) or not plan:
         return jsonify({"error": "plan must be a non-empty JSON array"}), 400
 
-    import tempfile
+    is_v5 = _plan_looks_like_v5(plan)
 
     with tempfile.TemporaryDirectory(prefix="pptx-compose-") as tmpdir:
         staging = Path(tmpdir) / "bundle"
         staging.mkdir(parents=True, exist_ok=True)
-        _stage_compose_bundle(staging)
-        plan_path = staging / "plan.json"
-        plan_path.write_text(json_mod.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+        if is_v5:
+            _stage_compose_v5_bundle(staging)
+            theme_id, theme_reason = _pick_v5_theme(plan, staging)
+            if theme_id is None:
+                return jsonify({"error": f"v5 compose blocked: {theme_reason}"}), 400
+            # Strip the optional "theme" key so reader's plan validator
+            # (which doesn't know about envelope fields) stays happy.
+            cleaned = [{k: v for k, v in e.items() if k != "theme"}
+                       if isinstance(e, dict) else e for e in plan]
+            plan_path = staging / "plan.json"
+            plan_path.write_text(
+                json_mod.dumps(cleaned, ensure_ascii=False), encoding="utf-8",
+            )
+            cmd = [sys.executable, "reader.py", "compose-v5",
+                   "plan.json", "out.pptx", "--theme", theme_id]
+            debug_event("info", "compose",
+                        f"v5 compose: {theme_reason}, {len(plan)} slide(s)")
+        else:
+            _stage_compose_bundle(staging)
+            plan_path = staging / "plan.json"
+            plan_path.write_text(
+                json_mod.dumps(plan, ensure_ascii=False), encoding="utf-8",
+            )
+            cmd = [sys.executable, "reader.py", "compose", "plan.json", "out.pptx"]
+
         out_path = staging / "out.pptx"
         try:
             result = subprocess.run(
-                [sys.executable, "reader.py", "compose", "plan.json", "out.pptx"],
-                cwd=str(staging),
-                capture_output=True,
-                text=True,
-                timeout=60,
+                cmd, cwd=str(staging),
+                capture_output=True, text=True, timeout=60,
             )
         except subprocess.TimeoutExpired:
             debug_event("error", "compose", "compose subprocess timed out (60s)")
@@ -2041,6 +2234,7 @@ def api_compose_run():
                 "error": "compose failed",
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "mode": "v5" if is_v5 else "v4",
             }), 500
         try:
             summary = json_mod.loads(result.stdout)
@@ -2051,15 +2245,16 @@ def api_compose_run():
         persisted = WORKSPACE / "_compose_out"
         persisted.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_persisted = persisted / f"deck-{ts}.pptx"
+        suffix = "v5" if is_v5 else "v4"
+        out_persisted = persisted / f"deck-{suffix}-{ts}.pptx"
         shutil.copyfile(out_path, out_persisted)
         debug_event(
             "info", "compose",
-            f"compose finished — {out_persisted.name}, "
+            f"compose finished ({suffix}) — {out_persisted.name}, "
             f"{out_persisted.stat().st_size // 1024} KB, "
             f"{len(plan)} plan entries",
             file=out_persisted.name, size_bytes=out_persisted.stat().st_size,
-            entries=len(plan),
+            entries=len(plan), mode=suffix,
         )
 
     return send_file(
@@ -3227,6 +3422,7 @@ COMPOSE_HTML = r"""<!doctype html>
   <div class="top">
     <strong>pptx-skill</strong>
     <a href="/">← describe</a>
+    <a href="/v5">v5 skeletons →</a>
     <span style="color:#999;font-size:12px;margin-left:auto;" id="kbSummary"></span>
   </div>
 
@@ -3303,10 +3499,15 @@ COMPOSE_HTML = r"""<!doctype html>
     <div class="step">
       <h2>3. Paste the agent's plan and compose</h2>
       <div class="desc">
-        Paste the JSON array the LLM returns. We run <code>reader.py compose</code>
-        and hand you the .pptx.
+        Paste the JSON array the LLM returns. v4 plans
+        (<code>{"template": …, "slots": …}</code>) run via
+        <code>reader.py compose</code>. v5 plans
+        (<code>{"skeleton_id": …, "slots": …}</code>) auto-route to
+        <code>reader.py compose-v5</code>; host theme is picked from
+        the first skeleton's <code>source_deck</code> unless a plan
+        entry sets <code>"theme": "&lt;id&gt;"</code>.
       </div>
-      <textarea id="plan" class="plan-area" placeholder='[{"template":"…","slots":{"title":"…"}}]'></textarea>
+      <textarea id="plan" class="plan-area" placeholder='[{"skeleton_id":"deckA_03","slots":{"title":"…"}}]'></textarea>
       <div class="actions">
         <button id="runCompose">Compose deck (.pptx)</button>
       </div>
