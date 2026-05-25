@@ -1855,6 +1855,353 @@ def cmd_v5_check_asset_fit(args: argparse.Namespace) -> None:
     sys.stdout.write("\n")
 
 
+def cmd_v5_compose(args: argparse.Namespace) -> None:
+    """Build a deck from a v5 plan on a chosen host theme's master.
+
+    Opens themes/<theme_id>/master.pptx as host, strips its slides,
+    then for each plan entry creates a new blank slide and places
+    primitives per the skeleton's slot inventory.
+
+    Plan shape (same as validate-plan):
+      [{"skeleton_id": "...", "slots": {"slot_id": value, ...}}, ...]
+
+    Slot value shapes:
+      string → text content
+      list[string] → bullets
+      dict {value, overflow: "shrink"} → text with autofit
+      dict {rows, cols, has_header, data: [[...]]} → table
+      dict {type, series, categories} → chart (deferred — emits warning)
+      "asset_<id>" or dict {asset: "..."} → image
+
+    Writes a JSON result to stdout with output path + warnings,
+    plus a <out>.warnings.json sidecar with the same warnings for
+    the user to triage overflow:shrink events after the deck opens.
+    """
+    from pptx import Presentation
+    from pptx.util import Emu, Pt
+
+    plan_path = Path(args.plan)
+    if not plan_path.exists():
+        raise SystemExit(f"plan not found: {plan_path}")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan, list) or not plan:
+        raise SystemExit("plan must be a non-empty JSON array")
+
+    theme = _v5_load_theme(args.theme)
+    if theme is None:
+        raise SystemExit(f"theme not found: {args.theme}")
+    master_path = _v5_themes_dir() / args.theme / theme.get("master_pptx", "master.pptx")
+    if not master_path.exists():
+        raise SystemExit(f"theme master.pptx missing: {master_path}")
+
+    out_path = Path(args.out)
+    warnings: list[dict] = []
+
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+        shutil.copyfile(master_path, tmp.name)
+        host_path = Path(tmp.name)
+
+    try:
+        prs = Presentation(str(host_path))
+        slide_w = prs.slide_width or 9144000
+        slide_h = prs.slide_height or 6858000
+
+        # Strip the source's existing slides — we build fresh.
+        _v5_drop_all_slides(prs)
+
+        # Pick a blank-ish layout to host each new slide.
+        blank_layout = _v5_pick_blank_layout(prs)
+
+        for i, entry in enumerate(plan):
+            sk_id = entry.get("skeleton_id")
+            sk = _v5_load_skeleton(sk_id) if sk_id else None
+            if sk is None:
+                warnings.append({"slide_index": i, "violation": "skeleton_not_found",
+                                 "message": f"no skeleton {sk_id!r}"})
+                continue
+
+            slide = prs.slides.add_slide(blank_layout)
+            slots_by_id = {s["id"]: s for s in (sk.get("slots") or [])}
+            filled = entry.get("slots") or {}
+
+            # Apply background_image if the skeleton has one (B4-render
+            # territory — for now we just warn it's set but unrendered).
+            if sk.get("background_image"):
+                warnings.append({
+                    "slide_index": i, "slot_id": "_background",
+                    "violation": "background_pending",
+                    "message": "background_image set but B4-render not implemented",
+                })
+
+            for slot_id, value in filled.items():
+                slot = slots_by_id.get(slot_id)
+                if slot is None:
+                    warnings.append({
+                        "slide_index": i, "slot_id": slot_id,
+                        "violation": "unknown_slot",
+                        "message": f"slot {slot_id!r} not in skeleton {sk_id!r}",
+                    })
+                    continue
+                ws = _v5_place_slot(slide, slot, value, slide_w, slide_h, theme)
+                for w in ws:
+                    w.setdefault("slide_index", i)
+                    w.setdefault("slot_id", slot_id)
+                warnings.extend(ws)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        prs.save(str(out_path))
+
+        # Sidecar for human review of overflow/warning events.
+        if warnings:
+            sidecar = out_path.with_suffix(out_path.suffix + ".warnings.json")
+            sidecar.write_text(
+                json.dumps({"warnings": warnings}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+    finally:
+        try:
+            host_path.unlink()
+        except OSError:
+            pass
+
+    result = {
+        "output": str(out_path),
+        "slides": len(plan),
+        "warnings": warnings,
+        "warnings_sidecar": str(out_path.with_suffix(out_path.suffix + ".warnings.json")) if warnings else None,
+    }
+    json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def _v5_drop_all_slides(prs) -> None:
+    """Remove every slide from the host master so we can add fresh
+    ones for each plan entry. Mirrors the pattern in v4's
+    _drop_first_slide but applied repeatedly.
+    """
+    sldIdLst = prs.slides._sldIdLst
+    rId_to_drop = []
+    for sldId in list(sldIdLst):
+        rId_to_drop.append(sldId.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"))
+        sldIdLst.remove(sldId)
+    for rId in rId_to_drop:
+        if rId:
+            try:
+                prs.part.drop_rel(rId)
+            except KeyError:
+                pass
+
+
+def _v5_pick_blank_layout(prs):
+    """Pick the simplest available layout (fewest placeholders).
+    Mirrors v4's "fewest placeholders" heuristic.
+    """
+    layouts = list(prs.slide_layouts)
+    if not layouts:
+        raise SystemExit("host master has no slide layouts")
+    return min(layouts, key=lambda lo: len(list(lo.placeholders)))
+
+
+def _v5_emu_geometry(slot: dict, slide_w: int, slide_h: int) -> tuple[int, int, int, int]:
+    """Fractional → EMU. Returns (left, top, width, height) in EMU."""
+    g = slot.get("geometry") or {}
+    return (
+        int((g.get("x", 0)) * slide_w),
+        int((g.get("y", 0)) * slide_h),
+        int((g.get("w", 0)) * slide_w),
+        int((g.get("h", 0)) * slide_h),
+    )
+
+
+def _v5_resolve_font_name(slot: dict, theme: dict) -> str | None:
+    """Resolve a slot's style.font_role against the host theme."""
+    style = slot.get("style") or {}
+    role = style.get("font_role")
+    fonts = theme.get("fonts") or {}
+    if role == "major":
+        return fonts.get("major")
+    if role == "minor":
+        return fonts.get("minor")
+    if role == "explicit":
+        return style.get("typeface")
+    return None
+
+
+def _v5_resolve_color(slot: dict, theme: dict):
+    """Resolve a slot's style.color_role or .color → RGBColor or None."""
+    from pptx.dml.color import RGBColor
+    style = slot.get("style") or {}
+    role = style.get("color_role")
+    palette = theme.get("palette") or {}
+    hex_val = None
+    if role and role in palette:
+        hex_val = palette[role]
+    elif style.get("color"):
+        hex_val = style["color"]
+    if not hex_val:
+        return None
+    try:
+        return RGBColor.from_string(hex_val.lstrip("#"))
+    except Exception:
+        return None
+
+
+def _v5_place_slot(slide, slot: dict, value, slide_w: int, slide_h: int, theme: dict) -> list[dict]:
+    """Dispatch to per-kind placers."""
+    kind = slot.get("kind")
+    warnings: list[dict] = []
+    overflow = None
+    if isinstance(value, dict) and "overflow" in value:
+        overflow = value.get("overflow")
+        value = value.get("value", value)
+    try:
+        if kind in ("heading", "paragraph", "footer"):
+            warnings.extend(_v5_place_text(slide, slot, value, slide_w, slide_h, theme, overflow))
+        elif kind == "bullets":
+            items = value if isinstance(value, list) else [value]
+            warnings.extend(_v5_place_bullets(slide, slot, items, slide_w, slide_h, theme, overflow))
+        elif kind == "image":
+            warnings.extend(_v5_place_image(slide, slot, value, slide_w, slide_h, theme))
+        elif kind == "table":
+            warnings.extend(_v5_place_table(slide, slot, value, slide_w, slide_h, theme))
+        elif kind == "chart":
+            warnings.append({"violation": "chart_not_implemented",
+                             "message": "chart compose deferred — slot left empty"})
+        else:
+            warnings.append({"violation": "unknown_kind",
+                             "message": f"unknown slot kind {kind!r}"})
+    except Exception as e:
+        warnings.append({"violation": "place_failed",
+                         "message": f"{type(e).__name__}: {e}"})
+    return warnings
+
+
+def _v5_place_text(slide, slot: dict, value, slide_w, slide_h, theme, overflow) -> list[dict]:
+    from pptx.util import Pt
+    from pptx.enum.text import MSO_ANCHOR
+    warnings: list[dict] = []
+    left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
+    tb = slide.shapes.add_textbox(left, top, w, h)
+    tf = tb.text_frame
+    tf.word_wrap = True
+    if overflow == "shrink":
+        # MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE doesn't exist universally;
+        # use word_wrap + autofit via tf.auto_size if available.
+        try:
+            from pptx.enum.text import MSO_AUTO_SIZE
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            warnings.append({"overflow_kind": "shrink",
+                             "message": "text autofit enabled per overflow:shrink"})
+        except Exception:
+            pass
+
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = str(value)
+    style = slot.get("style") or {}
+    if style.get("size_pt"):
+        run.font.size = Pt(style["size_pt"])
+    if style.get("bold") is not None:
+        run.font.bold = style["bold"]
+    if style.get("italic") is not None:
+        run.font.italic = style["italic"]
+    font_name = _v5_resolve_font_name(slot, theme)
+    if font_name:
+        run.font.name = font_name
+    color = _v5_resolve_color(slot, theme)
+    if color is not None:
+        run.font.color.rgb = color
+    return warnings
+
+
+def _v5_place_bullets(slide, slot: dict, items: list, slide_w, slide_h, theme, overflow) -> list[dict]:
+    from pptx.util import Pt
+    warnings: list[dict] = []
+    left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
+    tb = slide.shapes.add_textbox(left, top, w, h)
+    tf = tb.text_frame
+    tf.word_wrap = True
+    if overflow == "shrink":
+        try:
+            from pptx.enum.text import MSO_AUTO_SIZE
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            warnings.append({"overflow_kind": "shrink",
+                             "message": "bullet autofit enabled per overflow:shrink"})
+        except Exception:
+            pass
+
+    style = slot.get("style") or {}
+    font_name = _v5_resolve_font_name(slot, theme)
+    color = _v5_resolve_color(slot, theme)
+
+    for i, item in enumerate(items):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        run = p.add_run()
+        run.text = f"• {item}"
+        if style.get("size_pt"):
+            run.font.size = Pt(style["size_pt"])
+        if style.get("bold") is not None:
+            run.font.bold = style["bold"]
+        if font_name:
+            run.font.name = font_name
+        if color is not None:
+            run.font.color.rgb = color
+    return warnings
+
+
+def _v5_place_image(slide, slot: dict, value, slide_w, slide_h, theme) -> list[dict]:
+    warnings: list[dict] = []
+    left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
+    # Resolve asset id from value
+    asset_id = None
+    if isinstance(value, str):
+        asset_id = value
+    elif isinstance(value, dict):
+        asset_id = value.get("asset") or value.get("asset_id")
+    if not asset_id:
+        warnings.append({"violation": "no_asset", "message": "image value missing asset id"})
+        return warnings
+    # Find the asset binary
+    assets_dir = _v5_assets_dir()
+    if not assets_dir.exists():
+        warnings.append({"violation": "no_assets_dir", "message": f"assets dir missing: {assets_dir}"})
+        return warnings
+    bin_path = None
+    for cand in assets_dir.glob(f"{asset_id}.*"):
+        if cand.suffix == ".yaml":
+            continue
+        bin_path = cand
+        break
+    if bin_path is None:
+        warnings.append({"violation": "asset_not_found", "message": f"asset {asset_id} binary missing"})
+        return warnings
+    slide.shapes.add_picture(str(bin_path), left, top, w, h)
+    return warnings
+
+
+def _v5_place_table(slide, slot: dict, value, slide_w, slide_h, theme) -> list[dict]:
+    from pptx.util import Pt
+    warnings: list[dict] = []
+    left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
+    if not isinstance(value, dict):
+        warnings.append({"violation": "bad_table", "message": "table value must be dict"})
+        return warnings
+    data = value.get("data") or []
+    rows = value.get("rows") or len(data)
+    cols = value.get("cols") or (len(data[0]) if data else 0)
+    if rows < 1 or cols < 1:
+        warnings.append({"violation": "empty_table", "message": "table needs rows/cols"})
+        return warnings
+    tbl_shape = slide.shapes.add_table(rows, cols, left, top, w, h)
+    tbl = tbl_shape.table
+    for r in range(min(rows, len(data))):
+        row_data = data[r]
+        for c in range(min(cols, len(row_data))):
+            cell = tbl.cell(r, c)
+            cell.text = str(row_data[c])
+    return warnings
+
+
 def cmd_v5_measure_text(args: argparse.Namespace) -> None:
     if args.array:
         try:
@@ -1966,6 +2313,13 @@ def main(argv: list[str] | None = None) -> None:
     p_mt.add_argument("--array", default=None, help="JSON array of items (for bullets)")
     p_mt.add_argument("--against", default=None, help="<skeleton_id>.<slot_id>")
     p_mt.set_defaults(func=cmd_v5_measure_text)
+
+    p_cv = sub.add_parser("compose-v5",
+                          help="Build a deck from a v5 plan on a chosen host theme.")
+    p_cv.add_argument("plan")
+    p_cv.add_argument("out")
+    p_cv.add_argument("--theme", required=True, help="theme_id (see list-themes)")
+    p_cv.set_defaults(func=cmd_v5_compose)
 
     args = parser.parse_args(argv)
     args.func(args)
