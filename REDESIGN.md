@@ -210,6 +210,57 @@ Same vision-describe flow as today. SVGs get structural bonus metadata
 (palette_hex, aspect, recolorable flag) added at ingest as filter
 signal.
 
+### Overlap and frozen backgrounds (experimental)
+
+**Marked experimental.** This is a proposed handling for a real
+digest-time problem. Auto-detection heuristic is decent but not
+foolproof; if real-world usage shows this approach causes more
+breakage than it prevents, remove the freeze-as-background logic and
+fall back to auto-rejecting overlap-detected skeletons (user reviews
+manually via the reject flow). When implementing in phase B, keep the
+freeze-as-background module self-contained so removal is a small
+revert, not a refactor.
+
+**Problem.** A slide has a structural illustration (e.g. a chain of
+4 squared shapes representing a process) with text labels overlaid
+on each shape. In the structural-skeleton model:
+
+- Dropping the picture (it's a freeform / auto-shape we'd conscious-
+  drop) leaves the 4 text labels orphaned in nowhere positions —
+  useless skeleton.
+- Keeping the picture as an image slot lets the agent swap it for a
+  random photo, which misaligns the labels — broken deck.
+
+**Approach.** Freeze-as-background detection at digest time.
+
+1. During digest, detect overlap: text shapes whose geometry
+   overlaps a picture or freeform cluster's bounding box → the
+   picture is *probably* a structural background illustration, not
+   a swappable hero.
+2. For those slides: render the non-slottable underlay (picture +
+   freeforms + decorations) to a flat PNG, store as `background.png`
+   on the skeleton, add `background_image: background.png` to
+   `skeleton.yaml`. **Not a slot — a baked-in layer.**
+3. Overlaid text shapes become normal slots with their original
+   geometry.
+4. Build engine paints the background first, then places filled
+   slots on top.
+5. Agent fills text slots; cannot swap the background. Matches
+   structural intent — a process-flow skeleton works *because of*
+   the chain image.
+6. Flask UI surfaces detected overlaps; user confirms "freeze as
+   background", overrides to "treat as image slot anyway", or
+   rejects the skeleton.
+
+**Schema impact.** Adds optional `background_image: <path>|null` to
+`skeleton.yaml`. Build engine reads it; absent means no background
+layer.
+
+**Fallback if removed.** Strip steps 1-6. Replace with: at digest,
+flag overlap-detected skeletons with `status: pending` + a
+`digest_warnings: [overlap_detected]` field. User triages in Flask
+UI — categorize anyway (accepting the broken-deck risk) or reject.
+
 ---
 
 ## Agent-facing methods (`reader.py`)
@@ -224,6 +275,28 @@ signal.
 | `get-asset <id>` | Asset description + binary path. |
 | `validate-plan <plan.json>` | Full pre-build constraint check across all slides + asset choices. |
 | `compose --theme <theme_id> <plan.json> <out.pptx>` | Build the deck on the chosen host theme. |
+
+### Engine-side helpers — we compute, agent decides
+
+Anything the agent could get wrong arithmetically, we expose as a
+method. The agent's job is creative selection, not aspect-ratio math
+or char counting in Unicode.
+
+| Helper | Returns |
+|---|---|
+| `check-asset-fit <asset_id> <skeleton>.<slot>` | `{fits: true, will_resize_to: [W,H], will_crop: <region>\|none}` or `{fits: false, reason, suggestion}`. Covers aspect mismatch, min-resolution, kind mismatch (e.g. icon picked for hero slot). |
+| `measure-text <str\|array> [--against <skeleton>.<slot>]` | Char count, word count, estimated line count at the slot's font size. With `--against`: pass/fail vs the constraint with current headroom. |
+
+Plus **build-engine policy** the agent never calls (engine handles
+silently):
+
+- **Image auto-fit.** Default `cover` — center-crop preserving
+  aspect to fill the slot. Slot can declare `auto_fit: cover |
+  contain | stretch` to override. The agent never sees EMU
+  coordinates or computes aspect ratios.
+- **Text auto-wrap.** Within slot geometry. Vertical overflow is
+  the trigger for `auto_shrink` (see overflow policy below) when
+  the agent has signalled fall-through.
 
 ### `match-skeletons` — the content-first selection API
 
@@ -296,10 +369,47 @@ Returns:
 }
 ```
 
-`SKILL.md` instructs the agent: on zero match, rephrase per
-`suggested_action`, do NOT pick a near-miss. There's no "expand the
-slot" affordance — constraints exist because the source slide was
-designed for that length and overflow visually breaks the deck.
+### Rephrase loop with fall-through (the SKILL.md contract)
+
+On `matches: []`, the agent's contract is a three-step fallback:
+
+1. **Rephrase first.** Apply `suggested_action` (shorten title to ≤N
+   chars, consolidate to ≤N bullets). Re-call `match-skeletons`.
+2. **If rephrasing would lose meaning** — text is already terse,
+   trimming further destroys content — use the text as-is and pass
+   `overflow: "shrink"` in the plan value:
+   `{"value": "...", "overflow": "shrink"}`. Build engine will
+   auto-shrink font to fit and emit a warning to
+   `<output>.warnings.json` for the user to fix manually after the
+   deck is built.
+3. **Picking a near-miss skeleton is not an option.** The escape
+   hatch is `overflow: "shrink"` on the *intended* skeleton, not
+   selection of a different one whose constraints don't match the
+   intent.
+
+`overflow: "shrink"` is an escape hatch, not the default. Constraints
+exist because the source slide was designed for that length;
+overflow degrades the visual. The warnings sidecar exists so the
+user knows what to fix, not so the agent can ignore constraints
+freely.
+
+**Warnings sidecar shape (`<out>.warnings.json`):**
+
+```json
+{
+  "warnings": [
+    {
+      "slide_index": 3,
+      "skeleton_id": "deckA_07",
+      "slot_id": "title",
+      "constraint": {"max_chars": 60},
+      "actual": {"chars": 73},
+      "action_taken": "auto-shrunk font from 36pt to 30pt",
+      "agent_note": "could not shorten without losing meaning"
+    }
+  ]
+}
+```
 
 ### `validate-plan` — pre-build safety net
 
@@ -363,12 +473,36 @@ not copied (would be wrong on a freshly-composed deck).
 4. cli.py build
    → dist/skill.zip
        themes/<id>/{theme.yaml, master.pptx, preview.png}
-       templates/<id>/{skeleton.yaml, preview.png}
+       templates/<id>/{skeleton.yaml, preview.png, background.png?}
        assets/<id>.{ext, yaml}
        reader.py
        SKILL.md
        index.json
 ```
+
+### Skeleton status lifecycle
+
+`skeleton.yaml` carries a `status:` field:
+
+- `pending` — written by ingest. Awaiting category assignment (and
+  awaiting overlap-handling decision if `digest_warnings` is set).
+- `done` — categorized; included in build, listed and matchable.
+- `rejected` — explicitly rejected by user via the Flask UI
+  "Reject" button. Stays in workspace (re-ingest preserves the
+  state — no auto-recategorize). Excluded from `validate`
+  promotion, `list-skeletons`, `match-skeletons`, and build output.
+
+**Rejection is reversible.** The Flask UI shows rejected skeletons
+in a separate "Rejected" filter; user can click "Restore" to flip
+status back to `pending` (returns to the categorize queue) or
+straight to `done` if previously categorized (one-click un-reject
+without re-categorizing).
+
+Use cases for rejection: title-placeholder slides, empty
+boilerplate, slides with overlap too messy to background-freeze
+cleanly, anything visually useless. Use cases for un-reject: changed
+mind after seeing the rest of the deck, mis-clicked, re-evaluating
+after a brief discussion.
 
 ---
 
@@ -380,8 +514,8 @@ operational until phase F flips the build flag.
 | Phase | Touches | Deliverable |
 |---|---|---|
 | A | `REDESIGN.md`, `authoring/schemas/skeleton.yaml`, extended `theme.yaml` | Schemas + this doc. **You are here.** |
-| B | `authoring/cli.py:ingest` | Digest pass: slot inventory with geometry, style, constraints. Auto-classify category. Capture `master.pptx` per deck. Auto-classify decorations. |
-| C | `authoring/app.py` | Categorize-skeletons panel + verify-theme panel. Promote on save. Remove describe-slide path. |
+| B | `authoring/cli.py:ingest` | Digest pass: slot inventory with geometry, style, constraints. Auto-classify category. Capture `master.pptx` per deck. Auto-classify decorations. Overlap detection + freeze-as-background rendering (experimental — self-contained module so removable). |
+| C | `authoring/app.py` | Categorize-skeletons panel + verify-theme panel. Reject/Restore controls (rejection is reversible). Promote on save. Remove describe-slide path. |
 | D | `consumer/reader.py` | `list-themes`, `list-skeletons`, `get-skeleton`, `match-skeletons`, `validate-plan`. Tested in isolation against a fixture skeleton set. |
 | E | `consumer/reader.py:compose` | New build engine: build slides from primitives on chosen host theme. All kinds (heading, paragraph, bullets, table, chart, image). Page numbers auto-sequence. Font / color role resolution. |
 | F | `consumer/SKILL.md`, `authoring/cli.py:build` | Rewritten agent contract. v4 paths removed from build output. |
