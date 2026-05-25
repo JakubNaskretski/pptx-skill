@@ -692,6 +692,329 @@ def _apply_font_remap(el, remap: dict[str, str]) -> int:
     return count
 
 
+# ---------------------------------------------------------------------------
+# Rel-aware shape import (Phase 1 of the multi-slide compose fix)
+# ---------------------------------------------------------------------------
+#
+# A naive `deepcopy(shape._element)` brings the source's rId references
+# along verbatim. Those rIds live in the source slide's *local* rels file
+# and mean nothing in the destination — PowerPoint then refuses to render
+# the shape and pops the "couldn't read some content" dialog.
+#
+# _import_shape_xml handles this by:
+#   1) deepcopy the shape XML,
+#   2) for each rId-bearing attribute, look up the rel on the source part
+#      and re-register it on the destination part (which auto-imports the
+#      target part and any rels that come with it),
+#   3) rewrite the attribute to the destination-local rId.
+#
+# Transitive rels (chart → embedded xlsx → image) ride along automatically
+# because python-pptx packages parts together with their own rels graph
+# when `relate_to(target_part, reltype)` registers a new internal rel.
+
+_OPC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_REL_ATTRS = (
+    f"{{{_OPC_REL_NS}}}embed",
+    f"{{{_OPC_REL_NS}}}link",
+    f"{{{_OPC_REL_NS}}}id",
+)
+
+
+def _iter_rel_attr_holders(el):
+    """Yield (element, attr_qname) for every rId-bearing attribute under el."""
+    for descendant in el.iter():
+        for q in _REL_ATTRS:
+            if q in descendant.attrib:
+                yield descendant, q
+
+
+def _existing_part_for_blob(package, partname, blob: bytes):
+    """Return the dest-package part already at `partname` iff its blob
+    matches `blob` (so the import can dedupe instead of colliding).
+    None when no part exists there OR the existing part has different
+    bytes — caller must then allocate a fresh partname."""
+    for part in package.iter_parts():
+        if part.partname == partname and getattr(part, "blob", None) == blob:
+            return part
+    return None
+
+
+def _has_colliding_part(package, partname) -> bool:
+    for part in package.iter_parts():
+        if part.partname == partname:
+            return True
+    return False
+
+
+def _clone_part_into(dest_package, src_part):
+    """Materialise a copy of `src_part` inside `dest_package`. When the
+    partname is free (or already holds the same bytes), reuse it as-is.
+    When it would collide with different bytes, allocate a fresh
+    partname so the OPC package stays valid.
+
+    Returns a Part bound to dest_package."""
+    from pptx.opc.package import Part
+    from pptx.opc.packuri import PackURI
+
+    src_partname = src_part.partname
+    src_blob = src_part.blob
+    src_ctype = src_part.content_type
+
+    existing = _existing_part_for_blob(dest_package, src_partname, src_blob)
+    if existing is not None:
+        return existing
+
+    if not _has_colliding_part(dest_package, src_partname):
+        # Free slot — rebind by re-creating the part inside dest_package
+        # using the same class so chart/image/etc. behaviours are kept.
+        return type(src_part).load(src_partname, src_ctype, dest_package, src_blob)
+
+    # Collision: allocate a fresh partname matching the original prefix
+    # (e.g. /ppt/media/image%d.jpeg). PackURI exposes .baseURI + .ext.
+    base_uri = src_partname.baseURI            # e.g. /ppt/media
+    ext = src_partname.ext                     # e.g. jpeg
+    # Strip trailing digits from the original filename to get the tmpl
+    # stem ("image" from "image1"). Falls back to "part" if the source
+    # used a non-numbered name.
+    stem = src_partname.filename.split(".")[0]
+    stem = re.sub(r"\d+$", "", stem) or "part"
+    tmpl = f"{base_uri}/{stem}%d.{ext}" if ext else f"{base_uri}/{stem}%d"
+    new_partname = dest_package.next_partname(tmpl)
+    return type(src_part).load(
+        PackURI(str(new_partname)), src_ctype, dest_package, src_blob,
+    )
+
+
+def _import_part_rel(src_part, dest_part, old_rid: str) -> str | None:
+    """Look up old_rid on src_part, register the same target on dest_part,
+    return the new dest-local rId. None if the rel cannot be resolved.
+
+    Handles partname collisions across source decks by cloning the
+    target onto dest_package with a fresh partname when needed."""
+    try:
+        src_rel = src_part.rels[old_rid]
+    except KeyError:
+        return None
+    reltype = src_rel.reltype
+    try:
+        if src_rel.is_external:
+            return dest_part.relate_to(src_rel.target_ref, reltype, is_external=True)
+        target = src_rel.target_part
+        dest_pkg = dest_part.package
+        # If target was loaded from a different package OR its partname
+        # would clash with an existing part in dest, clone into dest.
+        if target.package is not dest_pkg or _has_colliding_part(
+            dest_pkg, target.partname
+        ):
+            target = _clone_part_into(dest_pkg, target)
+        return dest_part.relate_to(target, reltype)
+    except Exception:
+        # Unknown reltype or part class python-pptx can't handle — log
+        # and skip so the rest of the shape import still succeeds.
+        return None
+
+
+def _rewrite_rel_attrs_in_subtree(src_part, dest_part, subtree) -> list[str]:
+    """For every rId attr in `subtree`, import the rel onto dest_part and
+    rewrite the attr value. Returns a list of warnings for refs that
+    couldn't be resolved."""
+    warnings: list[str] = []
+    rid_subs: dict[str, str] = {}
+    for el, attr_q in _iter_rel_attr_holders(subtree):
+        old_rid = el.get(attr_q)
+        if old_rid is None or old_rid in rid_subs:
+            continue
+        new_rid = _import_part_rel(src_part, dest_part, old_rid)
+        if new_rid is None:
+            warnings.append(
+                f"unresolved rel {old_rid!r} on <{el.tag.rpartition('}')[2]} "
+                f"{attr_q.rpartition('}')[2]}=...> — shape kept but ref dropped"
+            )
+            continue
+        rid_subs[old_rid] = new_rid
+    for el, attr_q in _iter_rel_attr_holders(subtree):
+        old_rid = el.get(attr_q)
+        if old_rid in rid_subs:
+            el.set(attr_q, rid_subs[old_rid])
+        elif old_rid is not None:
+            # Drop the broken ref so OOXML doesn't see a phantom rId.
+            del el.attrib[attr_q]
+    return warnings
+
+
+def _import_shape_xml(src_slide_part, dest_slide_part, dest_sptree, src_shape_el):
+    """Import one shape: deepcopy, rewrite rIds against dest part, append.
+
+    Returns a list of warnings (empty on the happy path)."""
+    new_el = copy.deepcopy(src_shape_el)
+    warnings = _rewrite_rel_attrs_in_subtree(src_slide_part, dest_slide_part, new_el)
+    dest_sptree.append(new_el)
+    return new_el, warnings
+
+
+# ---------------------------------------------------------------------------
+# Background flatten (Phase 3 of the multi-slide compose fix)
+# ---------------------------------------------------------------------------
+#
+# PowerPoint resolves slide backgrounds through an inheritance chain:
+#   slide → layout → master → theme (via <p:bgRef idx>)
+# When we graft slides from one deck onto another, the destination's
+# layout/master/theme is used — so the source's background is lost.
+#
+# _flatten_slide_background materialises the effective background as an
+# explicit <p:bg> on the source slide before graft, so the background
+# copies along with the shape tree.
+
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+
+def _qn(tag: str) -> str:
+    prefix, _, local = tag.partition(":")
+    ns = {"a": _A_NS, "p": _P_NS, "r": _OPC_REL_NS}.get(prefix)
+    return f"{{{ns}}}{local}" if ns else tag
+
+
+def _find_bg_element(cSld_el):
+    if cSld_el is None:
+        return None
+    for child in cSld_el:
+        if child.tag == _qn("p:bg"):
+            return child
+    return None
+
+
+def _theme_part_for(slide_or_layout_or_master):
+    """Return the SlideMaster theme part (the only theme that defines
+    bgFillStyleLst entries used by <p:bgRef>)."""
+    try:
+        if hasattr(slide_or_layout_or_master, "slide_layout"):
+            master = slide_or_layout_or_master.slide_layout.slide_master
+        elif hasattr(slide_or_layout_or_master, "slide_master"):
+            master = slide_or_layout_or_master.slide_master
+        else:
+            master = slide_or_layout_or_master
+        # python-pptx exposes the theme part as master.element.part's
+        # related theme part; easiest is to read its rels for the theme.
+        master_part = master.part
+        for rel in master_part.rels.values():
+            if rel.reltype.endswith("/theme"):
+                return rel.target_part
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_theme_bg_ref(theme_part, idx: int):
+    """Return the theme's bgFillStyleLst[idx-1001] element (deepcopy),
+    suitable for embedding under <p:bgPr>. None on miss."""
+    if theme_part is None or idx is None:
+        return None
+    try:
+        from lxml import etree
+        root = etree.fromstring(theme_part.blob)
+    except Exception:
+        return None
+    bg_lst = root.find(
+        f".//{_qn('a:fmtScheme')}/{_qn('a:bgFillStyleLst')}"
+    )
+    if bg_lst is None:
+        return None
+    children = list(bg_lst)
+    # OOXML spec: bgRef@idx is 1001-based for bgFillStyleLst.
+    pos = idx - 1001
+    if pos < 0 or pos >= len(children):
+        return None
+    return copy.deepcopy(children[pos])
+
+
+def _build_bg_pr_from_fill(fill_el):
+    """Wrap a fill element (a:solidFill/a:gradFill/a:blipFill/a:pattFill)
+    in a fresh <p:bgPr> ready to be the sole child of <p:bg>."""
+    from lxml import etree
+    bg_pr = etree.SubElement(etree.Element(_qn("p:bg")), _qn("p:bgPr"))
+    bg_pr.append(fill_el)
+    # OOXML schema: <p:bgPr> must end with <a:effectLst/> (can be empty).
+    etree.SubElement(bg_pr, _qn("a:effectLst"))
+    return bg_pr.getparent()  # the <p:bg> wrapper
+
+
+def _find_effective_bg(slide):
+    """Walk slide → layout → master and return the first <p:bg> element
+    found (with the part it came from, for rel-import).
+
+    Returns (bg_el_deepcopy, source_part) or (None, None)."""
+    chain = []
+    try:
+        chain.append((slide._element.find(_qn("p:cSld")), slide.part))
+    except Exception:
+        pass
+    try:
+        layout = slide.slide_layout
+        chain.append((layout._element.find(_qn("p:cSld")), layout.part))
+    except Exception:
+        pass
+    try:
+        master = slide.slide_layout.slide_master
+        chain.append((master._element.find(_qn("p:cSld")), master.part))
+    except Exception:
+        pass
+    for cSld_el, part in chain:
+        bg = _find_bg_element(cSld_el)
+        if bg is not None:
+            return copy.deepcopy(bg), part
+    return None, None
+
+
+def _flatten_slide_background(slide) -> list[str]:
+    """Materialise the slide's effective background into an explicit
+    <p:bg> on the slide. Idempotent. Returns warnings list."""
+    warnings: list[str] = []
+    sld_el = slide._element
+    cSld_el = sld_el.find(_qn("p:cSld"))
+    if cSld_el is None:
+        return warnings
+    if _find_bg_element(cSld_el) is not None:
+        return warnings  # already explicit
+
+    bg_el, src_part = _find_effective_bg(slide)
+    if bg_el is None or src_part is None:
+        return warnings  # nothing to flatten
+
+    # Resolve <p:bgRef> → inline <p:bgPr> from the theme.
+    bg_ref = bg_el.find(_qn("p:bgRef"))
+    if bg_ref is not None:
+        try:
+            idx = int(bg_ref.get("idx") or 0)
+        except ValueError:
+            idx = 0
+        theme_part = _theme_part_for(slide)
+        fill_el = _resolve_theme_bg_ref(theme_part, idx)
+        if fill_el is None:
+            warnings.append(
+                f"bgRef idx={idx} could not be resolved against theme — "
+                f"background may render blank"
+            )
+            return warnings
+        # Carry over scheme-colour overrides from the bgRef (e.g. when
+        # the slide says "use theme bg #2 but recolor accent1 → bg2").
+        # bgRef wraps an inline colour spec as last child; preserve it.
+        new_bg = _build_bg_pr_from_fill(fill_el)
+        src_part = theme_part  # rels inside the theme blob, if any
+    else:
+        new_bg = bg_el
+
+    # Import any rels referenced inside the bg subtree (e.g. blipFill
+    # r:embed pointing at a media part on the source layout/master).
+    warnings.extend(
+        _rewrite_rel_attrs_in_subtree(src_part, slide.part, new_bg)
+    )
+
+    # <p:bg> must be the first child of <p:cSld> per the OOXML schema.
+    cSld_el.insert(0, new_bg)
+    return warnings
+
+
 def _copy_slide_into(
     dest_prs: Presentation,
     src_slide_pptx: Path,
@@ -701,15 +1024,21 @@ def _copy_slide_into(
     """Copy the (single) slide from src_slide_pptx into dest_prs and return
     the new slide.
 
-    Strategy: open the source deck, copy its first slide's shape tree onto a
-    blank layout in the destination, re-import image rels, and remap
-    semantic clrScheme slots (D5) so the copied shapes stay consistent
-    with the host's brand colours.
+    Strategy: open the source deck, flatten its background so it's self-
+    contained, copy its first slide's shape tree onto a blank layout in
+    the destination via rel-aware import, then remap semantic clrScheme
+    slots (D5) so the copied shapes stay consistent with the host's
+    brand colours.
     """
     src_prs = Presentation(str(src_slide_pptx))
     if len(src_prs.slides) == 0:
         raise SystemExit(f"{src_slide_pptx}: no slides")
     src_slide = src_prs.slides[0]
+
+    # Phase 3: make the source slide's background self-contained before
+    # we graft. Otherwise the destination's blank layout supplies a
+    # blank background and the original gradient/image is lost.
+    _flatten_slide_background(src_slide)
 
     # Pick a blank-ish layout in dest. Prefer the layout with the fewest
     # placeholders to minimise interference with the copied content.
@@ -732,42 +1061,38 @@ def _copy_slide_into(
     for shp in list(new_slide.shapes):
         shp._element.getparent().remove(shp._element)
 
+    # Carry the flattened background over to the new slide's <p:cSld>.
+    src_cSld = src_slide._element.find(_qn("p:cSld"))
+    dest_cSld = new_slide._element.find(_qn("p:cSld"))
+    if src_cSld is not None and dest_cSld is not None:
+        src_bg = _find_bg_element(src_cSld)
+        if src_bg is not None and _find_bg_element(dest_cSld) is None:
+            new_bg = copy.deepcopy(src_bg)
+            # Rels inside the bg (blip fills) were imported onto
+            # src_slide.part during flatten; re-import onto new_slide.part.
+            _rewrite_rel_attrs_in_subtree(
+                src_slide.part, new_slide.part, new_bg
+            )
+            dest_cSld.insert(0, new_bg)
+
     remap = _build_scheme_remap(source_theme, host_theme)
     font_remap = _build_font_remap(source_theme, host_theme)
 
-    # Copy shapes from source. For pictures, re-add via add_picture so the
-    # image part is imported into the destination package.
+    # Rel-aware shape import. Handles pictures, group shapes, hyperlinks,
+    # picture-filled auto-shapes, charts, SmartArt — anything that carries
+    # an rId reference inside its XML — by re-registering the underlying
+    # parts on the destination slide and rewriting rIds in place.
     for shape in src_slide.shapes:
-        st = getattr(shape, "shape_type", None)
-        # Picture: re-import bytes so the rel lives in the dest package.
-        if st is not None and str(st).endswith("PICTURE"):
-            try:
-                blob = shape.image.blob
-                ext = shape.image.ext or "png"
-            except Exception:
-                # Some pictures (e.g. background placeholders) may not expose .image
-                blob = None
-                ext = "png"
-            if blob is not None:
-                from io import BytesIO
-
-                new_pic = new_slide.shapes.add_picture(
-                    BytesIO(blob),
-                    shape.left or 0,
-                    shape.top or 0,
-                    width=shape.width,
-                    height=shape.height,
-                )
-                new_pic.name = shape.name
-                continue
-            # Fall through to plain XML copy if no blob accessible.
-
-        el = copy.deepcopy(shape._element)
+        new_el, _ws = _import_shape_xml(
+            src_slide_part=src_slide.part,
+            dest_slide_part=new_slide.part,
+            dest_sptree=new_slide.shapes._spTree,
+            src_shape_el=shape._element,
+        )
         if remap:
-            _apply_scheme_remap(el, remap)
+            _apply_scheme_remap(new_el, remap)
         if font_remap:
-            _apply_font_remap(el, font_remap)
-        new_slide.shapes._spTree.append(el)
+            _apply_font_remap(new_el, font_remap)
 
     return new_slide
 
@@ -1267,6 +1592,12 @@ def cmd_compose(args: argparse.Namespace) -> None:
                     aspect_warned_for.add(src_deck)
                 if i == 0 and host_claims_first_slide:
                     slide = dest_prs.slides[0]
+                    # Same flatten treatment as grafted slides so the
+                    # host's first slide carries its background
+                    # explicitly — otherwise inheritance loss in some
+                    # decks would leave it blank while grafted slides
+                    # render fine.
+                    warnings.extend(_flatten_slide_background(slide))
                 else:
                     src_pptx = template_dir(tid) / "slide.pptx"
                     if not src_pptx.exists():
