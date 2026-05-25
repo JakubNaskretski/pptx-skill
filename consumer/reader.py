@@ -1306,27 +1306,666 @@ def cmd_compose(args: argparse.Namespace) -> None:
     sys.stdout.write("\n")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# v5 redesign — read-side methods (phase D)
+#
+# Self-contained block. Operates on either a built v5 bundle (next to
+# reader.py with themes/ + skeletons/ + assets/ siblings, per phase F)
+# OR directly on workspace/themes/ + workspace/skeletons/ during dev
+# (so we can exercise the API end-to-end before phase E + F ship).
+#
+# Read-only — no deck building. Phase E owns compose-v5.
+# ===========================================================================
+
+
+def _v5_bundle_root() -> Path:
+    """Find the v5 data root. Tries built-bundle layout first
+    (themes/skeletons siblings next to reader.py), falls back to the
+    authoring workspace for dev. Returns None if neither is present.
+    """
+    here = bundle_root()
+    if (here / "themes").is_dir() and (here / "skeletons").is_dir():
+        return here
+    # Dev fallback: repo/authoring/workspace/
+    ws = here.parent / "authoring" / "workspace"
+    if (ws / "themes").is_dir() and (ws / "skeletons").is_dir():
+        return ws
+    return here  # caller will see empty results
+
+
+def _v5_themes_dir() -> Path:
+    return _v5_bundle_root() / "themes"
+
+
+def _v5_skeletons_dir() -> Path:
+    return _v5_bundle_root() / "skeletons"
+
+
+def _v5_assets_dir() -> Path:
+    # Assets live next to themes/skeletons in workspace; in a built
+    # bundle they're under "assets/" sibling. Same path either way.
+    return _v5_bundle_root() / "assets"
+
+
+def _v5_load_yaml(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+
+
+def _v5_iter_skeletons() -> list[dict]:
+    root = _v5_skeletons_dir()
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        sk = _v5_load_yaml(d / "skeleton.yaml")
+        if sk:
+            out.append(sk)
+    return out
+
+
+def _v5_load_skeleton(skeleton_id: str) -> dict | None:
+    return _v5_load_yaml(_v5_skeletons_dir() / skeleton_id / "skeleton.yaml")
+
+
+def _v5_load_theme(theme_id: str) -> dict | None:
+    return _v5_load_yaml(_v5_themes_dir() / theme_id / "theme.yaml")
+
+
+def _v5_load_asset_meta(asset_id: str) -> dict | None:
+    return _v5_load_yaml(_v5_assets_dir() / f"{asset_id}.yaml")
+
+
+# --- Constraint helpers (single source of truth for fit logic) -------------
+
+
+def _v5_check_text_fit(text: str, constraints: dict) -> tuple[bool, str, int]:
+    """Returns (fits, reason, headroom_chars). Headroom positive = under
+    constraint, negative = over.
+    """
+    max_chars = constraints.get("max_chars")
+    if max_chars is None:
+        return True, "", 0
+    n = len(text or "")
+    headroom = max_chars - n
+    if headroom < 0:
+        return False, f"{n} chars > max_chars {max_chars}", headroom
+    return True, "", headroom
+
+
+def _v5_check_bullets_fit(items: list, constraints: dict) -> tuple[bool, str, dict]:
+    max_items = constraints.get("max_items")
+    max_chars_per_item = constraints.get("max_chars_per_item")
+    n_items = len(items or [])
+    headroom = {"items": (max_items - n_items) if max_items is not None else 0}
+    if max_items is not None and n_items > max_items:
+        return False, f"{n_items} items > max_items {max_items}", headroom
+    if max_chars_per_item is not None:
+        for i, it in enumerate(items or []):
+            if len(str(it)) > max_chars_per_item:
+                return (
+                    False,
+                    f"item {i} has {len(str(it))} chars > max_chars_per_item {max_chars_per_item}",
+                    headroom,
+                )
+    return True, "", headroom
+
+
+def _v5_check_table_fit(table_dict: dict, constraints: dict) -> tuple[bool, str, dict]:
+    rows = table_dict.get("rows", 0)
+    cols = table_dict.get("cols", 0)
+    max_rows = constraints.get("max_rows")
+    max_cols = constraints.get("max_cols")
+    headroom = {
+        "rows": (max_rows - rows) if max_rows is not None else 0,
+        "cols": (max_cols - cols) if max_cols is not None else 0,
+    }
+    if max_rows is not None and rows > max_rows:
+        return False, f"{rows} rows > max_rows {max_rows}", headroom
+    if max_cols is not None and cols > max_cols:
+        return False, f"{cols} cols > max_cols {max_cols}", headroom
+    return True, "", headroom
+
+
+def _v5_check_image_fit(asset_meta: dict, constraints: dict) -> tuple[bool, str, dict]:
+    transform = {"will_crop": False, "will_resize": False}
+    slot_aspect = (constraints.get("aspect") or "free").lower()
+    if slot_aspect == "free":
+        return True, "", transform
+    aspect_targets = {"1:1": 1.0, "16:9": 16/9, "4:3": 4/3, "3:4": 3/4, "9:16": 9/16}
+    target = aspect_targets.get(slot_aspect)
+    if target is None:
+        return True, f"unknown aspect {slot_aspect!r} — letting through", transform
+    w = asset_meta.get("width") or asset_meta.get("dimensions", {}).get("width") or 0
+    h = asset_meta.get("height") or asset_meta.get("dimensions", {}).get("height") or 0
+    if w <= 0 or h <= 0:
+        return True, "asset dims unknown — best-effort fit", transform
+    asset_aspect = w / h
+    if abs(asset_aspect - target) / target > 0.05:
+        transform["will_crop"] = True
+        return False, f"asset aspect {asset_aspect:.2f} vs slot {slot_aspect} ({target:.2f}); would crop", transform
+    return True, "", transform
+
+
+# --- Slot lookup helpers ---------------------------------------------------
+
+
+_CONTENT_KEY_TO_KIND = {
+    "title": "heading",
+    "heading": "heading",
+    "subtitle": "heading",
+    "paragraph": "paragraph",
+    "bullets": "bullets",
+    "image": "image",
+    "hero": "image",
+    "table": "table",
+    "chart": "chart",
+    "footer": "footer",
+}
+
+
+def _v5_first_slot_of_kind(skeleton: dict, kind: str, exclude_ids: set[str]) -> dict | None:
+    for s in skeleton.get("slots") or []:
+        if s.get("kind") == kind and s.get("id") not in exclude_ids:
+            return s
+    return None
+
+
+def _v5_build_slot_mapping(content: dict, skeleton: dict) -> tuple[dict, list[str]]:
+    """Map content keys to slot ids. Returns (mapping, unmapped_keys).
+    Unmapped keys = content the skeleton has no slot for.
+    """
+    mapping: dict = {}
+    used_ids: set[str] = set()
+    unmapped: list[str] = []
+    for key in content:
+        kind = _CONTENT_KEY_TO_KIND.get(key)
+        if kind is None:
+            unmapped.append(key)
+            continue
+        slot = _v5_first_slot_of_kind(skeleton, kind, used_ids)
+        if slot is None:
+            unmapped.append(key)
+            continue
+        mapping[key] = slot["id"]
+        used_ids.add(slot["id"])
+    return mapping, unmapped
+
+
+def _v5_check_slot_fit(content_value: Any, slot: dict) -> tuple[bool, str, Any]:
+    """Validates a content value against a slot. Returns (fits, reason,
+    headroom). Headroom shape depends on kind.
+    """
+    constraints = slot.get("constraints") or {}
+    kind = slot.get("kind")
+    if kind in ("heading", "paragraph", "footer"):
+        if isinstance(content_value, dict) and "value" in content_value:
+            content_value = content_value["value"]
+        return _v5_check_text_fit(str(content_value), constraints)
+    if kind == "bullets":
+        items = content_value if isinstance(content_value, list) else [content_value]
+        return _v5_check_bullets_fit(items, constraints)
+    if kind == "table":
+        if isinstance(content_value, dict):
+            return _v5_check_table_fit(content_value, constraints)
+        return False, "table value must be a dict {rows, cols, has_header}", {}
+    if kind == "chart":
+        # Light validation: just check series/categories counts if given.
+        if not isinstance(content_value, dict):
+            return False, "chart value must be a dict {series, categories, type}", {}
+        n_series = content_value.get("n_series") or len(content_value.get("series", []) or [])
+        n_cats = content_value.get("n_categories") or len(content_value.get("categories", []) or [])
+        max_series = constraints.get("max_series", 99)
+        max_cats = constraints.get("max_categories", 99)
+        if n_series > max_series:
+            return False, f"{n_series} series > max_series {max_series}", {}
+        if n_cats > max_cats:
+            return False, f"{n_cats} categories > max_categories {max_cats}", {}
+        return True, "", {"series": max_series - n_series, "categories": max_cats - n_cats}
+    if kind == "image":
+        # Image content is typically just an asset_id string; full fit
+        # check uses _v5_check_image_fit with the asset meta loaded.
+        # Here we only validate the value's shape — content fit happens
+        # in cmd_v5_check_asset_fit.
+        if isinstance(content_value, str) and content_value.startswith("asset_"):
+            return True, "", {}
+        if isinstance(content_value, dict) and "asset" in content_value:
+            return True, "", {}
+        return False, "image value must be 'asset_<id>' or {asset: ...}", {}
+    return True, f"unknown kind {kind!r} — passing through", {}
+
+
+def _v5_required_slots_filled(skeleton: dict, mapping: dict) -> list[str]:
+    """Return ids of required slots that are NOT in the mapping (i.e.
+    would be left empty by this content)."""
+    missing = []
+    mapped_ids = set(mapping.values())
+    for s in skeleton.get("slots") or []:
+        if (s.get("constraints") or {}).get("required") and s.get("id") not in mapped_ids:
+            missing.append(s.get("id"))
+    return missing
+
+
+def _v5_headroom_summary(content_value: Any, slot: dict) -> str:
+    """Human-friendly headroom string per kind. Used in match-skeletons."""
+    kind = slot.get("kind")
+    c = slot.get("constraints") or {}
+    if kind in ("heading", "paragraph", "footer"):
+        v = content_value["value"] if isinstance(content_value, dict) and "value" in content_value else content_value
+        if c.get("max_chars"):
+            return f"{c['max_chars'] - len(str(v))} chars to spare"
+    if kind == "bullets":
+        items = content_value if isinstance(content_value, list) else [content_value]
+        if c.get("max_items"):
+            return f"{c['max_items'] - len(items)} items to spare"
+    if kind == "table" and isinstance(content_value, dict):
+        if c.get("max_rows"):
+            return f"{c['max_rows'] - content_value.get('rows', 0)} rows to spare"
+    return ""
+
+
+# --- CLI command implementations -------------------------------------------
+
+
+def cmd_v5_list_themes(args: argparse.Namespace) -> None:
+    out = []
+    root = _v5_themes_dir()
+    if root.exists():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            t = _v5_load_yaml(d / "theme.yaml")
+            if not t:
+                continue
+            out.append({
+                "id": t.get("id"),
+                "palette": t.get("palette", {}),
+                "fonts": t.get("fonts", {}),
+                "decoration_count": len(t.get("decorations") or []),
+                "preview_path": str(d / "preview.png") if (d / "preview.png").exists() else None,
+            })
+    json.dump({"themes": out}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_list_skeletons(args: argparse.Namespace) -> None:
+    cats = set(args.category) if args.category else None
+    has_slot = set(args.has_slot) if args.has_slot else None
+    statuses = set(args.status) if args.status else {"pending", "done"}
+
+    out = []
+    for sk in _v5_iter_skeletons():
+        if sk.get("status", "pending") not in statuses:
+            continue
+        sk_cats = set(sk.get("categories") or [])
+        if cats and not (sk_cats & cats):
+            continue
+        sk_kinds = {s.get("kind") for s in (sk.get("slots") or [])}
+        if has_slot and not (sk_kinds & has_slot):
+            continue
+        sk_dir = _v5_skeletons_dir() / sk.get("id", "")
+        out.append({
+            "id": sk.get("id"),
+            "source_deck": sk.get("source_deck"),
+            "source_slide_index": sk.get("source_slide_index"),
+            "status": sk.get("status", "pending"),
+            "categories": sk.get("categories") or [],
+            "slot_count": len(sk.get("slots") or []),
+            "slot_kinds": sorted(sk_kinds),
+            "preview_path": str(sk_dir / "preview.png") if (sk_dir / "preview.png").exists() else None,
+        })
+    json.dump({"skeletons": out}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_get_skeleton(args: argparse.Namespace) -> None:
+    sk = _v5_load_skeleton(args.id)
+    if sk is None:
+        raise SystemExit(f"skeleton not found: {args.id}")
+    json.dump(sk, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_get_theme(args: argparse.Namespace) -> None:
+    t = _v5_load_theme(args.id)
+    if t is None:
+        raise SystemExit(f"theme not found: {args.id}")
+    json.dump(t, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_match_skeletons(args: argparse.Namespace) -> None:
+    try:
+        content = json.loads(args.content)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--content must be valid JSON: {e}")
+    if not isinstance(content, dict):
+        raise SystemExit("--content must be a JSON object")
+
+    filter_cats = set(args.category) if args.category else None
+    filter_has_slot = set(args.has_slot) if args.has_slot else None
+
+    candidates = []
+    # Track tightest constraint per content key across all candidates
+    # — used to drive the rephrase suggestion on zero-match.
+    tightest_per_key: dict[str, dict] = {}
+
+    for sk in _v5_iter_skeletons():
+        if sk.get("status") == "rejected":
+            continue
+        sk_cats = set(sk.get("categories") or [])
+        if filter_cats and not (sk_cats & filter_cats):
+            continue
+        sk_kinds = {s.get("kind") for s in (sk.get("slots") or [])}
+        if filter_has_slot and not (sk_kinds & filter_has_slot):
+            continue
+
+        mapping, unmapped_keys = _v5_build_slot_mapping(content, sk)
+        if unmapped_keys:
+            # Content key has no matching slot kind in this skeleton.
+            for key in unmapped_keys:
+                kind = _CONTENT_KEY_TO_KIND.get(key, key)
+                cur = tightest_per_key.get(key, {})
+                if "no_such_slot" not in cur:
+                    cur["no_such_slot"] = True
+                    cur["suggested_action"] = f"no skeleton offers a '{kind}' slot for content key '{key}'"
+                    tightest_per_key[key] = cur
+            continue
+
+        # Required-slot gate
+        missing = _v5_required_slots_filled(sk, mapping)
+        if missing:
+            continue
+
+        # Fit each content piece
+        all_fit = True
+        slot_headroom: dict = {}
+        slots_by_id = {s["id"]: s for s in (sk.get("slots") or [])}
+        for key, slot_id in mapping.items():
+            slot = slots_by_id[slot_id]
+            fits, reason, headroom = _v5_check_slot_fit(content[key], slot)
+            if not fits:
+                all_fit = False
+                # Track the tightest version of this constraint
+                cur = tightest_per_key.get(key, {})
+                c = slot.get("constraints") or {}
+                if slot.get("kind") in ("heading", "paragraph", "footer"):
+                    your_len = len(str(content[key] if not isinstance(content[key], dict) else content[key].get("value", "")))
+                    constraint = c.get("max_chars", 0)
+                    if "tightest_constraint" not in cur or constraint < cur["tightest_constraint"]:
+                        cur.update({
+                            "slot": key, "your_value": str(content[key])[:80],
+                            "your_length": your_len, "tightest_constraint": constraint,
+                            "suggested_action": f"rephrase to ≤{constraint} chars (drop {your_len - constraint})",
+                        })
+                        tightest_per_key[key] = cur
+                elif slot.get("kind") == "bullets":
+                    items = content[key] if isinstance(content[key], list) else [content[key]]
+                    n = len(items)
+                    constraint = c.get("max_items", 0)
+                    if "tightest_constraint" not in cur or constraint < cur["tightest_constraint"]:
+                        cur.update({
+                            "slot": key, "your_count": n, "tightest_constraint": constraint,
+                            "suggested_action": f"consolidate to ≤{constraint} items",
+                        })
+                        tightest_per_key[key] = cur
+                break  # one issue per skeleton is enough
+            slot_headroom[slot_id] = _v5_headroom_summary(content[key], slot)
+
+        if not all_fit:
+            continue
+
+        # Compute fit_score
+        tightness_scores = []
+        for key, slot_id in mapping.items():
+            slot = slots_by_id[slot_id]
+            c = slot.get("constraints") or {}
+            value = content[key]
+            if slot.get("kind") in ("heading", "paragraph", "footer"):
+                v = value["value"] if isinstance(value, dict) and "value" in value else value
+                m = c.get("max_chars") or len(str(v))
+                if m > 0:
+                    tightness_scores.append(min(1.0, len(str(v)) / m))
+            elif slot.get("kind") == "bullets":
+                items = value if isinstance(value, list) else [value]
+                m = c.get("max_items") or len(items)
+                if m > 0:
+                    tightness_scores.append(min(1.0, len(items) / m))
+        tightness = sum(tightness_scores) / len(tightness_scores) if tightness_scores else 0.5
+
+        cat_bonus = 0.10 if filter_cats and (sk_cats & filter_cats) else 0
+        extra_slots = max(0, len(sk.get("slots") or []) - len(mapping))
+        extra_bonus = min(0.20, 0.05 * extra_slots)
+
+        fit_score = min(1.0, tightness * 0.70 + cat_bonus + extra_bonus)
+
+        candidates.append({
+            "skeleton_id": sk["id"],
+            "categories": list(sk_cats),
+            "fit_score": round(fit_score, 3),
+            "slot_mapping": mapping,
+            "headroom": slot_headroom,
+        })
+
+    candidates.sort(key=lambda c: c["fit_score"], reverse=True)
+
+    if candidates:
+        result = {"matches": candidates, "issues": []}
+    else:
+        result = {"matches": [], "issues": list(tightest_per_key.values())}
+
+    json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_validate_plan(args: argparse.Namespace) -> None:
+    plan_path = Path(args.plan)
+    if not plan_path.exists():
+        raise SystemExit(f"plan not found: {plan_path}")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan, list):
+        raise SystemExit("plan must be a JSON array")
+
+    errors: list[dict] = []
+    warnings: list[dict] = []
+
+    for i, entry in enumerate(plan):
+        sk_id = entry.get("skeleton_id")
+        sk = _v5_load_skeleton(sk_id) if sk_id else None
+        if sk is None:
+            errors.append({
+                "slide_index": i, "slot_id": None,
+                "violation": "skeleton_not_found",
+                "message": f"no skeleton with id {sk_id!r}",
+            })
+            continue
+        slots_by_id = {s["id"]: s for s in (sk.get("slots") or [])}
+        filled = entry.get("slots") or {}
+
+        # Required slots
+        for slot in sk.get("slots") or []:
+            if (slot.get("constraints") or {}).get("required") and slot["id"] not in filled:
+                errors.append({
+                    "slide_index": i, "slot_id": slot["id"],
+                    "violation": "required_unfilled",
+                    "message": f"required slot {slot['id']!r} not in plan",
+                })
+
+        # Constraint checks on filled slots
+        for slot_id, value in filled.items():
+            slot = slots_by_id.get(slot_id)
+            if slot is None:
+                errors.append({
+                    "slide_index": i, "slot_id": slot_id,
+                    "violation": "unknown_slot",
+                    "message": f"slot {slot_id!r} not in skeleton {sk_id!r}",
+                })
+                continue
+            is_overflow_shrink = isinstance(value, dict) and value.get("overflow") == "shrink"
+            inner = value.get("value", value) if isinstance(value, dict) else value
+            fits, reason, _ = _v5_check_slot_fit(inner, slot)
+            if not fits:
+                if is_overflow_shrink:
+                    warnings.append({
+                        "slide_index": i, "slot_id": slot_id,
+                        "overflow_kind": "shrink", "message": reason,
+                    })
+                else:
+                    errors.append({
+                        "slide_index": i, "slot_id": slot_id,
+                        "violation": "constraint", "message": reason,
+                    })
+
+    result = {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
+    json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_check_asset_fit(args: argparse.Namespace) -> None:
+    sk = _v5_load_skeleton(args.skeleton_id)
+    if sk is None:
+        raise SystemExit(f"skeleton not found: {args.skeleton_id}")
+    slot = next((s for s in (sk.get("slots") or []) if s.get("id") == args.slot_id), None)
+    if slot is None:
+        raise SystemExit(f"slot {args.slot_id!r} not in {args.skeleton_id}")
+    if slot.get("kind") != "image":
+        json.dump({
+            "fits": False, "will_resize_to": None, "will_crop": False,
+            "reason": f"slot is kind={slot.get('kind')!r}, not image",
+            "suggestion": "pick an image slot or change the slot kind",
+        }, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return
+    meta = _v5_load_asset_meta(args.asset_id) or {}
+    fits, reason, transform = _v5_check_image_fit(meta, slot.get("constraints") or {})
+    result = {
+        "fits": fits,
+        "will_resize_to": None,
+        "will_crop": transform.get("will_crop", False),
+        "reason": reason or None,
+        "suggestion": ("would crop to slot aspect" if transform.get("will_crop") else None) if not fits else None,
+    }
+    json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_v5_measure_text(args: argparse.Namespace) -> None:
+    if args.array:
+        try:
+            items = json.loads(args.array)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--array must be valid JSON: {e}")
+        text = "\n".join(str(x) for x in items)
+        n_items = len(items)
+    else:
+        text = args.text or ""
+        n_items = 1
+    chars = len(text)
+    words = len(text.split())
+    lines = text.count("\n") + 1
+    out: dict = {"chars": chars, "words": words, "lines_est": lines}
+    if args.array:
+        out["items"] = n_items
+    if args.against:
+        try:
+            sk_id, slot_id = args.against.split(".", 1)
+        except ValueError:
+            raise SystemExit("--against must be '<skeleton_id>.<slot_id>'")
+        sk = _v5_load_skeleton(sk_id)
+        if sk is None:
+            raise SystemExit(f"skeleton not found: {sk_id}")
+        slot = next((s for s in (sk.get("slots") or []) if s.get("id") == slot_id), None)
+        if slot is None:
+            raise SystemExit(f"slot {slot_id!r} not in {sk_id}")
+        c = slot.get("constraints") or {}
+        if args.array:
+            fits, reason, hr = _v5_check_bullets_fit(items, c)
+            out["fits"] = fits
+            out["headroom"] = f"{hr['items']} items to spare" if fits else reason
+        else:
+            fits, reason, hr_chars = _v5_check_text_fit(text, c)
+            out["fits"] = fits
+            out["headroom"] = (f"{hr_chars} chars to spare" if fits
+                               else f"{abs(hr_chars)} chars over (max {c.get('max_chars')})")
+    json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+# ===========================================================================
 # Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="reader.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_list = sub.add_parser("list", help="List templates + assets (optionally filtered).")
+    # --- v4 ---
+    p_list = sub.add_parser("list", help="List templates + assets (optionally filtered). [v4]")
     p_list.add_argument("--filter", default=None, help="comma-separated key=value pairs")
     p_list.set_defaults(func=cmd_list)
 
-    p_get = sub.add_parser("get", help="Get one template or asset by id.")
+    p_get = sub.add_parser("get", help="Get one template or asset by id. [v4]")
     p_get.add_argument("id")
     p_get.set_defaults(func=cmd_get)
 
-    p_compose = sub.add_parser("compose", help="Compose a deck from a JSON plan.")
+    p_compose = sub.add_parser("compose", help="Compose a deck from a JSON plan. [v4]")
     p_compose.add_argument("plan")
     p_compose.add_argument("out")
     p_compose.set_defaults(func=cmd_compose)
+
+    # --- v5 (read-side; phase D) ---
+    p_lt = sub.add_parser("list-themes", help="List v5 themes.")
+    p_lt.set_defaults(func=cmd_v5_list_themes)
+
+    p_ls = sub.add_parser("list-skeletons", help="List v5 skeletons (filterable).")
+    p_ls.add_argument("--category", action="append", default=None,
+                      help="filter by category (repeatable; any-match)")
+    p_ls.add_argument("--has-slot", action="append", default=None,
+                      help="filter by slot kind present (repeatable; any-match)")
+    p_ls.add_argument("--status", action="append", default=None,
+                      help="status filter (pending/done/rejected; default excludes rejected)")
+    p_ls.set_defaults(func=cmd_v5_list_skeletons)
+
+    p_gs = sub.add_parser("get-skeleton", help="Get one v5 skeleton by id.")
+    p_gs.add_argument("id")
+    p_gs.set_defaults(func=cmd_v5_get_skeleton)
+
+    p_gt = sub.add_parser("get-theme", help="Get one v5 theme by id.")
+    p_gt.add_argument("id")
+    p_gt.set_defaults(func=cmd_v5_get_theme)
+
+    p_ms = sub.add_parser("match-skeletons",
+                          help="Content-first ranked match. Returns matches or rephrase issues.")
+    p_ms.add_argument("--content", required=True, help="JSON content dict")
+    p_ms.add_argument("--category", action="append", default=None)
+    p_ms.add_argument("--has-slot", action="append", default=None)
+    p_ms.set_defaults(func=cmd_v5_match_skeletons)
+
+    p_vp = sub.add_parser("validate-plan",
+                          help="Pre-build constraint check on a full plan.")
+    p_vp.add_argument("plan")
+    p_vp.set_defaults(func=cmd_v5_validate_plan)
+
+    p_cf = sub.add_parser("check-asset-fit",
+                          help="Does this asset fit this skeleton slot?")
+    p_cf.add_argument("asset_id")
+    p_cf.add_argument("skeleton_id")
+    p_cf.add_argument("slot_id")
+    p_cf.set_defaults(func=cmd_v5_check_asset_fit)
+
+    p_mt = sub.add_parser("measure-text",
+                          help="Char/word/line counts; optional fit against a slot.")
+    p_mt.add_argument("text", nargs="?", default=None)
+    p_mt.add_argument("--array", default=None, help="JSON array of items (for bullets)")
+    p_mt.add_argument("--against", default=None, help="<skeleton_id>.<slot_id>")
+    p_mt.set_defaults(func=cmd_v5_measure_text)
 
     args = parser.parse_args(argv)
     args.func(args)
