@@ -1469,6 +1469,26 @@ _CONTENT_KEY_TO_KIND = {
     "footer": "footer",
 }
 
+# v5.1 — role preference in slot mapping. When the agent uses a content
+# key that names a role, prefer slots with matching role over first-of-kind.
+# Flip _V5_ENABLE_ROLE_MATCHING to False to disable purely on the reader
+# side without touching the ingest output.
+_V5_ENABLE_ROLE_MATCHING = True
+
+_CONTENT_KEY_TO_ROLE = {
+    "title": "page_title",
+    "page_title": "page_title",
+    "subtitle": "subtitle",
+    "body": "body",
+    "footer": "footer",
+    "footnote": "footnote",
+    "caption": "caption",
+    "key_points": "key_points",
+    "detailed_list": "detailed_list",
+    "cta": "cta",
+    "section_header": "section_header",
+}
+
 
 def _v5_first_slot_of_kind(skeleton: dict, kind: str, exclude_ids: set[str]) -> dict | None:
     for s in skeleton.get("slots") or []:
@@ -1477,19 +1497,33 @@ def _v5_first_slot_of_kind(skeleton: dict, kind: str, exclude_ids: set[str]) -> 
     return None
 
 
+def _v5_first_slot_by_role(skeleton: dict, role: str, exclude_ids: set[str]) -> dict | None:
+    for s in skeleton.get("slots") or []:
+        if s.get("role") == role and s.get("id") not in exclude_ids:
+            return s
+    return None
+
+
 def _v5_build_slot_mapping(content: dict, skeleton: dict) -> tuple[dict, list[str]]:
     """Map content keys to slot ids. Returns (mapping, unmapped_keys).
     Unmapped keys = content the skeleton has no slot for.
+
+    Preference order:
+    1. Role match (when _V5_ENABLE_ROLE_MATCHING and the content key
+       names a role and the skeleton has a slot with that role)
+    2. First slot of matching kind (legacy behaviour)
     """
     mapping: dict = {}
     used_ids: set[str] = set()
     unmapped: list[str] = []
     for key in content:
-        kind = _CONTENT_KEY_TO_KIND.get(key)
-        if kind is None:
-            unmapped.append(key)
-            continue
-        slot = _v5_first_slot_of_kind(skeleton, kind, used_ids)
+        target_kind = _CONTENT_KEY_TO_KIND.get(key)
+        target_role = _CONTENT_KEY_TO_ROLE.get(key) if _V5_ENABLE_ROLE_MATCHING else None
+        slot = None
+        if target_role is not None:
+            slot = _v5_first_slot_by_role(skeleton, target_role, used_ids)
+        if slot is None and target_kind is not None:
+            slot = _v5_first_slot_of_kind(skeleton, target_kind, used_ids)
         if slot is None:
             unmapped.append(key)
             continue

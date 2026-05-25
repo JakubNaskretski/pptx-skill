@@ -3966,6 +3966,39 @@ def api_v5_set_overlap_decision(skeleton_id):
     return jsonify({"ok": True, "overlap_decision": decision, "status": data["status"]})
 
 
+_V5_VALID_ROLES = frozenset({
+    "page_title", "subtitle", "body", "footer", "date", "page_number",
+    "footnote", "caption", "key_points", "detailed_list", "cta",
+    "byline", "kpi_label", "kpi_value", "section_header",
+})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/slot/<slot_id>/role")
+def api_v5_set_slot_role(skeleton_id, slot_id):
+    """Set or clear the `role` on a slot. role=null removes the field
+    (slot falls back to id/kind-based matching). Stamps user_edited
+    so re-ingest doesn't blow away the override.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_role = payload.get("role")
+    if new_role is not None and new_role not in _V5_VALID_ROLES:
+        return jsonify({"error": f"role must be null or one of {sorted(_V5_VALID_ROLES)}"}), 400
+    slots = data.get("slots") or []
+    target = next((s for s in slots if s.get("id") == slot_id), None)
+    if target is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    if new_role is None:
+        target.pop("role", None)
+    else:
+        target["role"] = new_role
+    target["user_edited"] = True
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "role": new_role})
+
+
 @app.post("/api/v5/skeleton/<skeleton_id>/slot/<slot_id>/kind")
 def api_v5_reclassify_slot_kind(skeleton_id, slot_id):
     """Change a slot's kind in-place. Resets constraints to defaults
@@ -4288,6 +4321,12 @@ V5_HTML = r"""<!doctype html>
     .kind-btn.active:hover { background: #1e88e5; color: white; border-color: #1565c0; }
     .user-edited-flag { color: #1565c0; font-size: 10px; font-style: italic;
                          margin-left: 6px; }
+    .role-badge { display: inline-block; font-size: 10px; padding: 1px 6px;
+                  background: #ede7f6; color: #5e35b1; border-radius: 8px;
+                  font-family: ui-monospace, monospace; margin-left: 6px;
+                  cursor: pointer; }
+    .role-badge:hover { background: #d1c4e9; }
+    .role-badge.unset { background: #f5f5f5; color: #999; }
     .excerpt { font-size: 12px; color: #444; margin-bottom: 6px;
                font-style: italic; word-break: break-word; line-height: 1.4; }
     .constraints { font-size: 11px; color: #666;
@@ -4337,6 +4376,9 @@ V5_HTML = r"""<!doctype html>
                    font-size: 10px; cursor: pointer; border-radius: 3px;
                    font-family: ui-monospace, monospace; color: #333; }
     .promote-btn:hover { background: #1e88e5; color: white; border-color: #1565c0; }
+
+    /* Belt-and-suspenders: hide v4 debug-floater if it leaks in. */
+    .dbg-floater { display: none !important; }
   </style>
 </head>
 <body>
@@ -4361,6 +4403,9 @@ V5_HTML = r"""<!doctype html>
 
   <script>
     const KIND_LIST = ['heading', 'paragraph', 'bullets', 'table', 'chart', 'image', 'footer'];
+    const ROLE_LIST = ['(none)', 'page_title', 'subtitle', 'body', 'footer', 'date',
+      'page_number', 'footnote', 'caption', 'key_points', 'detailed_list',
+      'cta', 'byline', 'kpi_label', 'kpi_value', 'section_header'];
 
     async function loadSkeletons() {
       const r = await fetch('/api/v5/skeletons');
@@ -4527,9 +4572,15 @@ V5_HTML = r"""<!doctype html>
                      onclick="demoteSlot('${sk.id}', '${escapeHtml(slot.id)}', ${JSON.stringify(slot.sha || null)})"
                      title="Move this slot back to unmapped decoration">demote</button>`
           : '';
+        const roleLabel = slot.role || 'no role';
+        const roleClass = slot.role ? '' : 'unset';
+        const roleBadge = `<span class="role-badge ${roleClass}" title="Click to change role"
+                                  onclick="changeRole('${sk.id}', '${escapeHtml(slot.id)}', '${escapeHtml(slot.role || '')}')">
+                              ${escapeHtml(roleLabel)}
+                           </span>`;
         return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
           <div class="slot-head">
-            <span class="slot-id">${escapeHtml(slot.id)}${editedFlag}${demoteBtn}</span>
+            <span class="slot-id">${escapeHtml(slot.id)}${roleBadge}${editedFlag}${demoteBtn}</span>
             <span class="kind-btns">${kindBtns}</span>
           </div>
           ${slot.source_excerpt ? `<div class="excerpt">${escapeHtml(slot.source_excerpt)}</div>` : ''}
@@ -4663,6 +4714,21 @@ V5_HTML = r"""<!doctype html>
         body: JSON.stringify({kind})
       });
       if (!r.ok) { alert('Reclassify failed: ' + (await r.text())); return; }
+      await refreshCurrent(id);
+    }
+
+    async function changeRole(id, slot_id, currentRole) {
+      const prompt_text = "Set slot role (blank = clear). Allowed:\n" +
+        ROLE_LIST.slice(1).join(', ');
+      const answer = window.prompt(prompt_text, currentRole || '');
+      if (answer === null) return;  // cancelled
+      const new_role = answer.trim() === '' ? null : answer.trim();
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/slot/${encodeURIComponent(slot_id)}/role`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({role: new_role})
+      });
+      if (!r.ok) { alert('Role update failed: ' + (await r.text())); return; }
       await refreshCurrent(id);
     }
 

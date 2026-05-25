@@ -417,6 +417,101 @@ class TestValidatePlan(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# v5.1 — slot role inference + role-aware match-skeletons
+# ---------------------------------------------------------------------------
+
+
+class TestSlotRoleInference(unittest.TestCase):
+    def test_title_placeholder_gets_page_title_role(self):
+        prs = make_title_body_deck(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = ingest_v5.digest_skeleton(
+                prs.slides[0], prs.slide_width, prs.slide_height,
+                "deck", 1, stub_theme_v4(), Path(tmp),
+            )
+        title = next(s for s in out["slots"] if s["kind"] == "heading")
+        self.assertEqual(title.get("role"), "page_title")
+
+    def test_body_placeholder_with_short_bullets_is_key_points(self):
+        prs = make_title_body_deck(1)
+        # Default body has 2 short bullets → key_points (≤4 items, ≤60 chars/item)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = ingest_v5.digest_skeleton(
+                prs.slides[0], prs.slide_width, prs.slide_height,
+                "deck", 1, stub_theme_v4(), Path(tmp),
+            )
+        body = next((s for s in out["slots"] if s["kind"] == "bullets"), None)
+        self.assertIsNotNone(body)
+        self.assertEqual(body.get("role"), "key_points")
+
+    def test_revert_flag_disables_inference(self):
+        prs = make_title_body_deck(1)
+        with mock.patch.object(ingest_v5, "_ENABLE_SLOT_ROLES", False):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = ingest_v5.digest_skeleton(
+                    prs.slides[0], prs.slide_width, prs.slide_height,
+                    "deck", 1, stub_theme_v4(), Path(tmp),
+                )
+        for slot in out["slots"]:
+            self.assertNotIn("role", slot,
+                             "role must not be emitted when _ENABLE_SLOT_ROLES=False")
+
+
+class TestRoleAwareMatching(unittest.TestCase):
+    """match-skeletons prefers role match over first-of-kind when both
+    fire. So if a content key names a role and the skeleton has a slot
+    with that role, that slot is picked even if an earlier slot of the
+    same kind exists.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        (root / "themes").mkdir()
+        (root / "skeletons" / "sk_01").mkdir(parents=True)
+        # Skeleton with two heading slots: first is "section_header",
+        # second is "page_title". Without role-matching, "title" content
+        # would pick the first (section_header). With role-matching,
+        # it picks the second.
+        (root / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+            "id: sk_01\n"
+            "source_deck: synth\n"
+            "source_slide_index: 1\n"
+            "status: pending\n"
+            "categories: [content]\n"
+            "slots:\n"
+            "  - id: header_a\n"
+            "    kind: heading\n"
+            "    role: section_header\n"
+            "    geometry: {x: 0.05, y: 0.05, w: 0.9, h: 0.1}\n"
+            "    constraints: {max_chars: 30, required: false}\n"
+            "  - id: title_b\n"
+            "    kind: heading\n"
+            "    role: page_title\n"
+            "    geometry: {x: 0.05, y: 0.2, w: 0.9, h: 0.15}\n"
+            "    constraints: {max_chars: 60, required: true}\n",
+        )
+        self._patcher = mock.patch.object(reader_mod, "_v5_bundle_root",
+                                          return_value=root)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmpdir.cleanup()
+
+    def test_title_content_key_picks_page_title_role(self):
+        out = _capture_stdout(
+            reader_mod.cmd_v5_match_skeletons,
+            _StubArgs(content='{"title": "Q4 results"}',
+                      category=None, has_slot=None),
+        )
+        self.assertEqual(len(out["matches"]), 1)
+        # "title" content key → page_title role → title_b slot,
+        # not header_a (which is the first heading-kind slot)
+        self.assertEqual(out["matches"][0]["slot_mapping"]["title"], "title_b")
+
+
+# ---------------------------------------------------------------------------
 # Aspect-aware image crop (compose-v5 _v5_place_image)
 # ---------------------------------------------------------------------------
 

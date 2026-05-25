@@ -336,6 +336,28 @@ def _picture_sha(shape) -> str | None:
 
 
 _FEATURED_SIZE_MULTIPLIER = 2.0  # >= 2x median area = treat as featured slot
+
+
+# ---------------------------------------------------------------------------
+# v5.1 — slot role auto-inference (REVERTIBLE)
+#
+# Flip _ENABLE_SLOT_ROLES to False to disable role inference entirely:
+# - digest_skeleton stops emitting `role` on slots
+# - any existing `role` fields in workspace skeleton.yaml become inert
+# - reader.py / app.py can keep their role-aware paths; they'll just
+#   see no roles to match and fall through to id/kind defaults
+#
+# Use case for the revert: real deck ingest produces wrong roles
+# often enough that the agent picks badly. Easier to ship a flag
+# than rip out the code mid-refactor.
+# ---------------------------------------------------------------------------
+_ENABLE_SLOT_ROLES = True
+
+_VALID_SLOT_ROLES = frozenset({
+    "page_title", "subtitle", "body", "footer", "date", "page_number",
+    "footnote", "caption", "key_points", "detailed_list", "cta",
+    "byline", "kpi_label", "kpi_value", "section_header",
+})
                                  # even if SHA is repeated deck-wide
 
 
@@ -517,6 +539,10 @@ def _extract_slots(
         )
         if slot is not None:
             slot["shape_id"] = shape.shape_id
+            if _ENABLE_SLOT_ROLES:
+                role = _infer_slot_role(shape, slot, slide_w, slide_h)
+                if role:
+                    slot["role"] = role
             slots.append(slot)
             consumed_shape_ids.add(shape.shape_id)
 
@@ -533,9 +559,91 @@ def _extract_slots(
         )
         if slot is not None:
             slot["shape_id"] = shape.shape_id
+            if _ENABLE_SLOT_ROLES:
+                role = _infer_slot_role(shape, slot, slide_w, slide_h)
+                if role:
+                    slot["role"] = role
             slots.append(slot)
 
     return slots
+
+
+# ---------------------------------------------------------------------------
+# v5.1 — slot role inference (REVERTIBLE; gated by _ENABLE_SLOT_ROLES)
+# ---------------------------------------------------------------------------
+
+
+def _infer_slot_role(shape, slot: dict, slide_w: int, slide_h: int) -> str | None:
+    """Derive a `role` for a slot from placeholder type + geometry +
+    style. Returns None when uncertain (agent falls back to id/kind).
+
+    Placeholder types are the strong signal (deterministic). Free
+    shapes get a heuristic role based on geometry/style/content shape.
+    The agent treats role as a hint, not a hard constraint — match-
+    skeletons prefers role match when available but doesn't require it.
+    """
+    # Strong signal: PowerPoint placeholder type
+    if getattr(shape, "is_placeholder", False):
+        try:
+            ph_type = shape.placeholder_format.type
+        except (AttributeError, ValueError):
+            ph_type = None
+        if ph_type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+            return "page_title"
+        if ph_type == PP_PLACEHOLDER.SUBTITLE:
+            return "subtitle"
+        if ph_type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT):
+            kind = slot.get("kind")
+            if kind == "bullets":
+                # Quick / detailed split based on item count + length
+                c = slot.get("constraints") or {}
+                items = c.get("max_items", 0)
+                avg_chars = c.get("max_chars_per_item", 0)
+                if items <= 4 and avg_chars <= 60:
+                    return "key_points"
+                return "detailed_list"
+            return "body"
+        if ph_type == PP_PLACEHOLDER.FOOTER:
+            return "footer"
+        if ph_type == PP_PLACEHOLDER.DATE:
+            return "date"
+        if ph_type == PP_PLACEHOLDER.SLIDE_NUMBER:
+            return "page_number"
+        if ph_type == PP_PLACEHOLDER.PICTURE:
+            return None  # picture placeholders have no semantic sub-role
+
+    # Heuristic for free shapes (no placeholder type to consult).
+    kind = slot.get("kind")
+    g = slot.get("geometry") or {}
+    style = slot.get("style") or {}
+
+    if kind == "heading":
+        # Large at top → page_title; smaller at top → section_header
+        size = style.get("size_pt", 0)
+        if g.get("y", 1.0) < 0.15:
+            return "page_title" if size >= 28 else "section_header"
+    if kind == "paragraph":
+        # Small + near bottom → footnote
+        size = style.get("size_pt", 100)
+        if size < 12 and g.get("y", 0) > 0.85:
+            return "footnote"
+        # Short paragraph below an image area → caption (heuristic)
+        c = slot.get("constraints") or {}
+        if c.get("max_chars", 999) < 80:
+            return "caption"
+        return "body"
+    if kind == "bullets":
+        c = slot.get("constraints") or {}
+        items = c.get("max_items", 0)
+        avg_chars = c.get("max_chars_per_item", 0)
+        if items <= 4 and avg_chars <= 60:
+            return "key_points"
+        return "detailed_list"
+    if kind == "footer":
+        return "footer"
+    if kind == "image":
+        return None  # images have no semantic sub-role beyond kind
+    return None
 
 
 # ---------------------------------------------------------------------------
