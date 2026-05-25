@@ -299,6 +299,7 @@ def digest_skeleton(
     slots = _extract_slots(
         slide, slide_w, slide_h, palette_v4, palette_v5, theme_fonts,
     )
+    overlap_info = _detect_overlap_candidates(slide, slide_w, slide_h, slots)
 
     # Preserve existing descriptive fields on re-ingest so user
     # categorisation isn't blown away. Status is preserved too — if
@@ -317,6 +318,9 @@ def digest_skeleton(
         "background_image": None,
         "slots": slots,
     }
+    if overlap_info:
+        out["digest_warnings"] = overlap_info["warnings"]
+        out["overlap_candidates"] = overlap_info["candidates"]
     _write_yaml(skeleton_dir / "skeleton.yaml", out)
 
     if v4_preview_path and v4_preview_path.exists():
@@ -426,6 +430,86 @@ def _slot_from_free_shape(
     # Freeforms / auto-shapes / connectors / groups — conscious drop
     # per REDESIGN.md. B4 may rescue some as frozen background.
     return None
+
+
+# ---------------------------------------------------------------------------
+# B4-detect — Overlap detection (no rendering yet)
+#
+# EXPERIMENTAL per REDESIGN.md. Detects only — does not modify the
+# slot inventory or render a background.png. Flags slides where a
+# large picture sits under text shapes, indicating a structural
+# illustration (chain diagram, process flow) that the agent shouldn't
+# blindly swap. User reviews flagged slides in C1 and decides via
+# C2 controls (future) whether to freeze-as-background, override
+# (treat as image slot), or reject.
+#
+# Kept in the same module as the rest of v5 ingest so removal is one
+# delete, not a refactor. To disable: comment out the call site in
+# digest_skeleton; nothing else depends on overlap_candidates yet.
+# ---------------------------------------------------------------------------
+
+
+def _detect_overlap_candidates(slide, slide_w: int, slide_h: int, slots: list[dict]) -> dict:
+    """Find pictures whose bbox overlaps text slots — candidate frozen
+    backgrounds. Returns {} when nothing flagged so the field is omitted
+    from skeleton.yaml on clean slides.
+
+    Heuristic: a picture is a candidate if (a) it covers ≥15% of slide
+    area AND (b) ≥50% of at least one text slot's bbox area sits inside
+    the picture's bbox. The 50%/15% thresholds are from REDESIGN.md
+    and intentionally conservative — false positives are worse than
+    missed detections for the user-review flow.
+    """
+    if not slots:
+        return {}
+
+    text_kinds = {"heading", "paragraph", "bullets", "footer"}
+    text_slot_bboxes = []
+    for s in slots:
+        if s.get("kind") not in text_kinds:
+            continue
+        g = s.get("geometry") or {}
+        x1, y1 = g.get("x", 0.0), g.get("y", 0.0)
+        x2, y2 = x1 + g.get("w", 0.0), y1 + g.get("h", 0.0)
+        text_slot_bboxes.append((s["id"], x1, y1, x2, y2))
+
+    if not text_slot_bboxes:
+        return {}
+
+    candidates: list[dict] = []
+    for shape in list(slide.shapes):
+        if not _shape_is_picture(shape):
+            continue
+        if getattr(shape, "is_placeholder", False):
+            continue
+        if _area_fraction(shape, slide_w, slide_h) < 0.15:
+            continue
+
+        g = _fractional_geometry(shape, slide_w, slide_h)
+        px1, py1 = g["x"], g["y"]
+        px2, py2 = px1 + g["w"], py1 + g["h"]
+
+        overlapping = []
+        for slot_id, tx1, ty1, tx2, ty2 in text_slot_bboxes:
+            ix1, iy1 = max(px1, tx1), max(py1, ty1)
+            ix2, iy2 = min(px2, tx2), min(py2, ty2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            intersect_area = (ix2 - ix1) * (iy2 - iy1)
+            text_area = (tx2 - tx1) * (ty2 - ty1)
+            if text_area > 0 and intersect_area / text_area >= 0.50:
+                overlapping.append(slot_id)
+
+        if overlapping:
+            candidates.append({
+                "picture_shape_id": shape.shape_id,
+                "picture_geometry": g,
+                "overlapping_slot_ids": overlapping,
+            })
+
+    if not candidates:
+        return {}
+    return {"warnings": ["overlap_detected"], "candidates": candidates}
 
 
 # ---------------------------------------------------------------------------
