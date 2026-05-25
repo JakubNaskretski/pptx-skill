@@ -529,9 +529,98 @@ def _slot_from_free_shape(
                 # else fall through — featured instance, treat as slot
         if _is_image_slot_worthy(shape, slide_w, slide_h):
             return _slot_image(shape, slide_w, slide_h, used_ids, slot_id_base="hero")
+    # Free text boxes (TEXT_BOX shape type, or any non-placeholder with
+    # a non-empty text_frame). Designer-dropped captions, body
+    # paragraphs, annotations.
+    if _shape_has_meaningful_text(shape):
+        return _slot_from_free_text(
+            shape, slide_w, slide_h, palette_v4, palette_v5, theme_fonts, used_ids,
+        )
     # Freeforms / auto-shapes / connectors / groups — conscious drop
     # per REDESIGN.md. B4 may rescue some as frozen background.
     return None
+
+
+def _shape_has_meaningful_text(shape) -> bool:
+    """True if shape has a text_frame with non-empty text. Skips
+    shapes that have a frame but no content (decorative auto-shapes
+    that happen to expose has_text_frame).
+    """
+    try:
+        if not getattr(shape, "has_text_frame", False):
+            return False
+        return bool((shape.text_frame.text or "").strip())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _slot_from_free_text(
+    shape, slide_w: int, slide_h: int,
+    palette_v4: dict, palette_v5: dict, theme_fonts: dict,
+    used_ids: set[str],
+) -> dict:
+    """Build a slot from a non-placeholder text shape (TEXT_BOX or
+    auto-shape with text). Mirrors the placeholder-text logic but
+    infers kind from content shape since there's no PH type to
+    consult.
+    """
+    tf = shape.text_frame
+    text = tf.text or ""
+    paras = list(getattr(tf, "paragraphs", []) or [])
+    non_empty = [p for p in paras if (p.text or "").strip()]
+
+    # Pull first-run size to inform kind inference: large + short =
+    # heading; otherwise paragraph or bullets per paragraph count.
+    size_pt = 0.0
+    try:
+        runs = list(getattr(paras[0], "runs", []) or [])
+        if runs and runs[0].font.size is not None:
+            size_pt = float(runs[0].font.size.pt)
+    except (AttributeError, ValueError, IndexError):
+        pass
+
+    if len(non_empty) > 1:
+        kind = "bullets"
+        base_id = "body"
+    elif len(text) <= 80 and size_pt >= 24:
+        kind = "heading"
+        base_id = "heading"
+    else:
+        kind = "paragraph"
+        base_id = "body"
+
+    # Style — pass ph_type=None; _resolve_font_role falls back to
+    # minor for non-title placeholders, which is right for free text.
+    style = _extract_style(shape, None, palette_v4, palette_v5, theme_fonts)
+    geometry = _fractional_geometry(shape, slide_w, slide_h)
+    required = _is_required(shape, slide_w, slide_h, True)
+
+    if kind == "bullets":
+        item_lens = [len((p.text or "").strip()) for p in non_empty]
+        longest = max(item_lens) if item_lens else 0
+        constraints = {
+            "max_items": max(1, len(non_empty)),
+            "max_chars_per_item": max(20, int(longest * 1.5)) if longest else 80,
+            "required": required,
+        }
+        items = [(p.text or "").strip() for p in non_empty[:3]]
+        excerpt = _truncate(" / ".join(f"• {it}" for it in items), 80)
+    else:
+        constraints = {
+            "max_chars": max(20, int(len(text) * 1.5)) if text else 60,
+            "max_lines": max(1, len(non_empty) or 1),
+            "required": required,
+        }
+        excerpt = _truncate(text.strip(), 80) if text else ""
+
+    return {
+        "id": _unique(base_id, used_ids),
+        "kind": kind,
+        "geometry": geometry,
+        "style": style,
+        "constraints": constraints,
+        "source_excerpt": excerpt,
+    }
 
 
 # ---------------------------------------------------------------------------
