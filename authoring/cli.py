@@ -2332,6 +2332,161 @@ def build(allow_pending: bool, out_path: Path | None, no_brand: bool) -> None:
     )
 
 
+# --- v5 build (additive) --------------------------------------------------
+
+
+@cli.command(name="build-v5")
+@click.option("--allow-pending", is_flag=True, default=True,
+              help="Build even if some skeletons are still pending (default: true).")
+@click.option("--out", "out_path", type=click.Path(path_type=Path), default=None,
+              help="Output zip path. Default: authoring/dist/skill-v5.zip")
+@click.option("--skill-md", "skill_md_path", type=click.Path(path_type=Path), default=None,
+              help="Override the SKILL.md path. Default: consumer/SKILL_v5.md")
+def build_v5(allow_pending: bool, out_path: Path | None, skill_md_path: Path | None) -> None:
+    """Emit a v5 skill bundle: themes/ + skeletons/ + assets/ + reader.py.
+
+    Bundle layout (sibling of reader.py inside the zip):
+      SKILL.md                      v5 agent contract
+      reader.py                     consumer + v5 read methods + compose-v5
+      requirements.txt
+      index.json                    skeleton + theme + asset summaries
+      themes/<id>/theme.yaml + master.pptx + preview.png?
+      skeletons/<id>/skeleton.yaml + preview.png? + background.png?
+      assets/<id>.<ext> + <id>.yaml
+    """
+    themes_root = WORKSPACE / "themes"
+    skeletons_root = WORKSPACE / "skeletons"
+    assets_root = WORKSPACE / "assets"
+
+    if not skeletons_root.exists() or not any(skeletons_root.iterdir()):
+        raise click.ClickException(
+            "no v5 skeletons in workspace; run `ingest` first"
+        )
+
+    # Collect skeletons (excluding rejected ones from the build).
+    skeletons: list[tuple[str, Path, dict]] = []
+    rejected = 0
+    pending = 0
+    for d in sorted(skeletons_root.iterdir()):
+        if not d.is_dir():
+            continue
+        sk_path = d / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        sk = read_yaml(sk_path)
+        status = sk.get("status", "pending")
+        if status == "rejected":
+            rejected += 1
+            continue
+        if status == "pending":
+            pending += 1
+        skeletons.append((sk["id"], d, sk))
+
+    if pending and not allow_pending:
+        raise click.ClickException(
+            f"{pending} skeleton(s) still pending — re-run with --allow-pending or "
+            "mark them done in /v5"
+        )
+
+    # Themes.
+    themes: list[tuple[str, Path, dict]] = []
+    if themes_root.exists():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir():
+                continue
+            t_path = d / "theme.yaml"
+            if not t_path.exists():
+                continue
+            t = read_yaml(t_path)
+            themes.append((t.get("id", d.name), d, t))
+
+    # Assets (v4 path; unchanged in v5).
+    asset_yamls = list(iter_asset_yamls())
+
+    DIST.mkdir(parents=True, exist_ok=True)
+    zip_path = out_path or (DIST / "skill-v5.zip")
+
+    reader_src = CONSUMER / "reader.py"
+    skill_md = skill_md_path or (CONSUMER / "SKILL_v5.md")
+    if not skill_md.exists():
+        # Fall back to v4 SKILL.md with a header note.
+        skill_md = CONSUMER / "SKILL.md"
+        click.echo(
+            f"warn: {(CONSUMER / 'SKILL_v5.md').name} missing — using v4 SKILL.md "
+            "(agent will see v4 contract, not v5; rerun once SKILL_v5.md exists)",
+            err=True,
+        )
+    consumer_reqs = CONSUMER / "requirements.txt"
+
+    # Build index.json — lightweight per-id summaries.
+    index = {
+        "version": 5,
+        "themes": [{"id": tid, "palette": t.get("palette", {}), "fonts": t.get("fonts", {})}
+                   for tid, _, t in themes],
+        "skeletons": [{
+            "id": sid,
+            "source_deck": sk.get("source_deck"),
+            "categories": sk.get("categories") or [],
+            "slot_count": len(sk.get("slots") or []),
+            "slot_kinds": sorted({s.get("kind") for s in (sk.get("slots") or [])}),
+            "status": sk.get("status", "pending"),
+        } for sid, _, sk in skeletons],
+        "assets": [
+            {"id": d.get("id"), "kind": d.get("kind"), "subject": d.get("subject", "")}
+            for d in (read_yaml(p) for p in asset_yamls)
+        ],
+    }
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("SKILL.md", skill_md.read_text(encoding="utf-8"))
+        zf.writestr("reader.py", reader_src.read_text(encoding="utf-8"))
+        if consumer_reqs.exists():
+            zf.writestr("requirements.txt", consumer_reqs.read_text(encoding="utf-8"))
+        zf.writestr("index.json", json.dumps(index, indent=2, ensure_ascii=False))
+
+        # Themes
+        for tid, t_dir, _ in themes:
+            for fn in ("theme.yaml", "master.pptx", "preview.png"):
+                src = t_dir / fn
+                if src.exists():
+                    zf.write(src, f"themes/{tid}/{fn}")
+
+        # Skeletons
+        for sid, sk_dir, _ in skeletons:
+            for fn in ("skeleton.yaml", "preview.png", "background.png"):
+                src = sk_dir / fn
+                if src.exists():
+                    zf.write(src, f"skeletons/{sid}/{fn}")
+
+        # Assets (binary + sidecar)
+        for ap in asset_yamls:
+            d = read_yaml(ap)
+            aid = d.get("id")
+            if not aid:
+                continue
+            blob: Path | None = None
+            for cand in ap.parent.glob(f"{ap.stem}.*"):
+                if cand.suffix == ".yaml":
+                    continue
+                blob = cand
+                break
+            if blob is None:
+                continue
+            ext = _ext_for(blob)
+            zf.write(blob, f"assets/{aid}.{ext}")
+            zf.writestr(
+                f"assets/{aid}.yaml",
+                yaml.safe_dump(d, sort_keys=False, allow_unicode=True),
+            )
+
+    click.echo(
+        f"built {zip_path} — {len(themes)} theme(s), {len(skeletons)} skeleton(s)"
+        f"{f' ({pending} pending)' if pending else ''}"
+        f"{f', {rejected} rejected (excluded)' if rejected else ''}, "
+        f"{len(asset_yamls)} asset(s)"
+    )
+
+
 # --- package-app ----------------------------------------------------------
 #
 # Produces a zip containing ONLY the application code + scaffolding —
@@ -2352,6 +2507,7 @@ PACKAGE_APP_ALLOWLIST = (
     "authoring/schemas/*.yaml",
     "authoring/schemas/*.yml",
     "consumer/SKILL.md",
+    "consumer/SKILL_v5.md",
     "consumer/reader.py",
     "consumer/requirements.txt",
     "consumer/index.example.json",
