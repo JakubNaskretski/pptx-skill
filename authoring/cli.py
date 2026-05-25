@@ -2337,6 +2337,7 @@ PACKAGE_APP_ALLOWLIST = (
     ".gitignore",
     "authoring/cli.py",
     "authoring/app.py",
+    "authoring/ingest_v5.py",
     "authoring/requirements.txt",
     "authoring/prompts/*.md",
     "authoring/schemas/*.yaml",
