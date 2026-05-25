@@ -1881,9 +1881,13 @@ def _v5_check_slot_fit(content_value: Any, slot: dict) -> tuple[bool, str, Any]:
             return _v5_check_table_fit(content_value, constraints)
         return False, "table value must be a dict {rows, cols, has_header}", {}
     if kind == "chart":
-        # Light validation: just check series/categories counts if given.
+        # Light validation: type whitelist + series/categories counts.
         if not isinstance(content_value, dict):
             return False, "chart value must be a dict {series, categories, type}", {}
+        type_key = str(content_value.get("type") or "column").strip().lower()
+        if type_key not in _V5_CHART_TYPE_MAP:
+            return False, (f"chart type {type_key!r} not supported "
+                           f"(use one of {sorted(_V5_CHART_TYPE_MAP)})"), {}
         n_series = content_value.get("n_series") or len(content_value.get("series", []) or [])
         n_cats = content_value.get("n_categories") or len(content_value.get("categories", []) or [])
         max_series = constraints.get("max_series", 99)
@@ -2430,8 +2434,7 @@ def _v5_place_slot(slide, slot: dict, value, slide_w: int, slide_h: int, theme: 
         elif kind == "table":
             warnings.extend(_v5_place_table(slide, slot, value, slide_w, slide_h, theme))
         elif kind == "chart":
-            warnings.append({"violation": "chart_not_implemented",
-                             "message": "chart compose deferred — slot left empty"})
+            warnings.extend(_v5_place_chart(slide, slot, value, slide_w, slide_h, theme))
         else:
             warnings.append({"violation": "unknown_kind",
                              "message": f"unknown slot kind {kind!r}"})
@@ -2629,6 +2632,109 @@ def _v5_place_table(slide, slot: dict, value, slide_w, slide_h, theme) -> list[d
         for c in range(min(cols, len(row_data))):
             cell = tbl.cell(r, c)
             cell.text = str(row_data[c])
+    return warnings
+
+
+# Chart type strings → python-pptx XL_CHART_TYPE attribute names. Kept
+# as a small whitelist; unknown types emit a warning and skip rather
+# than crash. Scatter charts use XyChartData (different data shape) so
+# they're not included here — add when there's a real need.
+_V5_CHART_TYPE_MAP = {
+    "bar": "BAR_CLUSTERED",
+    "bar_clustered": "BAR_CLUSTERED",
+    "bar_stacked": "BAR_STACKED",
+    "column": "COLUMN_CLUSTERED",
+    "column_clustered": "COLUMN_CLUSTERED",
+    "column_stacked": "COLUMN_STACKED",
+    "line": "LINE",
+    "line_markers": "LINE_MARKERS",
+    "pie": "PIE",
+    "doughnut": "DOUGHNUT",
+    "area": "AREA",
+    "area_stacked": "AREA_STACKED",
+}
+
+
+def _v5_place_chart(slide, slot: dict, value, slide_w, slide_h, theme) -> list[dict]:
+    """Build a category chart from primitives via python-pptx's
+    add_chart. Replaces the old "chart_not_implemented" warning.
+
+    Expected value shape:
+      {
+        "type": "bar|column|line|pie|doughnut|area" (+ variants),
+        "categories": ["Q1", "Q2", "Q3"],
+        "series": [{"name": "Revenue", "values": [10, 20, 30]}, ...]
+      }
+
+    Fail-soft: malformed value, unknown type, or any python-pptx
+    exception → append a warning and leave the slot empty. Matches
+    the previous fail-soft behaviour so a broken chart spec never
+    crashes the whole compose run.
+    """
+    warnings: list[dict] = []
+    left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
+
+    if not isinstance(value, dict):
+        warnings.append({
+            "violation": "bad_chart",
+            "message": "chart value must be a dict {type, categories, series}",
+        })
+        return warnings
+
+    type_key = str(value.get("type") or "column").strip().lower()
+    mapped = _V5_CHART_TYPE_MAP.get(type_key)
+    if mapped is None:
+        warnings.append({
+            "violation": "unsupported_chart_type",
+            "message": (f"chart type {type_key!r} not supported "
+                        f"(use one of {sorted(_V5_CHART_TYPE_MAP)}); "
+                        f"slot left empty"),
+        })
+        return warnings
+
+    categories = value.get("categories") or []
+    series = value.get("series") or []
+    if not categories or not series:
+        warnings.append({
+            "violation": "empty_chart_data",
+            "message": "chart needs at least one category and one series; slot left empty",
+        })
+        return warnings
+
+    try:
+        from pptx.chart.data import CategoryChartData
+        from pptx.enum.chart import XL_CHART_TYPE
+        cd = CategoryChartData()
+        cd.categories = [str(c) for c in categories]
+        n_cats = len(categories)
+        added = 0
+        for s in series:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name") or "")
+            raw_vals = s.get("values") or []
+            vals = []
+            for i in range(n_cats):
+                v = raw_vals[i] if i < len(raw_vals) else None
+                try:
+                    vals.append(float(v) if v is not None else 0.0)
+                except (TypeError, ValueError):
+                    vals.append(0.0)
+            cd.add_series(name, vals)
+            added += 1
+        if added == 0:
+            warnings.append({
+                "violation": "empty_chart_data",
+                "message": "no usable series after filtering; slot left empty",
+            })
+            return warnings
+        chart_type = getattr(XL_CHART_TYPE, mapped)
+        slide.shapes.add_chart(chart_type, left, top, w, h, cd)
+    except Exception as e:
+        warnings.append({
+            "violation": "chart_place_failed",
+            "message": f"{type(e).__name__}: {e}; slot left empty",
+        })
     return warnings
 
 

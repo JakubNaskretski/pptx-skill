@@ -797,5 +797,123 @@ class TestComposeRoundTrip(unittest.TestCase):
         self.assertIn("item a", all_text)
 
 
+class TestChartPlacement(unittest.TestCase):
+    """compose-v5 builds charts from primitives via python-pptx add_chart.
+    Tests cover the success path, unknown-type warning, malformed value,
+    and the count-validation in validate-plan.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        themes = self.root / "themes" / "synth"
+        themes.mkdir(parents=True)
+        synth_prs = make_title_body_deck(1)
+        synth_prs.save(str(themes / "master.pptx"))
+        (themes / "theme.yaml").write_text(
+            "id: synth\n"
+            "palette: {primary: '#FF0000'}\n"
+            "fonts: {major: Calibri, minor: Calibri}\n"
+            "master_pptx: master.pptx\n",
+        )
+        (self.root / "skeletons" / "sk_chart").mkdir(parents=True)
+        (self.root / "skeletons" / "sk_chart" / "skeleton.yaml").write_text(
+            "id: sk_chart\n"
+            "source_deck: synth\n"
+            "source_slide_index: 1\n"
+            "status: pending\n"
+            "categories: [data]\n"
+            "slots:\n"
+            "  - id: chart_a\n"
+            "    kind: chart\n"
+            "    geometry: {x: 0.1, y: 0.2, w: 0.8, h: 0.6}\n"
+            "    constraints: {chart_type: column, max_series: 3, max_categories: 4}\n",
+        )
+        self._patcher = mock.patch.object(reader_mod, "_v5_bundle_root",
+                                          return_value=self.root)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmpdir.cleanup()
+
+    def test_column_chart_is_built(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "column",
+                "categories": ["Q1", "Q2", "Q3"],
+                "series": [{"name": "Revenue", "values": [10, 20, 30]}],
+            }},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        # No chart-related warnings — the old chart_not_implemented one
+        # should be gone.
+        for w in result.get("warnings", []):
+            self.assertNotEqual(w.get("violation"), "chart_not_implemented")
+            self.assertNotEqual(w.get("violation"), "chart_place_failed")
+        prs = Presentation(str(out_pptx))
+        has_chart = any(getattr(s, "has_chart", False) for s in prs.slides[0].shapes)
+        self.assertTrue(has_chart, "compose should produce a chart shape")
+
+    def test_unknown_chart_type_warns(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "radar",  # not in the supported set
+                "categories": ["A", "B"],
+                "series": [{"name": "X", "values": [1, 2]}],
+            }},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings", [])]
+        self.assertIn("unsupported_chart_type", violations)
+
+    def test_empty_chart_data_warns(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {"type": "bar", "categories": [], "series": []}},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings", [])]
+        self.assertIn("empty_chart_data", violations)
+
+    def test_validate_plan_flags_unknown_chart_type(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "radar",
+                "categories": ["A"],
+                "series": [{"name": "X", "values": [1]}],
+            }},
+        }]))
+        out = _capture_stdout(
+            reader_mod.cmd_v5_validate_plan,
+            _StubArgs(plan=str(plan)),
+        )
+        self.assertFalse(out["ok"])
+        self.assertTrue(
+            any("not supported" in (e.get("message") or "") for e in out["errors"]),
+            f"expected a 'not supported' fit error, got: {out['errors']}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

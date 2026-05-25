@@ -61,7 +61,7 @@ consumer builds the deck on the chosen host theme.
 | `bullets` | list of strings | `max_items`, `max_chars_per_item`, `required` |
 | `image` | `"asset_<id>"` or `{"asset": "asset_<id>"}` | `aspect`, `required`, `auto_fit` |
 | `table` | `{"rows": N, "cols": N, "has_header": bool, "data": [[...]]}` | `max_rows`, `max_cols`, `has_header` |
-| `chart` | `{"type": "...", "series": [...], "categories": [...]}` | `max_series`, `max_categories` |
+| `chart` | `{"type": "bar\|column\|line\|pie\|doughnut\|area" (+ `_stacked` / `_markers` variants), "categories": ["..."], "series": [{"name": "...", "values": [...]}]}` | `chart_type`, `max_series`, `max_categories` |
 | `footer` | string | `max_chars`, `max_lines`, `auto_from_host` |
 
 Each slot also carries `geometry` (fractional `x/y/w/h`) and a
