@@ -457,6 +457,123 @@ class TestSlotRoleInference(unittest.TestCase):
                              "role must not be emitted when _ENABLE_SLOT_ROLES=False")
 
 
+class _StubFreeShape:
+    """Minimal stub for _infer_slot_role free-shape path — only needs
+    is_placeholder=False to skip the placeholder branch."""
+    is_placeholder = False
+
+
+class TestFreeShapeRoleInference(unittest.TestCase):
+    """Direct unit tests for the tightened free-shape rules in
+    _infer_slot_role + the cross-slot refinement in _refine_slot_roles.
+    """
+
+    def _make_slot(self, kind, *, x=0.1, y=0.1, w=0.8, h=0.1,
+                   size_pt=None, max_chars=None, max_lines=None,
+                   max_items=None, max_chars_per_item=None,
+                   excerpt=""):
+        slot = {"kind": kind,
+                "geometry": {"x": x, "y": y, "w": w, "h": h},
+                "style": {},
+                "constraints": {},
+                "source_excerpt": excerpt}
+        if size_pt is not None:
+            slot["style"]["size_pt"] = size_pt
+        if max_chars is not None:
+            slot["constraints"]["max_chars"] = max_chars
+        if max_lines is not None:
+            slot["constraints"]["max_lines"] = max_lines
+        if max_items is not None:
+            slot["constraints"]["max_items"] = max_items
+        if max_chars_per_item is not None:
+            slot["constraints"]["max_chars_per_item"] = max_chars_per_item
+        return slot
+
+    def _infer(self, slot):
+        return ingest_v5._infer_slot_role(_StubFreeShape(), slot,
+                                          slide_w=9144000, slide_h=6858000)
+
+    def test_top_large_heading_is_page_title(self):
+        slot = self._make_slot("heading", y=0.05, size_pt=36)
+        self.assertEqual(self._infer(slot), "page_title")
+
+    def test_top_medium_heading_is_section_header(self):
+        slot = self._make_slot("heading", y=0.10, size_pt=20)
+        self.assertEqual(self._infer(slot), "section_header")
+
+    def test_huge_short_text_is_kpi_value(self):
+        slot = self._make_slot("paragraph", y=0.40, size_pt=48, max_chars=10)
+        self.assertEqual(self._infer(slot), "kpi_value")
+
+    def test_small_bottom_paragraph_is_footnote(self):
+        slot = self._make_slot("paragraph", y=0.92, size_pt=9, max_chars=120)
+        self.assertEqual(self._infer(slot), "footnote")
+
+    def test_cta_action_verb_prefix(self):
+        slot = self._make_slot("paragraph", y=0.6, size_pt=18,
+                               max_chars=40, excerpt="Visit our website today")
+        self.assertEqual(self._infer(slot), "cta")
+
+    def test_caption_requires_below_top(self):
+        # Same small short text — at top is NOT a caption (likely byline-ish);
+        # below the middle IS a caption.
+        top = self._make_slot("paragraph", y=0.05, size_pt=11, max_chars=50)
+        mid = self._make_slot("paragraph", y=0.55, size_pt=11, max_chars=50)
+        self.assertNotEqual(self._infer(top), "caption")
+        self.assertEqual(self._infer(mid), "caption")
+
+    def test_long_paragraph_is_body(self):
+        slot = self._make_slot("paragraph", y=0.4, size_pt=18, max_chars=300)
+        self.assertEqual(self._infer(slot), "body")
+
+    def test_short_uncertain_paragraph_falls_through_to_none(self):
+        # Medium-sized, short, mid-slide, no CTA verbs — not enough
+        # signal for any single role.
+        slot = self._make_slot("paragraph", y=0.4, size_pt=16, max_chars=40,
+                               excerpt="Some neutral text")
+        self.assertIsNone(self._infer(slot))
+
+    def test_refinement_assigns_kpi_label_near_kpi_value(self):
+        slots = [
+            {"kind": "paragraph", "role": "kpi_value",
+             "geometry": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.15},
+             "style": {"size_pt": 48}, "constraints": {"max_chars": 5}},
+            # Small text directly below the KPI — should get kpi_label
+            {"kind": "paragraph",
+             "geometry": {"x": 0.1, "y": 0.56, "w": 0.2, "h": 0.05},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 30}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1].get("role"), "kpi_label")
+
+    def test_refinement_assigns_byline_below_page_title(self):
+        slots = [
+            {"kind": "heading", "role": "page_title",
+             "geometry": {"x": 0.05, "y": 0.05, "w": 0.9, "h": 0.15},
+             "style": {"size_pt": 40}, "constraints": {"max_chars": 50}},
+            # Small short text directly under the title — byline pattern
+            {"kind": "paragraph",
+             "geometry": {"x": 0.05, "y": 0.22, "w": 0.5, "h": 0.04},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 40}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1].get("role"), "byline")
+
+    def test_refinement_does_not_override_existing_role(self):
+        slots = [
+            {"kind": "paragraph", "role": "kpi_value",
+             "geometry": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.15},
+             "style": {"size_pt": 48}, "constraints": {"max_chars": 5}},
+            # Pre-assigned as 'caption' — refinement must NOT downgrade
+            # it to kpi_label even though it sits adjacent to a kpi_value.
+            {"kind": "paragraph", "role": "caption",
+             "geometry": {"x": 0.1, "y": 0.56, "w": 0.2, "h": 0.05},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 30}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1]["role"], "caption")
+
+
 class TestRoleAwareMatching(unittest.TestCase):
     """match-skeletons prefers role match over first-of-kind when both
     fire. So if a content key names a role and the skeleton has a slot
