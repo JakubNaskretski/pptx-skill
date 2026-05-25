@@ -3889,7 +3889,9 @@ def api_v5_get_theme(theme_id):
 
 @app.get("/v5")
 def v5_page():
-    return render_template_string(V5_HTML, debug_widget=DEBUG_WIDGET)
+    # Debug widget intentionally omitted — it's a v4 compose-flow tool
+    # and clutters the skeleton review with no upside on this page.
+    return render_template_string(V5_HTML)
 
 
 V5_HTML = r"""<!doctype html>
@@ -4011,7 +4013,6 @@ V5_HTML = r"""<!doctype html>
       No skeleton selected.
     </div>
   </aside>
-  {{ debug_widget|safe }}
 
   <script>
     const KIND_LIST = ['heading', 'paragraph', 'bullets', 'table', 'chart', 'image', 'footer'];
@@ -4160,9 +4161,16 @@ V5_HTML = r"""<!doctype html>
 
 def main():
     port = int(os.environ.get("PPTX_SKILL_PORT", "5050"))
-    url = f"http://127.0.0.1:{port}/"
+    # On the v5 redesign branch, /v5 is the primary surface — auto-open
+    # there rather than the v4 describe page. Pass PPTX_SKILL_LANDING=/
+    # to keep the v4 landing for asset-describe sessions.
+    landing = os.environ.get("PPTX_SKILL_LANDING", "/v5")
+    url = f"http://127.0.0.1:{port}{landing}"
     Timer(1.2, lambda: webbrowser.open(url)).start()
-    print(f"pptx-skill describe app → {url}")
+    print(f"pptx-skill app → {url}")
+    print(f"  v5 skeletons:   http://127.0.0.1:{port}/v5")
+    print(f"  v4 describe:    http://127.0.0.1:{port}/")
+    print(f"  compose:        http://127.0.0.1:{port}/compose")
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
