@@ -32,6 +32,8 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 
+import ingest_v5  # v5 redesign — self-contained, removable as a unit
+
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE / "workspace"
@@ -1702,6 +1704,19 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     theme = extract_deck_theme(prs, deck_stem)
     write_yaml(deck_dir / "theme.yaml", theme)
 
+    # v5 (additive): write workspace/themes/<deck>/{theme.yaml, master.pptx}
+    # with semantic palette roles + master fragment + auto-classified
+    # decorations for the new build engine. v4 path above is unaffected.
+    ingest_v5.digest_theme(prs, original, deck_stem, theme, WORKSPACE / "themes")
+
+    # Pre-compute repeated-picture info (sha → median area) across the
+    # whole deck so each per-slide digest can either skip a deck-wide
+    # brand mark (typical size = decoration) or capture it as a slot
+    # when it's rendered much larger on a specific slide (featured
+    # content, e.g. a logo at hero size on the cover). One pass, used
+    # by all per-slide digests below.
+    v5_repeated_info = ingest_v5.compute_repeated_picture_info(prs)
+
     # Resolve slide-level theme_colors via aliases; pass palette into
     # slot detection so per-run colour refs become hex + role names.
     theme_palette = theme.get("palette") or {}
@@ -1759,6 +1774,16 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
             theme_colors=slide_theme_colors,
             fonts=slide_fonts,
             inventory=inventory,
+        )
+
+        # v5 (additive): structural skeleton with fractional geometry,
+        # font_role / color_role, per-kind constraints. v4 path above
+        # is unaffected; v5 writes to workspace/skeletons/<deck>_<NN>/.
+        v4_preview = slide_pptx.with_suffix(".png")
+        ingest_v5.digest_skeleton(
+            slide, slide_w, slide_h, deck_stem, slide_number,
+            theme, WORKSPACE / "skeletons", v4_preview_path=v4_preview,
+            repeated_picture_info=v5_repeated_info,
         )
 
     return {
@@ -2099,6 +2124,21 @@ def preview() -> None:
         click.echo(f"preview: {n_failed} slide(s) could not be rendered", err=True)
     click.echo(f"preview: built {n_built} thumbnail(s)")
 
+    # v5 (additive): mirror each rendered slide PNG into the matching
+    # skeleton dir so the C1 Flask UI is self-contained. Idempotent.
+    skeletons_root = WORKSPACE / "skeletons"
+    n_mirrored = 0
+    if skeletons_root.exists():
+        for slide_png in sorted(decks.glob("*/slides/slide_*.png")):
+            deck_stem = slide_png.parent.parent.name
+            slide_num = int(slide_png.stem.split("_")[-1])
+            sk_dir = skeletons_root / f"{deck_stem}_{slide_num:02d}"
+            if sk_dir.exists():
+                shutil.copyfile(slide_png, sk_dir / "preview.png")
+                n_mirrored += 1
+    if n_mirrored:
+        click.echo(f"preview: mirrored {n_mirrored} preview(s) into v5 skeleton dirs")
+
 
 # --- build -----------------------------------------------------------------
 
@@ -2292,6 +2332,161 @@ def build(allow_pending: bool, out_path: Path | None, no_brand: bool) -> None:
     )
 
 
+# --- v5 build (additive) --------------------------------------------------
+
+
+@cli.command(name="build-v5")
+@click.option("--allow-pending", is_flag=True, default=True,
+              help="Build even if some skeletons are still pending (default: true).")
+@click.option("--out", "out_path", type=click.Path(path_type=Path), default=None,
+              help="Output zip path. Default: authoring/dist/skill-v5.zip")
+@click.option("--skill-md", "skill_md_path", type=click.Path(path_type=Path), default=None,
+              help="Override the SKILL.md path. Default: consumer/SKILL_v5.md")
+def build_v5(allow_pending: bool, out_path: Path | None, skill_md_path: Path | None) -> None:
+    """Emit a v5 skill bundle: themes/ + skeletons/ + assets/ + reader.py.
+
+    Bundle layout (sibling of reader.py inside the zip):
+      SKILL.md                      v5 agent contract
+      reader.py                     consumer + v5 read methods + compose-v5
+      requirements.txt
+      index.json                    skeleton + theme + asset summaries
+      themes/<id>/theme.yaml + master.pptx + preview.png?
+      skeletons/<id>/skeleton.yaml + preview.png? + background.png?
+      assets/<id>.<ext> + <id>.yaml
+    """
+    themes_root = WORKSPACE / "themes"
+    skeletons_root = WORKSPACE / "skeletons"
+    assets_root = WORKSPACE / "assets"
+
+    if not skeletons_root.exists() or not any(skeletons_root.iterdir()):
+        raise click.ClickException(
+            "no v5 skeletons in workspace; run `ingest` first"
+        )
+
+    # Collect skeletons (excluding rejected ones from the build).
+    skeletons: list[tuple[str, Path, dict]] = []
+    rejected = 0
+    pending = 0
+    for d in sorted(skeletons_root.iterdir()):
+        if not d.is_dir():
+            continue
+        sk_path = d / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        sk = read_yaml(sk_path)
+        status = sk.get("status", "pending")
+        if status == "rejected":
+            rejected += 1
+            continue
+        if status == "pending":
+            pending += 1
+        skeletons.append((sk["id"], d, sk))
+
+    if pending and not allow_pending:
+        raise click.ClickException(
+            f"{pending} skeleton(s) still pending — re-run with --allow-pending or "
+            "mark them done in /v5"
+        )
+
+    # Themes.
+    themes: list[tuple[str, Path, dict]] = []
+    if themes_root.exists():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir():
+                continue
+            t_path = d / "theme.yaml"
+            if not t_path.exists():
+                continue
+            t = read_yaml(t_path)
+            themes.append((t.get("id", d.name), d, t))
+
+    # Assets (v4 path; unchanged in v5).
+    asset_yamls = list(iter_asset_yamls())
+
+    DIST.mkdir(parents=True, exist_ok=True)
+    zip_path = out_path or (DIST / "skill-v5.zip")
+
+    reader_src = CONSUMER / "reader.py"
+    skill_md = skill_md_path or (CONSUMER / "SKILL_v5.md")
+    if not skill_md.exists():
+        # Fall back to v4 SKILL.md with a header note.
+        skill_md = CONSUMER / "SKILL.md"
+        click.echo(
+            f"warn: {(CONSUMER / 'SKILL_v5.md').name} missing — using v4 SKILL.md "
+            "(agent will see v4 contract, not v5; rerun once SKILL_v5.md exists)",
+            err=True,
+        )
+    consumer_reqs = CONSUMER / "requirements.txt"
+
+    # Build index.json — lightweight per-id summaries.
+    index = {
+        "version": 5,
+        "themes": [{"id": tid, "palette": t.get("palette", {}), "fonts": t.get("fonts", {})}
+                   for tid, _, t in themes],
+        "skeletons": [{
+            "id": sid,
+            "source_deck": sk.get("source_deck"),
+            "categories": sk.get("categories") or [],
+            "slot_count": len(sk.get("slots") or []),
+            "slot_kinds": sorted({s.get("kind") for s in (sk.get("slots") or [])}),
+            "status": sk.get("status", "pending"),
+        } for sid, _, sk in skeletons],
+        "assets": [
+            {"id": d.get("id"), "kind": d.get("kind"), "subject": d.get("subject", "")}
+            for d in (read_yaml(p) for p in asset_yamls)
+        ],
+    }
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("SKILL.md", skill_md.read_text(encoding="utf-8"))
+        zf.writestr("reader.py", reader_src.read_text(encoding="utf-8"))
+        if consumer_reqs.exists():
+            zf.writestr("requirements.txt", consumer_reqs.read_text(encoding="utf-8"))
+        zf.writestr("index.json", json.dumps(index, indent=2, ensure_ascii=False))
+
+        # Themes
+        for tid, t_dir, _ in themes:
+            for fn in ("theme.yaml", "master.pptx", "preview.png"):
+                src = t_dir / fn
+                if src.exists():
+                    zf.write(src, f"themes/{tid}/{fn}")
+
+        # Skeletons
+        for sid, sk_dir, _ in skeletons:
+            for fn in ("skeleton.yaml", "preview.png", "background.png"):
+                src = sk_dir / fn
+                if src.exists():
+                    zf.write(src, f"skeletons/{sid}/{fn}")
+
+        # Assets (binary + sidecar)
+        for ap in asset_yamls:
+            d = read_yaml(ap)
+            aid = d.get("id")
+            if not aid:
+                continue
+            blob: Path | None = None
+            for cand in ap.parent.glob(f"{ap.stem}.*"):
+                if cand.suffix == ".yaml":
+                    continue
+                blob = cand
+                break
+            if blob is None:
+                continue
+            ext = _ext_for(blob)
+            zf.write(blob, f"assets/{aid}.{ext}")
+            zf.writestr(
+                f"assets/{aid}.yaml",
+                yaml.safe_dump(d, sort_keys=False, allow_unicode=True),
+            )
+
+    click.echo(
+        f"built {zip_path} — {len(themes)} theme(s), {len(skeletons)} skeleton(s)"
+        f"{f' ({pending} pending)' if pending else ''}"
+        f"{f', {rejected} rejected (excluded)' if rejected else ''}, "
+        f"{len(asset_yamls)} asset(s)"
+    )
+
+
 # --- package-app ----------------------------------------------------------
 #
 # Produces a zip containing ONLY the application code + scaffolding —
@@ -2306,11 +2501,13 @@ PACKAGE_APP_ALLOWLIST = (
     ".gitignore",
     "authoring/cli.py",
     "authoring/app.py",
+    "authoring/ingest_v5.py",
     "authoring/requirements.txt",
     "authoring/prompts/*.md",
     "authoring/schemas/*.yaml",
     "authoring/schemas/*.yml",
     "consumer/SKILL.md",
+    "consumer/SKILL_v5.md",
     "consumer/reader.py",
     "consumer/requirements.txt",
     "consumer/index.example.json",

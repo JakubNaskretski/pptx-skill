@@ -34,3 +34,4 @@ HANDOVER.md
 # but the rest of a sample prompt-bundle (index.json, brand.md, brief.md,
 # theme.yaml) is not — this catches the whole directory.
 TestData/
+.agent-worktrees/

@@ -2406,8 +2406,10 @@ INDEX_HTML = r"""<!doctype html>
     <header>
       <strong>pptx-skill</strong>
       <span id="counts" style="color:#888;font-size:11px;margin-left:6px;"></span>
-      <a href="/compose" style="float:right;font-size:11px;color:#0066cc;
-         text-decoration:none;">Compose →</a>
+      <span style="float:right;font-size:11px;">
+        <a href="/v5" style="color:#0066cc;text-decoration:none;margin-right:8px;">Skeletons →</a>
+        <a href="/compose" style="color:#0066cc;text-decoration:none;">Compose →</a>
+      </span>
     </header>
     <div class="ingest-row">
       <input type="file" id="ingestFile" accept=".pptx"
@@ -2423,8 +2425,14 @@ INDEX_HTML = r"""<!doctype html>
       <button data-view="batch">Bulk</button>
     </div>
     <div class="tabs" id="kindTabs">
-      <button data-tab="slides" class="active">Slides</button>
-      <button data-tab="assets">Assets</button>
+      <button data-tab="slides" title="Slides moved to /v5 — describe page now owns assets only"
+              style="display:none;">Slides</button>
+      <button data-tab="assets" class="active">Assets</button>
+    </div>
+    <div style="padding:6px 14px;font-size:11px;color:#888;border-bottom:1px solid #eee;
+                line-height:1.4;">
+      Slide review moved to <a href="/v5" style="color:#0066cc;text-decoration:none;">/v5 →</a>
+      — this page now describes assets only.
     </div>
     <div class="filter-row" id="filterRow">
       <label><input type="checkbox" id="hideDone" checked> Hide done</label>
@@ -2542,7 +2550,7 @@ async function loadVocab() {
   ASSET_TAGS = v.asset.suitable_for;
 }
 
-let activeTab = "slides";
+let activeTab = "assets";  // v5: slide tab hidden; describe page owns assets only
 let items = {slides: [], assets: []};
 let current = null;
 let mode = localStorage.getItem("describe.mode") || "form";
@@ -3774,11 +3782,999 @@ def compose_page():
     return render_template_string(COMPOSE_HTML, debug_widget=DEBUG_WIDGET)
 
 
+# ---------------------------------------------------------------------------
+# v5 redesign — read-only skeletons view (phase C1).
+# Self-contained block. To roll back v5, delete this section + the
+# V5_HTML constant + the route below.
+# ---------------------------------------------------------------------------
+
+
+V5_THEMES_DIR = WORKSPACE / "themes"
+V5_SKELETONS_DIR = WORKSPACE / "skeletons"
+
+
+def _v5_safe_path(root: Path, name: str) -> Path | None:
+    """Resolve <root>/<name> ensuring no traversal outside <root>."""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    target = (root / name).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+@app.get("/api/v5/skeletons")
+def api_v5_list_skeletons():
+    """Group skeleton summaries by source_deck."""
+    decks: dict = {}
+    if not V5_SKELETONS_DIR.exists():
+        return jsonify({"decks": decks})
+    for d in sorted(V5_SKELETONS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        sk_path = d / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        try:
+            data = yaml.safe_load(sk_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        deck = data.get("source_deck", "unknown")
+        decks.setdefault(deck, []).append({
+            "id": data.get("id"),
+            "source_slide_index": data.get("source_slide_index"),
+            "status": data.get("status", "pending"),
+            "categories": data.get("categories", []),
+            "has_warnings": bool(data.get("digest_warnings")),
+            "slot_count": len(data.get("slots", [])),
+            "has_preview": (d / "preview.png").exists(),
+        })
+    for deck in decks:
+        decks[deck].sort(key=lambda s: s.get("source_slide_index", 0))
+    return jsonify({"decks": decks})
+
+
+@app.get("/api/v5/skeleton/<skeleton_id>")
+def api_v5_get_skeleton(skeleton_id):
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None or not (safe / "skeleton.yaml").exists():
+        abort(404)
+    try:
+        data = yaml.safe_load((safe / "skeleton.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        abort(500)
+    return jsonify(data)
+
+
+@app.get("/v5/skeleton/<skeleton_id>/preview.png")
+def v5_skeleton_preview(skeleton_id):
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None:
+        abort(404)
+    p = safe / "preview.png"
+    if not p.exists():
+        abort(404)
+    return send_file(str(p), mimetype="image/png")
+
+
+@app.get("/api/v5/themes")
+def api_v5_list_themes():
+    out: list[dict] = []
+    if not V5_THEMES_DIR.exists():
+        return jsonify({"themes": out})
+    for d in sorted(V5_THEMES_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        t_path = d / "theme.yaml"
+        if not t_path.exists():
+            continue
+        try:
+            data = yaml.safe_load(t_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        out.append({
+            "id": data.get("id"),
+            "palette": data.get("palette", {}),
+            "fonts": data.get("fonts", {}),
+            "decoration_count": len(data.get("decorations", [])),
+        })
+    return jsonify({"themes": out})
+
+
+@app.get("/api/v5/theme/<theme_id>")
+def api_v5_get_theme(theme_id):
+    safe = _v5_safe_path(V5_THEMES_DIR, theme_id)
+    if safe is None or not (safe / "theme.yaml").exists():
+        abort(404)
+    try:
+        data = yaml.safe_load((safe / "theme.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        abort(500)
+    return jsonify(data)
+
+
+@app.get("/v5")
+def v5_page():
+    # Debug widget intentionally omitted — it's a v4 compose-flow tool
+    # and clutters the skeleton review with no upside on this page.
+    return render_template_string(V5_HTML)
+
+
+# --- C-actions: write-back endpoints ------------------------------------
+
+
+_V5_VALID_STATUSES = {"pending", "done", "rejected"}
+_V5_VALID_OVERLAP_DECISIONS = {"image_slot", "reject", "freeze_pending"}
+_V5_VALID_KINDS = {"heading", "paragraph", "bullets", "image", "table", "chart", "footer"}
+
+
+def _v5_load_skeleton(skeleton_id: str) -> tuple[Path | None, dict | None, str | None]:
+    """Resolve <id> safely and load skeleton.yaml. Returns (yaml_path,
+    data, error_message). On any failure path returns (None, None, msg)
+    suitable for the caller to JSON-error.
+    """
+    safe = _v5_safe_path(V5_SKELETONS_DIR, skeleton_id)
+    if safe is None:
+        return None, None, "invalid skeleton id"
+    p = safe / "skeleton.yaml"
+    if not p.exists():
+        return None, None, "skeleton not found"
+    try:
+        return p, yaml.safe_load(p.read_text(encoding="utf-8")) or {}, None
+    except Exception as e:
+        return None, None, f"failed to read skeleton.yaml: {e}"
+
+
+def _v5_save_skeleton(p: Path, data: dict) -> None:
+    p.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=100),
+        encoding="utf-8",
+    )
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/status")
+def api_v5_set_status(skeleton_id):
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_status = payload.get("status")
+    if new_status not in _V5_VALID_STATUSES:
+        return jsonify({"error": f"status must be one of {sorted(_V5_VALID_STATUSES)}"}), 400
+    data["status"] = new_status
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "status": new_status})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/overlap-decision")
+def api_v5_set_overlap_decision(skeleton_id):
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    if decision not in _V5_VALID_OVERLAP_DECISIONS:
+        return jsonify({"error": f"decision must be one of {sorted(_V5_VALID_OVERLAP_DECISIONS)}"}), 400
+    data["overlap_decision"] = decision
+    # "reject" decision also flips the skeleton status — it's the
+    # explicit "this slide is unusable" outcome of overlap review.
+    if decision == "reject":
+        data["status"] = "rejected"
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "overlap_decision": decision, "status": data["status"]})
+
+
+_V5_VALID_ROLES = frozenset({
+    "page_title", "subtitle", "body", "footer", "date", "page_number",
+    "footnote", "caption", "key_points", "detailed_list", "cta",
+    "byline", "kpi_label", "kpi_value", "section_header",
+})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/slot/<slot_id>/role")
+def api_v5_set_slot_role(skeleton_id, slot_id):
+    """Set or clear the `role` on a slot. role=null removes the field
+    (slot falls back to id/kind-based matching). Stamps user_edited
+    so re-ingest doesn't blow away the override.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_role = payload.get("role")
+    if new_role is not None and new_role not in _V5_VALID_ROLES:
+        return jsonify({"error": f"role must be null or one of {sorted(_V5_VALID_ROLES)}"}), 400
+    slots = data.get("slots") or []
+    target = next((s for s in slots if s.get("id") == slot_id), None)
+    if target is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    if new_role is None:
+        target.pop("role", None)
+    else:
+        target["role"] = new_role
+    target["user_edited"] = True
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "role": new_role})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/slot/<slot_id>/kind")
+def api_v5_reclassify_slot_kind(skeleton_id, slot_id):
+    """Change a slot's kind in-place. Resets constraints to defaults
+    for the new kind and stamps user_edited:true so re-ingest preserves
+    the change instead of reverting to the heuristic-derived kind.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    new_kind = payload.get("kind")
+    if new_kind not in _V5_VALID_KINDS:
+        return jsonify({"error": f"kind must be one of {sorted(_V5_VALID_KINDS)}"}), 400
+
+    slots = data.get("slots") or []
+    target = next((s for s in slots if s.get("id") == slot_id), None)
+    if target is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    if target.get("kind") == new_kind:
+        return jsonify({"ok": True, "unchanged": True})
+
+    # Reset constraints to the new kind's defaults — the old kind's
+    # constraints don't carry meaning when the type changes.
+    target["kind"] = new_kind
+    target["constraints"] = _v5_default_slot_for_kind(new_kind, {}, set())["constraints"]
+    target["user_edited"] = True
+    _v5_save_skeleton(p, data)
+    return jsonify({"ok": True, "slot": target})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/promote-shape")
+def api_v5_promote_shape(skeleton_id):
+    """Move an unmapped_shapes entry into slots with the chosen kind.
+
+    Constraint defaults match what the slot builders in ingest_v5 would
+    have produced for that kind — agent doesn't see this slot as
+    'different' from heuristic-derived ones, just stamped with a
+    user-chosen kind. shape_id is preserved so re-ingest doesn't undo
+    the promotion.
+
+    Optional `propagate: true` finds the same picture SHA in OTHER
+    skeletons' unmapped_shapes and promotes there too. Use when the
+    user wants consistent treatment of a deck-wide repeated picture.
+    Returns counts of how many other skeletons were touched.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    idx = payload.get("shape_index")
+    kind = payload.get("kind")
+    propagate = bool(payload.get("propagate"))
+    if kind not in _V5_VALID_KINDS:
+        return jsonify({"error": f"kind must be one of {sorted(_V5_VALID_KINDS)}"}), 400
+    unmapped = data.get("unmapped_shapes") or []
+    if not isinstance(idx, int) or idx < 0 or idx >= len(unmapped):
+        return jsonify({"error": "shape_index out of range"}), 400
+    entry = unmapped.pop(idx)
+    used_ids = {s.get("id") for s in (data.get("slots") or []) if s.get("id")}
+    new_slot = _v5_default_slot_for_kind(kind, entry, used_ids)
+    slots = data.get("slots") or []
+    slots.append(new_slot)
+    data["slots"] = slots
+    data["unmapped_shapes"] = unmapped
+    _v5_save_skeleton(p, data)
+
+    propagated_to: list[str] = []
+    target_sha = entry.get("sha")
+    if propagate and target_sha:
+        for sk_dir in V5_SKELETONS_DIR.iterdir():
+            if not sk_dir.is_dir() or sk_dir.name == skeleton_id:
+                continue
+            sk_yaml = sk_dir / "skeleton.yaml"
+            if not sk_yaml.exists():
+                continue
+            try:
+                sk_data = yaml.safe_load(sk_yaml.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            sk_unmapped = sk_data.get("unmapped_shapes") or []
+            match_idx = next(
+                (i for i, u in enumerate(sk_unmapped) if u.get("sha") == target_sha),
+                None,
+            )
+            if match_idx is None:
+                continue
+            sib_entry = sk_unmapped.pop(match_idx)
+            sk_used_ids = {s.get("id") for s in (sk_data.get("slots") or []) if s.get("id")}
+            sib_slot = _v5_default_slot_for_kind(kind, sib_entry, sk_used_ids)
+            sk_slots = sk_data.get("slots") or []
+            sk_slots.append(sib_slot)
+            sk_data["slots"] = sk_slots
+            sk_data["unmapped_shapes"] = sk_unmapped
+            _v5_save_skeleton(sk_yaml, sk_data)
+            propagated_to.append(sk_dir.name)
+
+    return jsonify({"ok": True, "slot": new_slot, "propagated_to": propagated_to})
+
+
+@app.post("/api/v5/skeleton/<skeleton_id>/demote-slot")
+def api_v5_demote_slot(skeleton_id):
+    """Reverse a promote — move a user-promoted slot back to
+    unmapped_shapes so it stops being addressable by the agent.
+
+    Optional `propagate: true` finds slots in OTHER skeletons with the
+    same SHA + user_promoted flag and demotes them all in one shot.
+    Useful for undoing a mass promote, or cleaning up leftovers from
+    earlier experimentation.
+    """
+    p, data, err = _v5_load_skeleton(skeleton_id)
+    if err:
+        return jsonify({"error": err}), 404
+    payload = request.get_json(silent=True) or {}
+    slot_id = payload.get("slot_id")
+    propagate = bool(payload.get("propagate"))
+    slots = data.get("slots") or []
+    target_idx = next((i for i, s in enumerate(slots) if s.get("id") == slot_id), None)
+    if target_idx is None:
+        return jsonify({"error": f"slot {slot_id!r} not found"}), 404
+    target = slots[target_idx]
+    if not target.get("user_promoted"):
+        return jsonify({
+            "error": "only user_promoted slots can be demoted — heuristic-derived "
+            "slots come back on re-ingest anyway",
+        }), 400
+    # Reconstruct an unmapped entry from the slot.
+    unmapped_entry = {
+        "shape_id": target.get("shape_id"),
+        "kind_hint": "picture" if target.get("kind") == "image" else target.get("kind"),
+        "geometry": target.get("geometry") or {},
+        "skipped_reason": "user-demoted from slot",
+    }
+    if target.get("sha"):
+        unmapped_entry["sha"] = target["sha"]
+    if target.get("source_excerpt"):
+        unmapped_entry["source_excerpt"] = target["source_excerpt"]
+    # Apply locally.
+    slots.pop(target_idx)
+    unmapped = data.get("unmapped_shapes") or []
+    unmapped.append(unmapped_entry)
+    data["slots"] = slots
+    data["unmapped_shapes"] = unmapped
+    _v5_save_skeleton(p, data)
+
+    propagated_to: list[str] = []
+    target_sha = target.get("sha")
+    if propagate and target_sha:
+        for sk_dir in V5_SKELETONS_DIR.iterdir():
+            if not sk_dir.is_dir() or sk_dir.name == skeleton_id:
+                continue
+            sk_yaml = sk_dir / "skeleton.yaml"
+            if not sk_yaml.exists():
+                continue
+            try:
+                sk_data = yaml.safe_load(sk_yaml.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            sk_slots = sk_data.get("slots") or []
+            sib_idx = next(
+                (i for i, s in enumerate(sk_slots)
+                 if s.get("sha") == target_sha and s.get("user_promoted")),
+                None,
+            )
+            if sib_idx is None:
+                continue
+            sib = sk_slots.pop(sib_idx)
+            sib_unmapped = {
+                "shape_id": sib.get("shape_id"),
+                "kind_hint": "picture",
+                "geometry": sib.get("geometry") or {},
+                "skipped_reason": "user-demoted from slot",
+                "sha": target_sha,
+            }
+            sk_unmapped = sk_data.get("unmapped_shapes") or []
+            sk_unmapped.append(sib_unmapped)
+            sk_data["slots"] = sk_slots
+            sk_data["unmapped_shapes"] = sk_unmapped
+            _v5_save_skeleton(sk_yaml, sk_data)
+            propagated_to.append(sk_dir.name)
+
+    return jsonify({"ok": True, "demoted": slot_id, "propagated_to": propagated_to})
+
+
+def _v5_default_slot_for_kind(kind: str, unmapped_entry: dict, used_ids: set) -> dict:
+    """Reasonable default constraints per kind — matches the shape the
+    heuristic in ingest_v5 produces, so the agent sees no difference
+    between heuristic-derived and user-promoted slots.
+    """
+    base_id_for_kind = {
+        "heading": "heading", "paragraph": "body", "bullets": "body",
+        "image": "hero", "table": "data_table", "chart": "data_chart",
+        "footer": "footer",
+    }
+    base = base_id_for_kind.get(kind, "field")
+    slot_id = base if base not in used_ids else next(
+        f"{base}_{i}" for i in range(2, 99) if f"{base}_{i}" not in used_ids
+    )
+    constraints_for_kind = {
+        "heading": {"max_chars": 60, "max_lines": 1, "required": True},
+        "paragraph": {"max_chars": 200, "max_lines": 4, "required": False},
+        "bullets": {"max_items": 5, "max_chars_per_item": 80, "required": False},
+        "image": {"aspect": "free", "required": True, "auto_fit": "cover"},
+        "table": {"max_rows": 8, "max_cols": 4, "has_header": True, "required": True},
+        "chart": {"chart_type": "unknown", "max_series": 4, "max_categories": 12, "required": True},
+        "footer": {"max_chars": 40, "max_lines": 1, "required": False},
+    }
+    excerpt = unmapped_entry.get("source_excerpt", "")
+    out: dict = {
+        "id": slot_id,
+        "kind": kind,
+        "geometry": unmapped_entry.get("geometry", {}),
+        "constraints": constraints_for_kind.get(kind, {"required": False}),
+        "shape_id": unmapped_entry.get("shape_id"),
+        "user_promoted": True,
+    }
+    # Carry the SHA forward for picture promotes — demote-slot uses it
+    # to find this slot's entry in unmapped_shapes after re-ingest.
+    if unmapped_entry.get("sha"):
+        out["sha"] = unmapped_entry["sha"]
+    if excerpt:
+        out["source_excerpt"] = excerpt
+    return out
+
+
+V5_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pptx-skill v5 — skeletons</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           margin: 0; height: 100vh; display: flex; color: #222; }
+
+    .sidebar { width: 280px; border-right: 1px solid #ddd; background: #fafafa;
+               overflow-y: auto; display: flex; flex-direction: column; }
+    .sidebar header { padding: 12px 14px; border-bottom: 1px solid #ddd; }
+    .sidebar header h1 { font-size: 14px; margin: 0 0 4px; font-weight: 600; }
+    .sidebar header .nav { font-size: 11px; color: #666; }
+    .sidebar header .nav a { color: #0066cc; text-decoration: none; margin-right: 8px; }
+    .sidebar header .nav a:hover { text-decoration: underline; }
+    .deck-group h2 { font-size: 11px; text-transform: uppercase;
+                     letter-spacing: 0.5px; color: #555; padding: 12px 14px 6px;
+                     margin: 0; background: #f0f0f0; border-bottom: 1px solid #e0e0e0; }
+    .item-list { list-style: none; padding: 0; margin: 0; }
+    .item-list li { padding: 8px 14px; cursor: pointer; font-size: 12px;
+                    display: flex; justify-content: space-between; align-items: center;
+                    border-bottom: 1px solid #eee; gap: 8px; }
+    .item-list li:hover { background: #eef4ff; }
+    .item-list li.active { background: #d8e8ff; }
+    .item-list .label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .item-list .label .top { display: flex; align-items: center; gap: 4px; }
+    .item-list .cats { font-size: 10px; color: #888; white-space: nowrap;
+                       overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+    .pill { font-size: 9px; padding: 2px 6px; border-radius: 8px;
+            text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; flex-shrink: 0; }
+    .pill.pending { background: #ffeaa7; color: #8c6900; }
+    .pill.done { background: #c8e6c9; color: #1b5e20; }
+    .pill.rejected { background: #e0e0e0; color: #555; }
+    .warn-dot { color: #d68b00; font-weight: 700; }
+
+    .preview-area { flex: 1; background: #1c1c1c; display: flex; align-items: center;
+                    justify-content: center; padding: 20px; min-width: 0; }
+    .preview-wrap { position: relative; max-width: 100%; max-height: 100%;
+                    background: white; box-shadow: 0 4px 30px rgba(0,0,0,0.4); }
+    .preview-wrap img { display: block; max-width: 100%;
+                        max-height: calc(100vh - 80px); object-fit: contain; }
+    .slot-overlay { position: absolute; border: 2px solid;
+                    cursor: pointer; transition: background 0.1s; }
+    .slot-overlay:hover { background: rgba(255,255,255,0.18) !important; }
+    .slot-overlay .slot-label { position: absolute; top: 2px; left: 2px;
+                                background: rgba(0,0,0,0.85); color: white;
+                                padding: 2px 6px; font-size: 10px; border-radius: 3px;
+                                font-family: ui-monospace, monospace; white-space: nowrap; }
+    .slot-overlay.heading   { border-color: #e53935; }
+    .slot-overlay.paragraph { border-color: #fb8c00; }
+    .slot-overlay.bullets   { border-color: #1e88e5; }
+    .slot-overlay.table     { border-color: #43a047; }
+    .slot-overlay.chart     { border-color: #8e24aa; }
+    .slot-overlay.image     { border-color: #00acc1; }
+    .slot-overlay.footer    { border-color: #757575; }
+    .slot-overlay.unmapped  { border-color: #999; border-style: dashed; opacity: 0.7; }
+    .slot-overlay.unmapped .slot-label { background: rgba(80,80,80,0.85); }
+
+    .preview-empty { color: #999; font-size: 13px; text-align: center; padding: 40px;
+                     line-height: 1.5; }
+    .preview-empty .hint { font-size: 11px; color: #777; margin-top: 8px;
+                           font-family: ui-monospace, monospace; }
+
+    .panel { width: 440px; border-left: 1px solid #ddd; padding: 16px;
+             overflow-y: auto; background: white; }
+    .panel h2 { margin: 0 0 4px; font-size: 15px; word-break: break-all;
+                font-family: ui-monospace, monospace; }
+    .panel .subtitle { color: #777; font-size: 12px; margin-bottom: 14px; }
+    .panel .cats-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px;
+                       align-items: center; }
+    .cats-row .label { font-size: 11px; color: #555; text-transform: uppercase;
+                        letter-spacing: 0.5px; margin-right: 4px; }
+    .cat-tag { background: #e8eaf6; color: #3949ab; padding: 3px 8px;
+               border-radius: 10px; font-size: 11px; font-weight: 500; }
+    .warning-banner { background: #fff4e0; border: 1px solid #ffcc80; color: #8c5400;
+                      padding: 8px 12px; border-radius: 4px; font-size: 12px;
+                      margin-bottom: 14px; line-height: 1.4; }
+
+    .slots-header { font-size: 11px; text-transform: uppercase;
+                    letter-spacing: 0.5px; color: #555; margin: 0 0 8px; }
+    .slot-card { border: 1px solid #e0e0e0; border-radius: 4px; padding: 10px 12px;
+                 margin-bottom: 10px; background: #fafafa; transition: background 0.1s; }
+    .slot-card.active { background: #fff8e1; border-color: #ffc107; }
+    .slot-head { display: flex; justify-content: space-between;
+                 align-items: center; margin-bottom: 6px; gap: 8px; }
+    .slot-id { font-weight: 600; font-size: 13px; font-family: ui-monospace, monospace; }
+    .kind-btns { display: flex; gap: 2px; flex-wrap: wrap; }
+    .kind-btn { padding: 2px 6px; border: 1px solid #ccc; background: white;
+                font-size: 10px; cursor: pointer; border-radius: 3px;
+                color: #555; font-family: ui-monospace, monospace; }
+    .kind-btn:hover { background: #eef4ff; color: #0066cc; border-color: #0066cc; }
+    .kind-btn.active { background: #1e88e5; color: white; border-color: #1565c0;
+                       cursor: default; font-weight: 600; }
+    .kind-btn.active:hover { background: #1e88e5; color: white; border-color: #1565c0; }
+    .user-edited-flag { color: #1565c0; font-size: 10px; font-style: italic;
+                         margin-left: 6px; }
+    .role-badge { display: inline-block; font-size: 10px; padding: 1px 6px;
+                  background: #ede7f6; color: #5e35b1; border-radius: 8px;
+                  font-family: ui-monospace, monospace; margin-left: 6px;
+                  cursor: pointer; }
+    .role-badge:hover { background: #d1c4e9; }
+    .role-badge.unset { background: #f5f5f5; color: #999; }
+    .excerpt { font-size: 12px; color: #444; margin-bottom: 6px;
+               font-style: italic; word-break: break-word; line-height: 1.4; }
+    .constraints { font-size: 11px; color: #666;
+                   font-family: ui-monospace, monospace; }
+    .constraints .req { color: #d32f2f; font-weight: 600; }
+    .constraints .sep { color: #bbb; margin: 0 4px; }
+
+    .actions-row { display: flex; gap: 6px; margin: 8px 0 14px; flex-wrap: wrap; }
+    .action-btn { padding: 4px 10px; border: 1px solid #ccc; background: white;
+                  font-size: 11px; cursor: pointer; border-radius: 3px;
+                  font-family: inherit; }
+    .action-btn:hover { background: #f0f4ff; border-color: #0066cc; color: #0066cc; }
+    .action-btn.danger:hover { background: #ffeaea; border-color: #d32f2f; color: #d32f2f; }
+    .action-btn.primary { background: #1e88e5; color: white; border-color: #1565c0; }
+    .action-btn.primary:hover { background: #1565c0; color: white; }
+    .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .action-btn:disabled:hover { background: white; border-color: #ccc; color: #888; }
+
+    .overlap-banner { background: #fff4e0; border: 1px solid #ffcc80; color: #8c5400;
+                      padding: 10px 12px; border-radius: 4px; font-size: 12px;
+                      margin-bottom: 14px; line-height: 1.4; }
+    .overlap-banner .head { font-weight: 600; margin-bottom: 6px; }
+    .overlap-banner .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+
+    .unmapped-section { margin-top: 18px; padding-top: 14px;
+                        border-top: 1px solid #e0e0e0; }
+    .unmapped-section h3 { font-size: 11px; text-transform: uppercase;
+                           letter-spacing: 0.5px; color: #555; margin: 0 0 8px;
+                           display: flex; justify-content: space-between;
+                           align-items: center; cursor: pointer; user-select: none; }
+    .unmapped-section h3 .toggle { color: #999; font-weight: normal; font-size: 12px; }
+    .unmapped-card { border: 1px dashed #bbb; border-radius: 4px; padding: 8px 12px;
+                     margin-bottom: 8px; background: #f9f9f9; }
+    .unmapped-card.active { background: #f0f4ff; border-color: #0066cc; }
+    .unmapped-card .hint-head { display: flex; justify-content: space-between;
+                                align-items: center; margin-bottom: 4px; gap: 6px; }
+    .unmapped-card .kind-hint { font-family: ui-monospace, monospace; font-size: 11px;
+                                color: #555; background: #e8e8e8; padding: 1px 5px;
+                                border-radius: 2px; }
+    .unmapped-card .reason { font-size: 10px; color: #888; font-style: italic; }
+    .unmapped-card .excerpt { font-size: 12px; color: #444; margin: 4px 0;
+                              word-break: break-word; }
+    .unmapped-card .promote-row { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 4px;
+                                  align-items: center; }
+    .unmapped-card .promote-label { font-size: 10px; color: #666; margin-right: 4px; }
+    .promote-btn { padding: 2px 7px; border: 1px solid #aaa; background: white;
+                   font-size: 10px; cursor: pointer; border-radius: 3px;
+                   font-family: ui-monospace, monospace; color: #333; }
+    .promote-btn:hover { background: #1e88e5; color: white; border-color: #1565c0; }
+
+    /* Belt-and-suspenders: hide v4 debug-floater if it leaks in. */
+    .dbg-floater { display: none !important; }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <header>
+      <h1>pptx-skill v5 — skeletons</h1>
+      <div class="nav"><a href="/">describe</a><a href="/compose">compose</a></div>
+    </header>
+    <div id="skeletons-list"></div>
+  </aside>
+  <main class="preview-area" id="preview-area">
+    <div class="preview-empty">
+      <div>Select a skeleton on the left.</div>
+      <div class="hint">colored boxes = our digest proposal · hover for details</div>
+    </div>
+  </main>
+  <aside class="panel" id="panel">
+    <div class="preview-empty" style="text-align:center;padding-top:40px;">
+      No skeleton selected.
+    </div>
+  </aside>
+
+  <script>
+    const KIND_LIST = ['heading', 'paragraph', 'bullets', 'table', 'chart', 'image', 'footer'];
+    const ROLE_LIST = ['(none)', 'page_title', 'subtitle', 'body', 'footer', 'date',
+      'page_number', 'footnote', 'caption', 'key_points', 'detailed_list',
+      'cta', 'byline', 'kpi_label', 'kpi_value', 'section_header'];
+
+    async function loadSkeletons() {
+      const r = await fetch('/api/v5/skeletons');
+      const data = await r.json();
+      const root = document.getElementById('skeletons-list');
+      root.innerHTML = '';
+      const decks = Object.keys(data.decks).sort();
+      if (decks.length === 0) {
+        root.innerHTML = '<div style="padding:14px;color:#888;font-size:12px;line-height:1.5;">No skeletons yet.<br>Run:<br><code style="font-size:11px;">python3 authoring/cli.py ingest your_deck.pptx</code></div>';
+        return;
+      }
+      decks.forEach(deck => {
+        const group = document.createElement('div');
+        group.className = 'deck-group';
+        const h = document.createElement('h2');
+        h.textContent = deck;
+        group.appendChild(h);
+        const ul = document.createElement('ul');
+        ul.className = 'item-list';
+        data.decks[deck].forEach(sk => {
+          const li = document.createElement('li');
+          li.dataset.id = sk.id;
+          const cats = (sk.categories || []).join(', ') || '—';
+          const warn = sk.has_warnings ? '<span class="warn-dot" title="overlap_detected">⚠</span> ' : '';
+          li.innerHTML = `
+            <span class="label">
+              <span class="top">${warn}slide ${sk.source_slide_index} · ${sk.slot_count} slots</span>
+              <span class="cats">${cats}</span>
+            </span>
+            <span class="pill ${sk.status}">${sk.status}</span>
+          `;
+          li.onclick = () => selectSkeleton(sk.id);
+          ul.appendChild(li);
+        });
+        group.appendChild(ul);
+        root.appendChild(group);
+      });
+    }
+
+    async function selectSkeleton(id) {
+      document.querySelectorAll('.item-list li').forEach(li => {
+        li.classList.toggle('active', li.dataset.id === id);
+      });
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}`);
+      const sk = await r.json();
+      renderPreview(sk);
+      renderPanel(sk);
+    }
+
+    function renderPreview(sk) {
+      const area = document.getElementById('preview-area');
+      area.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'preview-wrap';
+      const img = document.createElement('img');
+      img.src = `/v5/skeleton/${encodeURIComponent(sk.id)}/preview.png?cb=${Date.now()}`;
+      img.onerror = () => {
+        wrap.style.background = 'transparent';
+        wrap.style.boxShadow = 'none';
+        wrap.innerHTML = `<div class="preview-empty">
+          <div>No preview rendered for this skeleton yet.</div>
+          <div class="hint">Run: python3 authoring/cli.py preview</div>
+          <div class="hint" style="margin-top:14px;">Slot inventory is still visible on the right →</div>
+        </div>`;
+      };
+      img.onload = () => {
+        (sk.slots || []).forEach(slot => {
+          const g = slot.geometry || {};
+          const d = document.createElement('div');
+          d.className = `slot-overlay ${slot.kind}`;
+          d.style.left = `${(g.x || 0) * 100}%`;
+          d.style.top = `${(g.y || 0) * 100}%`;
+          d.style.width = `${(g.w || 0) * 100}%`;
+          d.style.height = `${(g.h || 0) * 100}%`;
+          d.dataset.slotId = slot.id;
+          d.innerHTML = `<span class="slot-label">${slot.id} · ${slot.kind}</span>`;
+          d.onmouseenter = () => highlightSlot(slot.id, true);
+          d.onmouseleave = () => highlightSlot(slot.id, false);
+          wrap.appendChild(d);
+        });
+        (sk.unmapped_shapes || []).forEach((entry, idx) => {
+          const g = entry.geometry || {};
+          const d = document.createElement('div');
+          d.className = 'slot-overlay unmapped';
+          d.style.left = `${(g.x || 0) * 100}%`;
+          d.style.top = `${(g.y || 0) * 100}%`;
+          d.style.width = `${(g.w || 0) * 100}%`;
+          d.style.height = `${(g.h || 0) * 100}%`;
+          d.dataset.unmappedIndex = idx;
+          d.innerHTML = `<span class="slot-label">unmapped · ${entry.kind_hint}</span>`;
+          d.onmouseenter = () => highlightUnmapped(idx, true);
+          d.onmouseleave = () => highlightUnmapped(idx, false);
+          wrap.appendChild(d);
+        });
+      };
+      wrap.appendChild(img);
+      area.appendChild(wrap);
+    }
+
+    function renderPanel(sk) {
+      const panel = document.getElementById('panel');
+      const cats = (sk.categories || []).map(c => `<span class="cat-tag">${escapeHtml(c)}</span>`).join('');
+
+      // Status action row depends on current status.
+      const status = sk.status || 'pending';
+      let statusActions = '';
+      if (status === 'pending') {
+        statusActions = `
+          <button class="action-btn primary" onclick="setStatus('${sk.id}', 'done')">Mark done</button>
+          <button class="action-btn danger" onclick="setStatus('${sk.id}', 'rejected')">Reject</button>`;
+      } else if (status === 'done') {
+        statusActions = `
+          <button class="action-btn" onclick="setStatus('${sk.id}', 'pending')">Back to pending</button>
+          <button class="action-btn danger" onclick="setStatus('${sk.id}', 'rejected')">Reject</button>`;
+      } else if (status === 'rejected') {
+        statusActions = `
+          <button class="action-btn primary" onclick="setStatus('${sk.id}', 'pending')">Restore</button>`;
+      }
+
+      // Overlap banner — actionable only if no decision recorded yet.
+      const warnings = sk.digest_warnings || [];
+      const overlapDecided = !!sk.overlap_decision;
+      let warnHtml = '';
+      if (warnings.length && !overlapDecided) {
+        warnHtml = `
+          <div class="overlap-banner">
+            <div class="head">⚠ overlap_detected</div>
+            <div>A picture sits under text on this slide. The agent shouldn't blindly swap it (cross-slide misalignment risk). Choose:</div>
+            <div class="actions">
+              <button class="action-btn" onclick="setOverlapDecision('${sk.id}', 'image_slot')">Keep as image slot</button>
+              <button class="action-btn" disabled title="B4-render not yet implemented">Freeze as background</button>
+              <button class="action-btn danger" onclick="setOverlapDecision('${sk.id}', 'reject')">Reject slide</button>
+            </div>
+          </div>`;
+      } else if (overlapDecided) {
+        warnHtml = `<div class="overlap-banner" style="background:#e8f5e9;border-color:#a5d6a7;color:#1b5e20;">
+          <div class="head">✓ overlap decision: ${escapeHtml(sk.overlap_decision)}</div>
+        </div>`;
+      }
+
+      const slotCards = (sk.slots || []).map(slot => {
+        const kindBtns = KIND_LIST.map(k =>
+          `<button class="kind-btn ${k === slot.kind ? 'active' : ''}"
+                   onclick="reclassifySlot('${sk.id}', '${escapeHtml(slot.id)}', '${k}')"
+                   title="${k === slot.kind ? 'current kind' : 'click to reclassify to ' + k}">
+             ${k}
+           </button>`
+        ).join('');
+        const c = slot.constraints || {};
+        const parts = [];
+        if (c.max_chars) parts.push(`max ${c.max_chars} chars`);
+        if (c.max_lines) parts.push(`${c.max_lines} lines`);
+        if (c.max_items) parts.push(`${c.max_items} items`);
+        if (c.max_chars_per_item) parts.push(`${c.max_chars_per_item} chars/item`);
+        if (c.max_rows && c.max_cols) parts.push(`${c.max_rows}×${c.max_cols}${c.has_header ? ' +hdr' : ''}`);
+        if (c.chart_type) parts.push(`${c.chart_type}, ${c.max_series}s×${c.max_categories}c`);
+        if (c.aspect) parts.push(`aspect ${c.aspect}`);
+        if (c.required) parts.push('<span class="req">required</span>');
+        const editedFlag = slot.user_edited
+          ? '<span class="user-edited-flag">(user-edited)</span>'
+          : (slot.user_promoted ? '<span class="user-edited-flag">(user-promoted)</span>' : '');
+        const demoteBtn = slot.user_promoted
+          ? `<button class="action-btn danger" style="margin-left:6px;font-size:10px;padding:2px 6px;"
+                     onclick="demoteSlot('${sk.id}', '${escapeHtml(slot.id)}', ${JSON.stringify(slot.sha || null)})"
+                     title="Move this slot back to unmapped decoration">demote</button>`
+          : '';
+        const roleLabel = slot.role || 'no role';
+        const roleClass = slot.role ? '' : 'unset';
+        const roleBadge = `<span class="role-badge ${roleClass}" title="Click to change role"
+                                  onclick="changeRole('${sk.id}', '${escapeHtml(slot.id)}', '${escapeHtml(slot.role || '')}')">
+                              ${escapeHtml(roleLabel)}
+                           </span>`;
+        return `<div class="slot-card" data-slot-id="${escapeHtml(slot.id)}">
+          <div class="slot-head">
+            <span class="slot-id">${escapeHtml(slot.id)}${roleBadge}${editedFlag}${demoteBtn}</span>
+            <span class="kind-btns">${kindBtns}</span>
+          </div>
+          ${slot.source_excerpt ? `<div class="excerpt">${escapeHtml(slot.source_excerpt)}</div>` : ''}
+          <div class="constraints">${parts.join('<span class="sep">·</span>')}</div>
+        </div>`;
+      }).join('');
+
+      const unmapped = sk.unmapped_shapes || [];
+      const unmappedHtml = unmapped.length ? `
+        <div class="unmapped-section">
+          <h3>Unmapped shapes <span class="toggle">(${unmapped.length}) — promote any our heuristic missed</span></h3>
+          ${unmapped.map((entry, idx) => {
+            const promoteBtns = KIND_LIST.map(k =>
+              `<button class="promote-btn" onclick="promoteShape('${sk.id}', ${idx}, '${k}')">${k}</button>`
+            ).join('');
+            return `<div class="unmapped-card" data-unmapped-index="${idx}">
+              <div class="hint-head">
+                <span class="kind-hint">${escapeHtml(entry.kind_hint)}</span>
+                <span class="reason">${escapeHtml(entry.skipped_reason || '')}</span>
+              </div>
+              ${entry.source_excerpt
+                ? `<div class="excerpt">${escapeHtml(entry.source_excerpt)}</div>`
+                : '<div class="excerpt" style="color:#999;">(no text)</div>'}
+              <div class="promote-row">
+                <span class="promote-label">promote to →</span>
+                ${promoteBtns}
+              </div>
+            </div>`;
+          }).join('')}
+        </div>` : '';
+
+      panel.innerHTML = `
+        <h2>${escapeHtml(sk.id)}</h2>
+        <div class="subtitle">
+          ${escapeHtml(sk.source_deck)} · slide ${sk.source_slide_index}
+          · ${(sk.slots || []).length} slot${(sk.slots || []).length === 1 ? '' : 's'}
+          · <span class="pill ${status}">${status}</span>
+        </div>
+        <div class="actions-row">${statusActions}</div>
+        <div class="cats-row"><span class="label">categories</span>${cats || '<span style="color:#888;font-size:11px;">none</span>'}</div>
+        ${warnHtml}
+        <h3 class="slots-header">slots (proposed)</h3>
+        ${slotCards}
+        ${unmappedHtml}
+      `;
+    }
+
+    async function setStatus(id, status) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/status`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({status})
+      });
+      if (!r.ok) {
+        alert('Status update failed: ' + (await r.text()));
+        return;
+      }
+      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+    }
+
+    async function setOverlapDecision(id, decision) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/overlap-decision`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({decision})
+      });
+      if (!r.ok) { alert('Overlap decision failed: ' + (await r.text())); return; }
+      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+    }
+
+    async function promoteShape(id, shape_index, kind) {
+      // If the target unmapped entry is a deck-wide repeated brand mark,
+      // ask whether to propagate so the user doesn't accidentally create
+      // a slide-N-only swappable hero while the same picture stays
+      // decoration on every other slide. The /v5 panel already has the
+      // skeleton in scope; we look up the entry from the cached render.
+      const panel = document.getElementById('panel');
+      const card = panel.querySelector(`.unmapped-card[data-unmapped-index="${shape_index}"]`);
+      let propagate = false;
+      if (card) {
+        const reason = card.querySelector('.reason')?.textContent || '';
+        if (reason.toLowerCase().includes('repeated brand mark')) {
+          const choice = confirm(
+            "This picture appears on multiple slides as deck-wide decoration.\n\n" +
+            "OK   = promote on all slides where it appears (consistent)\n" +
+            "Cancel = promote on this slide only (may cause cross-slide inconsistency)"
+          );
+          propagate = choice === true;
+        }
+      }
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/promote-shape`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({shape_index, kind, propagate})
+      });
+      if (!r.ok) { alert('Promote failed: ' + (await r.text())); return; }
+      const result = await r.json();
+      if (result.propagated_to?.length) {
+        // Refresh the sidebar list so other skeletons show updated state.
+        await loadSkeletons();
+      }
+      await refreshCurrent(id);
+    }
+
+    async function demoteSlot(id, slot_id, sha) {
+      let propagate = false;
+      if (sha) {
+        propagate = confirm(
+          "Demote this slot back to decoration.\n\n" +
+          "OK   = demote on all slides where the same picture is user-promoted\n" +
+          "Cancel = demote on this slide only"
+        );
+      }
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/demote-slot`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({slot_id, propagate})
+      });
+      if (!r.ok) { alert('Demote failed: ' + (await r.text())); return; }
+      const result = await r.json();
+      if (result.propagated_to?.length) {
+        await loadSkeletons();
+      }
+      await refreshCurrent(id);
+    }
+
+    async function reclassifySlot(id, slot_id, kind) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/slot/${encodeURIComponent(slot_id)}/kind`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({kind})
+      });
+      if (!r.ok) { alert('Reclassify failed: ' + (await r.text())); return; }
+      await refreshCurrent(id);
+    }
+
+    async function changeRole(id, slot_id, currentRole) {
+      const prompt_text = "Set slot role (blank = clear). Allowed:\n" +
+        ROLE_LIST.slice(1).join(', ');
+      const answer = window.prompt(prompt_text, currentRole || '');
+      if (answer === null) return;  // cancelled
+      const new_role = answer.trim() === '' ? null : answer.trim();
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/slot/${encodeURIComponent(slot_id)}/role`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({role: new_role})
+      });
+      if (!r.ok) { alert('Role update failed: ' + (await r.text())); return; }
+      await refreshCurrent(id);
+    }
+
+    async function refreshCurrent(id) {
+      const r = await fetch(`/api/v5/skeleton/${encodeURIComponent(id)}`);
+      const sk = await r.json();
+      renderPreview(sk);
+      renderPanel(sk);
+    }
+
+    function highlightUnmapped(idx, on) {
+      document.querySelectorAll(`.unmapped-card[data-unmapped-index="${idx}"]`).forEach(c => {
+        c.classList.toggle('active', on);
+      });
+    }
+
+    function highlightSlot(slotId, on) {
+      document.querySelectorAll(`.slot-card[data-slot-id="${CSS.escape(slotId)}"]`).forEach(c => {
+        c.classList.toggle('active', on);
+      });
+    }
+
+    function escapeHtml(s) {
+      return (s == null ? '' : String(s)).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    loadSkeletons();
+  </script>
+</body>
+</html>
+"""
+
+
 def main():
     port = int(os.environ.get("PPTX_SKILL_PORT", "5050"))
-    url = f"http://127.0.0.1:{port}/"
+    # On the v5 redesign branch, /v5 is the primary surface — auto-open
+    # there rather than the v4 describe page. Pass PPTX_SKILL_LANDING=/
+    # to keep the v4 landing for asset-describe sessions.
+    landing = os.environ.get("PPTX_SKILL_LANDING", "/v5")
+    url = f"http://127.0.0.1:{port}{landing}"
     Timer(1.2, lambda: webbrowser.open(url)).start()
-    print(f"pptx-skill describe app → {url}")
+    print(f"pptx-skill app → {url}")
+    print(f"  v5 skeletons:   http://127.0.0.1:{port}/v5")
+    print(f"  v4 describe:    http://127.0.0.1:{port}/")
+    print(f"  compose:        http://127.0.0.1:{port}/compose")
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
