@@ -5,14 +5,21 @@ Two neutral-brand 16:9 builder scripts that emit ready-to-ingest
 needs (cover / agenda / dividers / quote / closing) plus the content
 slides that fill in between (header + text + chart/image/table).
 
-The compiled `.pptx` outputs ship in this directory **and** the
-predigested artifacts (theme.yaml, skeleton.yaml, asset binaries +
-sidecars) ship under `authoring/workspace/` so a fresh clone has a
-fully ingested corpus — no builder script, no `cli.py ingest` step
-required. Run the workflow (`cli.py validate`, `cli.py build-v5`,
-the web app, …) immediately after `git pull`.
+The compiled `.pptx` outputs ship in this directory, and the
+predigested **skeletons** (the slot/geometry/style definitions for
+each example slide) ship under
+`authoring/workspace/skeletons/standard_templates_*` and
+`authoring/workspace/skeletons/title_and_breaks_*` so the agent has a
+ready layout vocabulary on a fresh clone — no `cli.py ingest` step
+required for that.
 
-To regenerate the predigested resources after editing a builder:
+Themes, assets, and per-deck artifacts are **not** committed. Bring
+your own theme + asset library; `--theme` against your theme when you
+compose, and `find-asset` will draw from your assets. If you want the
+example decks' themes locally, run `cli.py ingest` on the `.pptx`
+files in this directory.
+
+To regenerate the skeletons after editing a builder:
 
 ```bash
 python3 examples/build_standard_templates.py
@@ -21,10 +28,9 @@ python3 authoring/cli.py remove-deck standard_templates
 python3 authoring/cli.py remove-deck title_and_breaks
 python3 authoring/cli.py ingest examples/standard_templates.pptx
 python3 authoring/cli.py ingest examples/title_and_breaks.pptx
+# Commit only the workspace/skeletons/standard_templates_* and
+# workspace/skeletons/title_and_breaks_* changes.
 ```
-
-(If the asset SHAs change, update the explicit exceptions in
-`.gitignore` to match the new file names.)
 
 ## Standard content templates — `build_standard_templates.py`
 
