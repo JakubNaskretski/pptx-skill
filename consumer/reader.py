@@ -2283,43 +2283,35 @@ def cmd_v5_check_asset_fit(args: argparse.Namespace) -> None:
 def cmd_v5_find_asset(args: argparse.Namespace) -> None:
     """Deterministic shortlist filter over the asset library.
 
-    Filters index.json's assets by structural tags only (kind required;
-    feel / composition / scope / suitable_for / colors optional). Free-
-    text fields (subject, depicts) are NOT used as filter inputs — the
-    agent uses them to pick the final 1-of-N from the returned shortlist.
+    Filter dimensions:
+      --kind   required; matches the asset's ``kind`` exactly
+      --tags   optional, repeatable; an asset matches if it carries
+               every requested tag (AND, not OR)
 
-    Two compose runs against the same library + same query produce the
-    same shortlist in the same order (sorted by id, ascending). Idempo-
-    tent by construction.
+    `description` is included in each match for picking the final 1-of-N
+    by topic fit, but is never a filter input. `width`/`height`/`aspect`
+    ride along so the agent can call check-asset-fit on the shortlist
+    without a second round-trip.
+
+    Two runs against the same library + same query produce the same
+    shortlist in the same order (sorted by id, ascending). Idempotent
+    by construction.
 
     If the filter is too tight to return any candidates, ``suggestion``
-    names the field to drop first; the agent should retry with a broader
-    filter before falling back to "placeholder" or external sourcing.
+    points to the broadening step.
     """
     index = load_index()
     assets = index.get("assets", []) or []
 
-    def _matches(entry: dict, key: str, wants: list[str]) -> bool:
-        got = entry.get(key)
-        if got is None or got == "":
-            return False
-        if isinstance(got, list):
-            haystack = [str(x) for x in got]
-            return any(w in haystack for w in wants)
-        return str(got) in wants
-
     pool = [a for a in assets if str(a.get("kind", "")) == args.kind]
     total_kind = len(pool)
-    if args.feel:
-        pool = [a for a in pool if _matches(a, "feel", [args.feel])]
-    if args.composition:
-        pool = [a for a in pool if _matches(a, "composition", [args.composition])]
-    if args.suitable_for:
-        pool = [a for a in pool if _matches(a, "suitable_for", args.suitable_for)]
-    if args.scope:
-        pool = [a for a in pool if _matches(a, "scope", args.scope)]
-    if args.colors:
-        pool = [a for a in pool if _matches(a, "colors", args.colors)]
+
+    wanted_tags = list(args.tags or [])
+    if wanted_tags:
+        pool = [
+            a for a in pool
+            if all(t in (a.get("tags") or []) for t in wanted_tags)
+        ]
 
     pool.sort(key=lambda a: str(a.get("id", "")))
     limit = max(1, int(args.limit or 5))
@@ -2327,26 +2319,13 @@ def cmd_v5_find_asset(args: argparse.Namespace) -> None:
 
     suggestion: str | None = None
     if not shortlist:
-        # Drop order: most-specific first, so the agent broadens the
-        # weakest constraints before giving up structural signal.
-        drop_order = []
-        if args.colors:
-            drop_order.append("--colors")
-        if args.composition:
-            drop_order.append("--composition")
-        if args.scope:
-            drop_order.append("--scope")
-        if args.suitable_for:
-            drop_order.append("--suitable-for")
-        if args.feel:
-            drop_order.append("--feel")
-        if drop_order:
+        if wanted_tags:
             suggestion = (
-                f"no match — drop {drop_order[0]} and retry "
-                f"(broaden order: {', '.join(drop_order)}). If still "
-                f"empty, either stage a new asset (POST /api/asset/add) "
-                f'or pass "placeholder" as the asset_id to render a '
-                f"labeled grey box for manual replacement post-build."
+                f"no match — drop --tags and retry with --kind {args.kind} "
+                f"only. If still empty, either stage a new asset "
+                f'(POST /api/asset/add) or pass "placeholder" as the '
+                f"asset_id to render a labeled grey box for manual "
+                f"replacement post-build."
             )
         else:
             suggestion = (
@@ -2357,28 +2336,24 @@ def cmd_v5_find_asset(args: argparse.Namespace) -> None:
     out = {
         "query": {
             "kind": args.kind,
-            "feel": args.feel,
-            "composition": args.composition,
-            "suitable_for": args.suitable_for or [],
-            "scope": args.scope or [],
-            "colors": args.colors or [],
+            "tags": wanted_tags,
         },
         "matches": [
             {
                 "id": a.get("id"),
                 "kind": a.get("kind"),
-                "feel": a.get("feel", ""),
-                "composition": a.get("composition", ""),
-                "suitable_for": list(a.get("suitable_for") or []),
-                "scope": list(a.get("scope") or []),
-                "colors": list(a.get("colors") or []),
-                "subject": a.get("subject", ""),
-                "depicts": a.get("depicts", ""),
+                "tags": list(a.get("tags") or []),
+                "description": a.get("description", ""),
+                "width": int(a.get("width") or 0),
+                "height": int(a.get("height") or 0),
+                "aspect": float(a.get("aspect") or 0.0),
+                "colors_hex": list(a.get("colors_hex") or []),
             }
             for a in shortlist
         ],
         "count": len(shortlist),
         "total_of_kind": total_kind,
+        "tag_vocab": list(index.get("tag_vocab") or []),
         "suggestion": suggestion,
     }
     json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
@@ -3078,7 +3053,7 @@ def main(argv: list[str] | None = None) -> None:
     p_fa = sub.add_parser(
         "find-asset",
         help="Deterministic shortlist filter over the asset library "
-             "(structural tags only — feel/suitable_for/colors). Always "
+             "(--kind required; --tags optional, AND-matched). Always "
              "call this BEFORE picking an asset_id by reading index.json.",
     )
     p_fa.add_argument(
@@ -3087,26 +3062,10 @@ def main(argv: list[str] | None = None) -> None:
              "chart|callout|freeform|smartart",
     )
     p_fa.add_argument(
-        "--feel", default=None,
-        help="formal|warm|clinical|punchy|playful|minimal|dramatic",
-    )
-    p_fa.add_argument(
-        "--composition", default=None,
-        help="centered|left-weighted|right-weighted|full-bleed|"
-             "top-heavy|scattered",
-    )
-    p_fa.add_argument(
-        "--suitable-for", action="append", default=None, dest="suitable_for",
-        help="repeatable; any-match (e.g. --suitable-for team)",
-    )
-    p_fa.add_argument(
-        "--scope", action="append", default=None,
-        help="repeatable; any-match (e.g. --scope generic, "
-             "--scope client:acme-bank)",
-    )
-    p_fa.add_argument(
-        "--colors", action="append", default=None,
-        help="repeatable; any-match against semantic color words",
+        "--tags", action="append", default=None,
+        help="repeatable; AND-matched against the workspace tag vocab "
+             "(see `tag_vocab` field on the find-asset response or in "
+             "index.json).",
     )
     p_fa.add_argument(
         "--limit", type=int, default=5,

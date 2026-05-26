@@ -826,16 +826,10 @@ def _prune_dead_sources(sources: list, valid_decks: set[str]) -> list:
 
 _ASSET_DESCRIPTIVE_DEFAULTS = {
     "kind": "",
-    "subject": "",
-    "depicts": "",
-    "feel": "",
-    "composition": "",
-    "colors": [],
-    "scope": [],
-    "suitable_for": [],
+    "tags": [],
+    "description": "",
     "status": "pending",
     "notes": "",
-    "interpretation": "",
 }
 
 
@@ -849,6 +843,8 @@ def write_asset_yaml_stub(
     kind: str | None = None,
     colors_hex: list | None = None,
     recolor_targets: list | None = None,
+    width: int | None = None,
+    height: int | None = None,
     table: dict | None = None,
     chart: dict | None = None,
     shape: dict | None = None,
@@ -856,14 +852,11 @@ def write_asset_yaml_stub(
 ) -> None:
     """Write an asset sidecar in canonical-order YAML.
 
-    Structural fields (id, sha1, colors_hex, recolor_targets, sources)
-    are refreshed when the ingest layer supplies new values. Descriptive
-    fields (kind/subject/depicts/feel/composition/colors/scope/
-    suitable_for/status/notes) are preserved verbatim across re-ingest.
-
-    The `kind` kwarg seeds the field only on first ingest — never
-    overwrites a hand-edited value. Pass it when ingest knows the kind
-    (e.g. "vector" for an SVG sibling).
+    Mechanical fields (id, sha1, width, height, aspect, colors_hex,
+    recolor_targets, sources) are refreshed when ingest supplies new
+    values. Descriptive fields (kind/tags/description/notes) are
+    preserved verbatim across re-ingest. The `kind` kwarg seeds the
+    field only on first ingest — never overwrites a hand-edited value.
     """
     existing: dict = {}
     if out_path.exists():
@@ -878,9 +871,6 @@ def write_asset_yaml_stub(
     if kind is not None and not descriptive["kind"]:
         descriptive["kind"] = kind
 
-    # Source list: append the current touch, then prune entries pointing
-    # at decks no longer in workspace/decks/ (handles the "I ran ingest
-    # wrong then rm -rf'd the bad dir" case).
     sources = list(existing.get("sources") or [])
     if not any(
         s.get("deck") == deck_stem and s.get("slide") == slide_number for s in sources
@@ -888,29 +878,26 @@ def write_asset_yaml_stub(
         sources.append({"deck": deck_stem, "slide": slide_number})
     sources = _prune_dead_sources(sources, _current_deck_stems())
 
-    # colors_hex: preserve previous extraction if the new pass returned
-    # nothing (e.g. PIL absent, or unsupported format) so we don't clobber.
-    if colors_hex:
-        out_colors_hex = colors_hex
-    else:
-        out_colors_hex = list(existing.get("colors_hex") or [])
+    # Mechanical: prefer fresh values from ingest; fall back to whatever
+    # was already on disk so we never clobber a known-good measurement.
+    out_colors_hex = colors_hex if colors_hex else list(existing.get("colors_hex") or [])
+    out_width = int(width if width is not None else (existing.get("width") or 0))
+    out_height = int(height if height is not None else (existing.get("height") or 0))
+    out_aspect = (out_width / out_height) if out_width > 0 and out_height > 0 else 0.0
 
     out = {
-        "kind": descriptive["kind"],
-        "subject": descriptive["subject"],
-        "depicts": descriptive["depicts"],
-        "feel": descriptive["feel"],
-        "composition": descriptive["composition"],
-        "colors": descriptive["colors"],
-        "colors_hex": out_colors_hex,
-        "scope": descriptive["scope"],
-        "suitable_for": descriptive["suitable_for"],
-        "status": descriptive["status"],
-        "notes": descriptive["notes"],
-        "interpretation": descriptive["interpretation"],
         "id": asset_id,
         "sha1": sha1,
         "sources": sources,
+        "kind": descriptive["kind"],
+        "width": out_width,
+        "height": out_height,
+        "aspect": round(out_aspect, 4),
+        "colors_hex": out_colors_hex,
+        "tags": list(descriptive["tags"] or []),
+        "description": descriptive["description"],
+        "status": descriptive["status"],
+        "notes": descriptive["notes"],
     }
 
     if recolor_targets is not None:
@@ -919,8 +906,7 @@ def write_asset_yaml_stub(
         out["recolor_targets"] = existing["recolor_targets"]
 
     # Kind-specific blocks: prefer fresh input from ingest, else
-    # preserve whatever was already there (human edits + prior ingest
-    # data both survive when this re-ingest doesn't supply the block).
+    # preserve whatever was already there.
     for key, value in (
         ("table", table),
         ("chart", chart),
@@ -960,6 +946,41 @@ def _color_close(a: str, b: str, tol: int = 16) -> bool:
     ar, ag, ab = (ai >> 16) & 0xFF, (ai >> 8) & 0xFF, ai & 0xFF
     br, bg, bb_ = (bi >> 16) & 0xFF, (bi >> 8) & 0xFF, bi & 0xFF
     return abs(ar - br) <= tol and abs(ag - bg) <= tol and abs(ab - bb_) <= tol
+
+
+def _image_dimensions(bin_path: Path, ext: str) -> tuple[int, int]:
+    """Return (width, height) for the asset binary.
+
+    Rasters: read via PIL. SVG: parse viewBox or width/height attrs.
+    XML fragments and anything unreadable return (0, 0). Used purely
+    as mechanical metadata; never gates a filter.
+    """
+    ext = ext.lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        try:
+            from PIL import Image
+            with Image.open(bin_path) as im:
+                return int(im.width), int(im.height)
+        except Exception:
+            return 0, 0
+    if ext == ".svg":
+        try:
+            from xml.etree import ElementTree as ET
+            root = ET.fromstring(bin_path.read_text(encoding="utf-8", errors="ignore"))
+            vb = root.attrib.get("viewBox")
+            if vb:
+                parts = vb.replace(",", " ").split()
+                if len(parts) == 4:
+                    return int(float(parts[2])), int(float(parts[3]))
+            def _strip(v: str) -> str:
+                return "".join(c for c in v if c.isdigit() or c == ".")
+            w = root.attrib.get("width", "")
+            h = root.attrib.get("height", "")
+            if w and h:
+                return int(float(_strip(w) or 0)), int(float(_strip(h) or 0))
+        except Exception:
+            return 0, 0
+    return 0, 0
 
 
 def _extract_dominant_colors_hex(blob_path: Path, n: int = 3) -> list[str]:
@@ -1405,6 +1426,7 @@ def extract_picture_assets(
         if not bin_path.exists():
             bin_path.write_bytes(blob)
         colors_hex = _extract_dominant_colors_hex(bin_path)
+        rw, rh = _image_dimensions(bin_path, f".{ext}")
         write_asset_yaml_stub(
             yaml_path,
             asset_id,
@@ -1412,6 +1434,8 @@ def extract_picture_assets(
             deck_stem,
             slide_number,
             colors_hex=colors_hex,
+            width=rw,
+            height=rh,
         )
         geom = _shape_geometry(shape, slide_w, slide_h)
         extracted.append({"atom": asset_id, "kind": "image", **geom})
@@ -1426,6 +1450,7 @@ def extract_picture_assets(
             if not svg_bin_path.exists():
                 svg_bin_path.write_bytes(svg_blob)
             svg_colors = _extract_svg_colors(svg_blob)
+            sw, sh = _image_dimensions(svg_bin_path, f".{svg_ext}")
             write_asset_yaml_stub(
                 svg_yaml_path,
                 svg_asset_id,
@@ -1435,6 +1460,8 @@ def extract_picture_assets(
                 kind="vector",
                 colors_hex=svg_colors,
                 recolor_targets=svg_colors,
+                width=sw,
+                height=sh,
             )
             extracted.append({"atom": svg_asset_id, "kind": "vector", **geom})
 
@@ -1543,18 +1570,16 @@ def extract_deck_theme(prs, deck_stem: str) -> dict:
 
 
 SLIDE_REQUIRED = ("intent", "feel", "suitable_for")
-# Base required-for-all-assets. `composition` is intentionally NOT in
-# this list — it's only required for picture-kinds (see ASSET_PICTURE_KINDS
-# below). Structured atoms (table, chart, callout, freeform, smartart)
-# can have empty composition because the concept doesn't apply.
-ASSET_REQUIRED = ("kind", "subject", "feel", "colors", "scope", "suitable_for")
-# Kinds for which `composition` is meaningful and required. Mirrors the
-# guidance in describe_asset.md ("the slot applies primarily to pictures").
+# Slim asset contract: kind is the only structural enum check here.
+# tags are checked against the workspace tag vocabulary (TAG_VOCAB),
+# which is editable at runtime. description is free-text.
+ASSET_REQUIRED = ("kind", "tags", "description")
 ASSET_PICTURE_KINDS = frozenset(
     {"photo", "icon", "logo", "illustration", "screenshot", "vector"}
 )
 
 VOCAB_PATH = SCHEMAS / "vocab.yaml"
+TAG_VOCAB_PATH = WORKSPACE / "tag_vocab.yaml"
 
 
 def _load_vocab() -> dict:
@@ -1562,14 +1587,31 @@ def _load_vocab() -> dict:
         return yaml.safe_load(f)
 
 
+def load_tag_vocab() -> list[str]:
+    """Return the current workspace tag list. Editable at runtime — do
+    NOT cache; callers should read each time so add/remove takes effect
+    in long-running processes (e.g. the web app).
+    """
+    if not TAG_VOCAB_PATH.exists():
+        return []
+    try:
+        with TAG_VOCAB_PATH.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        tags = data.get("tags") or []
+        return [str(t) for t in tags]
+    except Exception:
+        return []
+
+
+def save_tag_vocab(tags: list[str]) -> None:
+    TAG_VOCAB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    write_yaml(TAG_VOCAB_PATH, {"tags": sorted(set(tags))})
+
+
 VOCAB = _load_vocab()
 SLIDE_FEEL_ENUM = set(VOCAB["slide"]["feel"])
 SLIDE_SUITABLE_ENUM = set(VOCAB["slide"]["suitable_for"])
 ASSET_KIND_ENUM = set(VOCAB["asset"]["kind"])
-ASSET_FEEL_ENUM = set(VOCAB["asset"]["feel"])
-ASSET_COMPOSITION_ENUM = set(VOCAB["asset"]["composition"])
-ASSET_SUITABLE_ENUM = set(VOCAB["asset"]["suitable_for"])
-ASSET_SCOPE_PREFIXES = set(VOCAB["asset"]["scope_prefixes"])
 
 
 def _missing_or_empty(data: dict, keys: Iterable[str]) -> list[str]:
@@ -1602,43 +1644,21 @@ def validate_asset(data: dict) -> list[str]:
     kind = data.get("kind") or ""
     if kind and kind not in ASSET_KIND_ENUM:
         errors.append(f"kind '{kind}' not in {sorted(ASSET_KIND_ENUM)}")
-    if data.get("feel") and data["feel"] not in ASSET_FEEL_ENUM:
-        errors.append(f"feel '{data['feel']}' not in {sorted(ASSET_FEEL_ENUM)}")
-    # `composition` is required for picture-kinds only; structured atoms
-    # (table, chart, callout, freeform, smartart) can leave it empty.
-    composition = data.get("composition") or ""
-    if kind in ASSET_PICTURE_KINDS and not composition:
-        errors.append("composition is required for picture-kind assets")
-    if composition and composition not in ASSET_COMPOSITION_ENUM:
-        errors.append(
-            f"composition '{composition}' not in {sorted(ASSET_COMPOSITION_ENUM)}"
-        )
-    sfor = data.get("suitable_for") or []
-    if isinstance(sfor, list):
-        bad = [t for t in sfor if t not in ASSET_SUITABLE_ENUM]
-        if bad:
-            errors.append(f"suitable_for has unknown tag(s): {bad}")
-    scope = data.get("scope") or []
-    if isinstance(scope, list):
-        for entry in scope:
-            if entry == "generic":
-                continue
-            if not isinstance(entry, str) or ":" not in entry:
+    tags = data.get("tags") or []
+    if isinstance(tags, list):
+        if len(tags) > 4:
+            errors.append(f"tags has {len(tags)} entries; max 4")
+        tag_vocab = set(load_tag_vocab())
+        if tag_vocab:
+            bad = [t for t in tags if t not in tag_vocab]
+            if bad:
                 errors.append(
-                    f"scope entry {entry!r} must be 'generic' or '<prefix>:<value>'"
+                    f"tags has unknown value(s): {bad} (run "
+                    f"'cli.py tag-vocab list' for the current vocab)"
                 )
-                continue
-            prefix, _, value = entry.partition(":")
-            if prefix not in ASSET_SCOPE_PREFIXES:
-                errors.append(
-                    f"scope entry {entry!r}: unknown prefix '{prefix}' "
-                    f"(use one of {sorted(ASSET_SCOPE_PREFIXES)} or 'generic')"
-                )
-            if not value:
-                errors.append(f"scope entry {entry!r}: missing value after ':'")
-    subj = data.get("subject") or ""
-    if subj and len(subj.split()) > 30:
-        errors.append("subject is over 30 words; prefer <=25")
+    desc = data.get("description") or ""
+    if desc and len(desc.split()) > 30:
+        errors.append("description is over 30 words; prefer <=25")
     return errors
 
 
@@ -1993,6 +2013,8 @@ def _add_asset_to_workspace(src: Path, *, kind_hint: str | None = None) -> dict:
         except Exception:
             pass
 
+    w, h = _image_dimensions(bin_path, ext)
+
     # write_asset_yaml_stub expects a (deck_stem, slide_number) pair for
     # the source. For manual adds, append a non-deck `external` entry
     # directly to the YAML — _prune_dead_sources keeps entries without a
@@ -2017,6 +2039,8 @@ def _add_asset_to_workspace(src: Path, *, kind_hint: str | None = None) -> dict:
         kind=inferred_kind,
         colors_hex=colors_hex or None,
         recolor_targets=recolor_targets,
+        width=w,
+        height=h,
     )
     data = read_yaml(yaml_path)
     sources = [
@@ -2168,9 +2192,7 @@ def check_prompt_drift() -> list[str]:
         (PROMPTS / "describe_slide.md", "slide.feel", VOCAB["slide"]["feel"]),
         (PROMPTS / "describe_slide.md", "slide.suitable_for", VOCAB["slide"]["suitable_for"]),
         (PROMPTS / "describe_asset.md", "asset.kind", VOCAB["asset"]["kind"]),
-        (PROMPTS / "describe_asset.md", "asset.feel", VOCAB["asset"]["feel"]),
-        (PROMPTS / "describe_asset.md", "asset.composition", VOCAB["asset"]["composition"]),
-        (PROMPTS / "describe_asset.md", "asset.suitable_for", VOCAB["asset"]["suitable_for"]),
+        (PROMPTS / "describe_asset.md", "asset.tags", load_tag_vocab()),
     ]
     errs: list[str] = []
     for path, label, values in pairs:
@@ -2178,11 +2200,11 @@ def check_prompt_drift() -> list[str]:
             errs.append(f"{path.name}: missing prompt file")
             continue
         text = path.read_text(encoding="utf-8")
-        missing = [v for v in values if v not in text]
+        missing = [v for v in values if v and v not in text]
         if missing:
             errs.append(
                 f"{path.name}: {label} missing value(s) {missing} "
-                f"(update prompt to match schemas/vocab.yaml)"
+                f"(prompt and vocab are out of sync)"
             )
     return errs
 
@@ -2239,6 +2261,306 @@ def validate() -> None:
     click.echo(f"checked {total}, promoted pending→done: {promoted}")
     if failures:
         sys.exit(1)
+
+
+# --- migrate-asset-yaml ----------------------------------------------------
+#
+# One-shot upgrade for the slim asset schema. Strips the dropped fields
+# (feel / composition / suitable_for / scope / colors / depicts /
+# interpretation), folds subject → description so existing free-text
+# survives, seeds tags as empty, and fills width/height/aspect from the
+# binary. Idempotent: running again is a no-op.
+
+_LEGACY_FIELDS_TO_DROP = (
+    "feel",
+    "composition",
+    "suitable_for",
+    "scope",
+    "colors",
+    "depicts",
+    "interpretation",
+    "subject",
+)
+
+
+def _migrate_one_asset(yaml_path: Path) -> tuple[dict, dict, bool]:
+    """Apply the slim-schema migration to one sidecar.
+
+    Returns (new_data, change_summary, changed). The summary lists the
+    fields that were dropped, set, or preserved so the dry-run can
+    show the user exactly what will happen.
+    """
+    data = read_yaml(yaml_path) or {}
+    summary: dict = {"dropped": [], "set": [], "preserved": []}
+    changed = False
+
+    desc = (data.get("description") or "").strip()
+    if not desc:
+        for src in ("subject", "depicts"):
+            v = (data.get(src) or "").strip()
+            if v:
+                desc = v
+                summary["set"].append(f"description ← {src!r}")
+                break
+    if desc and data.get("description") != desc:
+        data["description"] = desc
+        changed = True
+    elif "description" not in data:
+        data["description"] = ""
+        changed = True
+
+    for f in _LEGACY_FIELDS_TO_DROP:
+        if f in data:
+            data.pop(f, None)
+            summary["dropped"].append(f)
+            changed = True
+
+    if "tags" not in data:
+        data["tags"] = []
+        summary["set"].append("tags ← []")
+        changed = True
+    else:
+        if data.get("tags"):
+            summary["preserved"].append(f"tags ({len(data['tags'])} kept)")
+
+    # Mechanical dimensions: only fill if missing or zero. Find the
+    # sibling binary by stem.
+    if not data.get("width") or not data.get("height"):
+        binary: Path | None = None
+        for cand in yaml_path.parent.glob(f"{yaml_path.stem}.*"):
+            if cand.suffix.lower() == ".yaml":
+                continue
+            binary = cand
+            break
+        if binary is not None:
+            w, h = _image_dimensions(binary, binary.suffix)
+            if w and h:
+                data["width"] = w
+                data["height"] = h
+                data["aspect"] = round(w / h, 4)
+                summary["set"].append(f"dimensions ← {w}x{h}")
+                changed = True
+
+    if "aspect" not in data and data.get("width") and data.get("height"):
+        data["aspect"] = round(int(data["width"]) / int(data["height"]), 4)
+        changed = True
+
+    # Canonical key order for the slim shape; preserve any kind-specific
+    # block (table/chart/shape/smartart) that ingest produced.
+    ordered_keys = (
+        "id", "sha1", "sources",
+        "kind", "width", "height", "aspect",
+        "colors_hex", "recolor_targets",
+        "tags", "description",
+        "table", "chart", "shape", "smartart",
+        "status", "notes",
+    )
+    ordered = {k: data[k] for k in ordered_keys if k in data}
+    for k, v in data.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered, summary, changed
+
+
+@cli.command(name="migrate-asset-yaml")
+@click.option("--apply", is_flag=True,
+              help="Actually write changes. Default is dry-run.")
+@click.option("--backup-dir", type=click.Path(path_type=Path, file_okay=False),
+              default=None, help="Where to copy pre-migration sidecars. "
+                                  "Default: workspace/_migration_backup/<ts>/")
+def migrate_asset_yaml(apply: bool, backup_dir: Path | None) -> None:
+    """Upgrade existing asset sidecars to the slim schema.
+
+    Drops feel/composition/suitable_for/scope/colors/depicts/
+    interpretation. Folds subject (or depicts) into `description` only
+    when description is empty — never overwrites a hand-set value.
+    Seeds empty `tags: []`. Fills width/height/aspect from the binary
+    when missing.
+
+    Idempotent. Default is dry-run; pass --apply to write changes.
+    A backup of every modified sidecar is taken first.
+    """
+    yamls = list(iter_asset_yamls())
+    if not yamls:
+        click.echo("no asset sidecars in workspace/assets/")
+        return
+
+    if apply:
+        from datetime import datetime as _dt
+        if backup_dir is None:
+            backup_dir = WORKSPACE / "_migration_backup" / _dt.now().strftime("%Y%m%dT%H%M%S")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+    changed_count = 0
+    for yp in yamls:
+        new_data, summary, changed = _migrate_one_asset(yp)
+        if not changed:
+            continue
+        changed_count += 1
+        rel = yp.relative_to(HERE)
+        click.echo(f"  {rel}")
+        if summary["dropped"]:
+            click.echo(f"    drop:     {', '.join(summary['dropped'])}")
+        if summary["set"]:
+            click.echo(f"    set:      {', '.join(summary['set'])}")
+        if summary["preserved"]:
+            click.echo(f"    keep:     {', '.join(summary['preserved'])}")
+        if apply:
+            shutil.copy2(yp, backup_dir / yp.name)
+            write_yaml(yp, new_data)
+
+    if apply:
+        click.echo(
+            f"\napplied {changed_count}/{len(yamls)} sidecar(s); "
+            f"backups in {backup_dir.relative_to(HERE) if backup_dir.is_relative_to(HERE) else backup_dir}"
+        )
+    else:
+        click.echo(
+            f"\ndry-run: {changed_count}/{len(yamls)} sidecar(s) would change. "
+            f"Re-run with --apply to write."
+        )
+
+
+# --- tag-vocab management --------------------------------------------------
+
+
+@cli.group(name="tag-vocab")
+def tag_vocab_group() -> None:
+    """Manage the workspace asset-tag vocabulary."""
+
+
+@tag_vocab_group.command("list")
+def tag_vocab_list_cmd() -> None:
+    """Print the current tag vocabulary."""
+    tags = load_tag_vocab()
+    if not tags:
+        click.echo("(no tags — workspace/tag_vocab.yaml missing or empty)")
+        return
+    for t in tags:
+        click.echo(t)
+
+
+@tag_vocab_group.command("add")
+@click.argument("tag")
+def tag_vocab_add_cmd(tag: str) -> None:
+    """Add a tag to the vocabulary."""
+    tag = tag.strip().lower()
+    if not tag or " " in tag or not all(c.isalnum() or c == "-" for c in tag):
+        raise click.ClickException(
+            "tag must be lowercase, alphanumeric or '-', no spaces "
+            f"(got {tag!r})"
+        )
+    tags = load_tag_vocab()
+    if tag in tags:
+        click.echo(f"already in vocab: {tag}")
+        return
+    tags.append(tag)
+    save_tag_vocab(tags)
+    click.echo(f"added: {tag}")
+
+
+@tag_vocab_group.command("remove")
+@click.argument("tag")
+@click.option("--replace-with", default=None,
+              help="Existing or new tag to substitute on all assets that "
+                   "currently use the tag being removed. Required if any "
+                   "asset uses it.")
+def tag_vocab_remove_cmd(tag: str, replace_with: str | None) -> None:
+    """Remove a tag from the vocabulary.
+
+    If any asset uses the tag, --replace-with is required so no asset
+    is left with an unknown tag. The replacement is also added to the
+    vocab if not already present.
+    """
+    tag = tag.strip().lower()
+    tags = load_tag_vocab()
+    if tag not in tags:
+        raise click.ClickException(f"not in vocab: {tag}")
+
+    using: list[Path] = []
+    for yp in iter_asset_yamls():
+        try:
+            data = read_yaml(yp)
+        except Exception:
+            continue
+        if tag in (data.get("tags") or []):
+            using.append(yp)
+
+    if using and not replace_with:
+        click.echo(
+            f"{len(using)} asset(s) use {tag!r}; pass --replace-with <other-tag>"
+        )
+        for yp in using:
+            click.echo(f"  {yp.relative_to(HERE)}")
+        sys.exit(1)
+
+    if using and replace_with:
+        rep = replace_with.strip().lower()
+        if rep == tag:
+            raise click.ClickException("--replace-with cannot equal the tag being removed")
+        if rep not in tags:
+            tags.append(rep)
+        for yp in using:
+            data = read_yaml(yp)
+            new_tags = [(rep if t == tag else t) for t in (data.get("tags") or [])]
+            # de-dupe in case the replacement was already present
+            seen: list[str] = []
+            for t in new_tags:
+                if t not in seen:
+                    seen.append(t)
+            data["tags"] = seen
+            write_yaml(yp, data)
+        click.echo(f"replaced {tag!r} → {rep!r} on {len(using)} asset(s)")
+
+    tags = [t for t in tags if t != tag]
+    save_tag_vocab(tags)
+    click.echo(f"removed: {tag}")
+
+
+# --- redescribe ------------------------------------------------------------
+
+
+@cli.command(name="redescribe")
+@click.argument("asset_id", required=False)
+@click.option("--all", "all_assets", is_flag=True,
+              help="Mark every asset pending so they all flow through the "
+                   "describe queue. Description is preserved.")
+def redescribe_cmd(asset_id: str | None, all_assets: bool) -> None:
+    """Mark one (or all) asset(s) pending for redescription.
+
+    Preserves `description` so the existing prose survives — only
+    clears `tags` and resets status to pending. The standard describe
+    flow (web UI or `cli.py next --kind asset`) will then walk you
+    through them; the vision LLM is asked to pick tags (and optionally
+    refine the description).
+    """
+    if not asset_id and not all_assets:
+        raise click.ClickException("pass an asset_id or --all")
+
+    targets: list[Path] = []
+    for yp in iter_asset_yamls():
+        try:
+            data = read_yaml(yp)
+        except Exception:
+            continue
+        if all_assets or data.get("id") == asset_id:
+            targets.append(yp)
+
+    if not targets:
+        raise click.ClickException(f"asset_id not found: {asset_id!r}")
+
+    for yp in targets:
+        data = read_yaml(yp)
+        data["tags"] = []
+        data["status"] = "pending"
+        write_yaml(yp, data)
+        click.echo(f"  pending: {data.get('id')} — {yp.relative_to(HERE)}")
+    click.echo(
+        f"\nmarked {len(targets)} asset(s) pending. Next steps:\n"
+        f"  cli.py prompt --kind asset   # copy describe prompt\n"
+        f"  cli.py next --kind asset --open   # walk the queue\n"
+        f"or open the web app's describe page."
+    )
 
 
 # --- slide rendering -------------------------------------------------------
@@ -2841,23 +3163,22 @@ def build_v5(allow_pending: bool, out_path: Path | None, skill_md_path: Path | N
             "slot_kinds": sorted({s.get("kind") for s in (sk.get("slots") or [])}),
             "status": sk.get("status", "pending"),
         } for sid, _, sk in skeletons],
-        # Asset records carry the full structural-vocab block (kind, feel,
-        # composition, suitable_for, scope, colors, colors_hex) so the
-        # consumer-side `find-asset` can filter deterministically without
-        # opening every sidecar YAML. Free-text fields (subject, depicts)
-        # ride along too for shortlist tiebreaks.
+        # Slim asset record: kind for required-filter; tags as the only
+        # soft filter; description for tiebreak only; mechanical
+        # dimensions for check-asset-fit. tag_vocab is shipped alongside
+        # so the consuming agent can see the closed list without poking
+        # the workspace.
+        "tag_vocab": load_tag_vocab(),
         "assets": [
             {
                 "id": d.get("id"),
                 "kind": d.get("kind", ""),
-                "feel": d.get("feel", ""),
-                "composition": d.get("composition", ""),
-                "suitable_for": list(d.get("suitable_for") or []),
-                "scope": list(d.get("scope") or []),
-                "colors": list(d.get("colors") or []),
+                "tags": list(d.get("tags") or []),
+                "description": d.get("description", ""),
+                "width": int(d.get("width") or 0),
+                "height": int(d.get("height") or 0),
+                "aspect": float(d.get("aspect") or 0.0),
                 "colors_hex": list(d.get("colors_hex") or []),
-                "subject": d.get("subject", ""),
-                "depicts": d.get("depicts", ""),
             }
             for d in (read_yaml(p) for p in asset_yamls)
         ],
