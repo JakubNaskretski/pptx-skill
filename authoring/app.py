@@ -3980,7 +3980,7 @@ document.getElementById("uaFileInput").onchange = (e) => {
 
 @app.get("/compose")
 def compose_page():
-    return render_template_string(COMPOSE_HTML, debug_widget=DEBUG_WIDGET)
+    return render_template_string(COMPOSE_HTML, debug_widget="")
 
 
 # ---------------------------------------------------------------------------
