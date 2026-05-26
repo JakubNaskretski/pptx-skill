@@ -2,8 +2,12 @@
 authoring/workspace/*
 !authoring/workspace/.gitkeep
 
-# Source decks (often sensitive client material) — never tracked
+# Source decks (often sensitive client material) — never tracked,
+# except the canonical example decks shipped from examples/build_*.py
+# so anyone cloning the repo has a working corpus without running
+# the builders first.
 *.pptx
+!examples/*.pptx
 
 # Built consumer artifacts
 authoring/dist/
