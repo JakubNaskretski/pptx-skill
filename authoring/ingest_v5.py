@@ -565,6 +565,12 @@ def _extract_slots(
                     slot["role"] = role
             slots.append(slot)
 
+    # Cross-slot refinement: detect roles that need neighbour context
+    # (kpi_label near kpi_value, byline below page_title). Only assigns
+    # to slots currently without a role; never overrides.
+    if _ENABLE_SLOT_ROLES:
+        _refine_slot_roles(slots)
+
     return slots
 
 
@@ -613,37 +619,174 @@ def _infer_slot_role(shape, slot: dict, slide_w: int, slide_h: int) -> str | Non
             return None  # picture placeholders have no semantic sub-role
 
     # Heuristic for free shapes (no placeholder type to consult).
+    # Multi-signal: each role requires geometry AND style AND constraint
+    # agreement. Falls through to None when uncertain so match-skeletons
+    # uses the kind-only fallback instead of a guessed role.
     kind = slot.get("kind")
     g = slot.get("geometry") or {}
     style = slot.get("style") or {}
+    c = slot.get("constraints") or {}
+    size = float(style.get("size_pt") or 0.0)
+    y = g.get("y", 0.0)
+    max_chars = c.get("max_chars")
+    excerpt = (slot.get("source_excerpt") or "").lower()
 
     if kind == "heading":
-        # Large at top → page_title; smaller at top → section_header
-        size = style.get("size_pt", 0)
-        if g.get("y", 1.0) < 0.15:
-            return "page_title" if size >= 28 else "section_header"
+        # KPI value: large + very short anywhere on the slide
+        if size >= 36 and (max_chars or 999) <= 30:
+            return "kpi_value"
+        # Page title: large size + top region (relaxed from y<0.15 to y<0.20)
+        if size >= 28 and y < 0.20:
+            return "page_title"
+        # Section header: medium size in top quarter
+        if 18 <= size < 28 and y < 0.25:
+            return "section_header"
+        return None  # uncertain heading
+
     if kind == "paragraph":
-        # Small + near bottom → footnote
-        size = style.get("size_pt", 100)
-        if size < 12 and g.get("y", 0) > 0.85:
+        # KPI value: very large + very short
+        if size >= 36 and (max_chars or 999) <= 30:
+            return "kpi_value"
+        # Footnote: small AND near bottom (both required)
+        if 0 < size < 12 and y > 0.85:
             return "footnote"
-        # Short paragraph below an image area → caption (heuristic)
-        c = slot.get("constraints") or {}
-        if c.get("max_chars", 999) < 80:
+        # CTA: action-verb prefix + short text
+        if (max_chars or 999) < 80 and _looks_like_cta(excerpt):
+            return "cta"
+        # Caption: small AND short AND not at top (captions sit below imagery)
+        if 0 < size < 14 and (max_chars or 999) < 80 and y > 0.30:
             return "caption"
-        return "body"
+        # Body: only when confidently long-form
+        max_lines = c.get("max_lines", 0)
+        if (max_chars or 0) >= 60 or max_lines >= 3:
+            return "body"
+        return None  # uncertain free paragraph
+
     if kind == "bullets":
-        c = slot.get("constraints") or {}
         items = c.get("max_items", 0)
         avg_chars = c.get("max_chars_per_item", 0)
         if items <= 4 and avg_chars <= 60:
             return "key_points"
         return "detailed_list"
+
     if kind == "footer":
         return "footer"
     if kind == "image":
         return None  # images have no semantic sub-role beyond kind
     return None
+
+
+# Action-verb prefixes for CTA detection. Conservative — only matches
+# imperatives at the very start of the slot text so plain mentions
+# ("we will contact you") don't get tagged as CTAs.
+_CTA_PREFIXES = (
+    "visit", "contact us", "contact our", "learn more", "sign up",
+    "get started", "join us", "join our", "follow us", "subscribe",
+    "register", "buy now", "shop now", "call us", "email us",
+    "download", "request a", "book a", "try it", "start your",
+)
+
+
+def _looks_like_cta(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    return any(t.startswith(p) for p in _CTA_PREFIXES)
+
+
+def _refine_slot_roles(slots: list[dict]) -> None:
+    """Cross-slot refinement after per-shape inference.
+
+    Detects roles that need neighbour context — kpi_label (small text
+    near a kpi_value), byline (small text directly under a page_title).
+    Conservative: only assigns to slots currently without a role; never
+    overrides an existing role. Each rule needs both geometric proximity
+    AND a style/size match so a stray small textbox can't get a
+    misleading label.
+    """
+    if not slots:
+        return
+    by_role: dict[str, list[dict]] = {}
+    for s in slots:
+        r = s.get("role")
+        if r:
+            by_role.setdefault(r, []).append(s)
+
+    # kpi_label: small paragraph/heading slot adjacent (above/below)
+    # to a kpi_value slot, with horizontal overlap.
+    kpi_values = by_role.get("kpi_value", [])
+    if kpi_values:
+        for s in slots:
+            if s.get("role"):
+                continue
+            if s.get("kind") not in ("paragraph", "heading"):
+                continue
+            style = s.get("style") or {}
+            size = float(style.get("size_pt") or 0.0)
+            if not (0 < size <= 18):
+                continue
+            g = s.get("geometry") or {}
+            for kv in kpi_values:
+                if _slots_adjacent_vertically(g, kv.get("geometry") or {}):
+                    s["role"] = "kpi_label"
+                    break
+
+    # byline: small short paragraph directly below a page_title — the
+    # author/date attribution pattern on a cover slide.
+    page_titles = by_role.get("page_title", [])
+    if page_titles:
+        for s in slots:
+            if s.get("role"):
+                continue
+            if s.get("kind") != "paragraph":
+                continue
+            style = s.get("style") or {}
+            size = float(style.get("size_pt") or 0.0)
+            if not (0 < size <= 14):
+                continue
+            c = s.get("constraints") or {}
+            if (c.get("max_chars") or 999) > 60:
+                continue
+            g = s.get("geometry") or {}
+            for pt in page_titles:
+                if _slot_directly_below(g, pt.get("geometry") or {}, max_gap=0.10):
+                    s["role"] = "byline"
+                    break
+
+
+def _slots_adjacent_vertically(a: dict, b: dict, max_gap: float = 0.05) -> bool:
+    """True if rect a sits within max_gap above or below rect b AND
+    there's horizontal overlap."""
+    ay1 = a.get("y", 0.0)
+    ay2 = ay1 + a.get("h", 0.0)
+    by1 = b.get("y", 0.0)
+    by2 = by1 + b.get("h", 0.0)
+    # smallest gap between the two rects on the y axis
+    if ay2 <= by1:
+        vgap = by1 - ay2
+    elif by2 <= ay1:
+        vgap = ay1 - by2
+    else:
+        vgap = 0.0  # overlapping vertically — count as adjacent
+    if vgap > max_gap:
+        return False
+    ax1 = a.get("x", 0.0); ax2 = ax1 + a.get("w", 0.0)
+    bx1 = b.get("x", 0.0); bx2 = bx1 + b.get("w", 0.0)
+    return min(ax2, bx2) > max(ax1, bx1)
+
+
+def _slot_directly_below(a: dict, b: dict, max_gap: float = 0.10) -> bool:
+    """True if rect a starts below rect b's bottom (within max_gap)
+    and they have horizontal overlap."""
+    ay1 = a.get("y", 0.0)
+    by2 = b.get("y", 0.0) + b.get("h", 0.0)
+    if ay1 < by2:
+        return False
+    if (ay1 - by2) > max_gap:
+        return False
+    ax1 = a.get("x", 0.0); ax2 = ax1 + a.get("w", 0.0)
+    bx1 = b.get("x", 0.0); bx2 = bx1 + b.get("w", 0.0)
+    return min(ax2, bx2) > max(ax1, bx1)
 
 
 # ---------------------------------------------------------------------------

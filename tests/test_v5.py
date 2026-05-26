@@ -457,6 +457,123 @@ class TestSlotRoleInference(unittest.TestCase):
                              "role must not be emitted when _ENABLE_SLOT_ROLES=False")
 
 
+class _StubFreeShape:
+    """Minimal stub for _infer_slot_role free-shape path — only needs
+    is_placeholder=False to skip the placeholder branch."""
+    is_placeholder = False
+
+
+class TestFreeShapeRoleInference(unittest.TestCase):
+    """Direct unit tests for the tightened free-shape rules in
+    _infer_slot_role + the cross-slot refinement in _refine_slot_roles.
+    """
+
+    def _make_slot(self, kind, *, x=0.1, y=0.1, w=0.8, h=0.1,
+                   size_pt=None, max_chars=None, max_lines=None,
+                   max_items=None, max_chars_per_item=None,
+                   excerpt=""):
+        slot = {"kind": kind,
+                "geometry": {"x": x, "y": y, "w": w, "h": h},
+                "style": {},
+                "constraints": {},
+                "source_excerpt": excerpt}
+        if size_pt is not None:
+            slot["style"]["size_pt"] = size_pt
+        if max_chars is not None:
+            slot["constraints"]["max_chars"] = max_chars
+        if max_lines is not None:
+            slot["constraints"]["max_lines"] = max_lines
+        if max_items is not None:
+            slot["constraints"]["max_items"] = max_items
+        if max_chars_per_item is not None:
+            slot["constraints"]["max_chars_per_item"] = max_chars_per_item
+        return slot
+
+    def _infer(self, slot):
+        return ingest_v5._infer_slot_role(_StubFreeShape(), slot,
+                                          slide_w=9144000, slide_h=6858000)
+
+    def test_top_large_heading_is_page_title(self):
+        slot = self._make_slot("heading", y=0.05, size_pt=36)
+        self.assertEqual(self._infer(slot), "page_title")
+
+    def test_top_medium_heading_is_section_header(self):
+        slot = self._make_slot("heading", y=0.10, size_pt=20)
+        self.assertEqual(self._infer(slot), "section_header")
+
+    def test_huge_short_text_is_kpi_value(self):
+        slot = self._make_slot("paragraph", y=0.40, size_pt=48, max_chars=10)
+        self.assertEqual(self._infer(slot), "kpi_value")
+
+    def test_small_bottom_paragraph_is_footnote(self):
+        slot = self._make_slot("paragraph", y=0.92, size_pt=9, max_chars=120)
+        self.assertEqual(self._infer(slot), "footnote")
+
+    def test_cta_action_verb_prefix(self):
+        slot = self._make_slot("paragraph", y=0.6, size_pt=18,
+                               max_chars=40, excerpt="Visit our website today")
+        self.assertEqual(self._infer(slot), "cta")
+
+    def test_caption_requires_below_top(self):
+        # Same small short text — at top is NOT a caption (likely byline-ish);
+        # below the middle IS a caption.
+        top = self._make_slot("paragraph", y=0.05, size_pt=11, max_chars=50)
+        mid = self._make_slot("paragraph", y=0.55, size_pt=11, max_chars=50)
+        self.assertNotEqual(self._infer(top), "caption")
+        self.assertEqual(self._infer(mid), "caption")
+
+    def test_long_paragraph_is_body(self):
+        slot = self._make_slot("paragraph", y=0.4, size_pt=18, max_chars=300)
+        self.assertEqual(self._infer(slot), "body")
+
+    def test_short_uncertain_paragraph_falls_through_to_none(self):
+        # Medium-sized, short, mid-slide, no CTA verbs — not enough
+        # signal for any single role.
+        slot = self._make_slot("paragraph", y=0.4, size_pt=16, max_chars=40,
+                               excerpt="Some neutral text")
+        self.assertIsNone(self._infer(slot))
+
+    def test_refinement_assigns_kpi_label_near_kpi_value(self):
+        slots = [
+            {"kind": "paragraph", "role": "kpi_value",
+             "geometry": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.15},
+             "style": {"size_pt": 48}, "constraints": {"max_chars": 5}},
+            # Small text directly below the KPI — should get kpi_label
+            {"kind": "paragraph",
+             "geometry": {"x": 0.1, "y": 0.56, "w": 0.2, "h": 0.05},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 30}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1].get("role"), "kpi_label")
+
+    def test_refinement_assigns_byline_below_page_title(self):
+        slots = [
+            {"kind": "heading", "role": "page_title",
+             "geometry": {"x": 0.05, "y": 0.05, "w": 0.9, "h": 0.15},
+             "style": {"size_pt": 40}, "constraints": {"max_chars": 50}},
+            # Small short text directly under the title — byline pattern
+            {"kind": "paragraph",
+             "geometry": {"x": 0.05, "y": 0.22, "w": 0.5, "h": 0.04},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 40}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1].get("role"), "byline")
+
+    def test_refinement_does_not_override_existing_role(self):
+        slots = [
+            {"kind": "paragraph", "role": "kpi_value",
+             "geometry": {"x": 0.1, "y": 0.4, "w": 0.2, "h": 0.15},
+             "style": {"size_pt": 48}, "constraints": {"max_chars": 5}},
+            # Pre-assigned as 'caption' — refinement must NOT downgrade
+            # it to kpi_label even though it sits adjacent to a kpi_value.
+            {"kind": "paragraph", "role": "caption",
+             "geometry": {"x": 0.1, "y": 0.56, "w": 0.2, "h": 0.05},
+             "style": {"size_pt": 12}, "constraints": {"max_chars": 30}},
+        ]
+        ingest_v5._refine_slot_roles(slots)
+        self.assertEqual(slots[1]["role"], "caption")
+
+
 class TestRoleAwareMatching(unittest.TestCase):
     """match-skeletons prefers role match over first-of-kind when both
     fire. So if a content key names a role and the skeleton has a slot
@@ -678,6 +795,436 @@ class TestComposeRoundTrip(unittest.TestCase):
         all_text = "\n".join(s.text_frame.text for s in text_boxes)
         self.assertIn("Hello world", all_text)
         self.assertIn("item a", all_text)
+
+
+class TestChartPlacement(unittest.TestCase):
+    """compose-v5 builds charts from primitives via python-pptx add_chart.
+    Tests cover the success path, unknown-type warning, malformed value,
+    and the count-validation in validate-plan.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        themes = self.root / "themes" / "synth"
+        themes.mkdir(parents=True)
+        synth_prs = make_title_body_deck(1)
+        synth_prs.save(str(themes / "master.pptx"))
+        (themes / "theme.yaml").write_text(
+            "id: synth\n"
+            "palette: {primary: '#FF0000'}\n"
+            "fonts: {major: Calibri, minor: Calibri}\n"
+            "master_pptx: master.pptx\n",
+        )
+        (self.root / "skeletons" / "sk_chart").mkdir(parents=True)
+        (self.root / "skeletons" / "sk_chart" / "skeleton.yaml").write_text(
+            "id: sk_chart\n"
+            "source_deck: synth\n"
+            "source_slide_index: 1\n"
+            "status: pending\n"
+            "categories: [data]\n"
+            "slots:\n"
+            "  - id: chart_a\n"
+            "    kind: chart\n"
+            "    geometry: {x: 0.1, y: 0.2, w: 0.8, h: 0.6}\n"
+            "    constraints: {chart_type: column, max_series: 3, max_categories: 4}\n",
+        )
+        self._patcher = mock.patch.object(reader_mod, "_v5_bundle_root",
+                                          return_value=self.root)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmpdir.cleanup()
+
+    def test_column_chart_is_built(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "column",
+                "categories": ["Q1", "Q2", "Q3"],
+                "series": [{"name": "Revenue", "values": [10, 20, 30]}],
+            }},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        # No chart-related warnings — the old chart_not_implemented one
+        # should be gone.
+        for w in result.get("warnings", []):
+            self.assertNotEqual(w.get("violation"), "chart_not_implemented")
+            self.assertNotEqual(w.get("violation"), "chart_place_failed")
+        prs = Presentation(str(out_pptx))
+        has_chart = any(getattr(s, "has_chart", False) for s in prs.slides[0].shapes)
+        self.assertTrue(has_chart, "compose should produce a chart shape")
+
+    def test_unknown_chart_type_warns(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "radar",  # not in the supported set
+                "categories": ["A", "B"],
+                "series": [{"name": "X", "values": [1, 2]}],
+            }},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings", [])]
+        self.assertIn("unsupported_chart_type", violations)
+
+    def test_empty_chart_data_warns(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {"type": "bar", "categories": [], "series": []}},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings", [])]
+        self.assertIn("empty_chart_data", violations)
+
+    def test_validate_plan_flags_unknown_chart_type(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_chart",
+            "slots": {"chart_a": {
+                "type": "radar",
+                "categories": ["A"],
+                "series": [{"name": "X", "values": [1]}],
+            }},
+        }]))
+        out = _capture_stdout(
+            reader_mod.cmd_v5_validate_plan,
+            _StubArgs(plan=str(plan)),
+        )
+        self.assertFalse(out["ok"])
+        self.assertTrue(
+            any("not supported" in (e.get("message") or "") for e in out["errors"]),
+            f"expected a 'not supported' fit error, got: {out['errors']}",
+        )
+
+
+class TestBackgroundImageCompose(unittest.TestCase):
+    """compose-v5 paints background.png when the skeleton specifies one.
+    Tests cover happy path (background placed as first shape), missing-
+    file fail-soft (warns and proceeds), and the no-background path
+    (the absence of warnings).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        themes = self.root / "themes" / "synth"
+        themes.mkdir(parents=True)
+        synth_prs = make_title_body_deck(1)
+        synth_prs.save(str(themes / "master.pptx"))
+        (themes / "theme.yaml").write_text(
+            "id: synth\n"
+            "palette: {primary: '#FF0000'}\n"
+            "fonts: {major: Calibri, minor: Calibri}\n"
+            "master_pptx: master.pptx\n",
+        )
+        self.sk_dir = self.root / "skeletons" / "sk_bg"
+        self.sk_dir.mkdir(parents=True)
+        self._patcher = mock.patch.object(reader_mod, "_v5_bundle_root",
+                                          return_value=self.root)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmpdir.cleanup()
+
+    def _write_skeleton(self, *, background_image: str | None):
+        bg_line = f"background_image: {background_image}\n" if background_image else ""
+        (self.sk_dir / "skeleton.yaml").write_text(
+            "id: sk_bg\n"
+            "source_deck: synth\n"
+            "source_slide_index: 1\n"
+            "status: pending\n"
+            "categories: [content]\n"
+            f"{bg_line}"
+            "slots:\n"
+            "  - id: title\n"
+            "    kind: heading\n"
+            "    geometry: {x: 0.1, y: 0.1, w: 0.8, h: 0.2}\n"
+            "    constraints: {max_chars: 50, required: false}\n",
+        )
+
+    def test_background_is_placed_when_present(self):
+        # Drop a 1x1 PNG into the skeleton dir as background.png
+        (self.sk_dir / "background.png").write_bytes(_TINY_PNG)
+        self._write_skeleton(background_image="background.png")
+
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        # No background-related warnings on the happy path
+        for w in result.get("warnings") or []:
+            self.assertNotIn(w.get("violation"),
+                             {"background_missing", "background_place_failed",
+                              "background_pending"})
+        prs = Presentation(str(out_pptx))
+        shapes = list(prs.slides[0].shapes)
+        # First shape should be the background picture (full-bleed)
+        from pptx.enum.shapes import MSO_SHAPE_TYPE as _MST
+        self.assertEqual(shapes[0].shape_type, _MST.PICTURE,
+                         "background picture must be the first shape")
+
+    def test_missing_background_file_warns_but_compose_still_runs(self):
+        # Skeleton claims a background but the file isn't there.
+        self._write_skeleton(background_image="background.png")
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        self.assertTrue(out_pptx.exists())
+        violations = [w.get("violation") for w in result.get("warnings") or []]
+        self.assertIn("background_missing", violations)
+
+    def test_no_background_no_warnings(self):
+        self._write_skeleton(background_image=None)
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps([{
+            "skeleton_id": "sk_bg",
+            "slots": {"title": "Hi"},
+        }]))
+        out_pptx = self.root / "out.pptx"
+        result = _capture_stdout(
+            reader_mod.cmd_v5_compose,
+            _StubArgs(plan=str(plan), out=str(out_pptx), theme="synth"),
+        )
+        violations = [w.get("violation") for w in result.get("warnings") or []]
+        self.assertNotIn("background_missing", violations)
+        self.assertNotIn("background_pending", violations)
+
+
+class TestRenderBackgroundHelper(unittest.TestCase):
+    """_render_background_png strips slot shapes and routes through the
+    _RENDERERS chain. We can't run a real renderer in CI, so the tests
+    mock the chain to verify (a) the right shapes are stripped before
+    rendering and (b) total-failure path returns ok=False without
+    crashing.
+    """
+
+    def test_no_renderer_returns_failure_message(self):
+        # Mocking _RENDERERS to empty tuple makes the function take
+        # the no-renderer-found path.
+        import importlib, sys as _sys
+        if "cli" in _sys.modules:
+            cli_mod = _sys.modules["cli"]
+        else:
+            import cli as cli_mod  # noqa: F401
+            cli_mod = _sys.modules["cli"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sk_dir = root / "sk"
+            sk_dir.mkdir()
+            # Need a real single-slide pptx to strip from
+            prs = make_title_body_deck(1)
+            slide_pptx = root / "slide_01.pptx"
+            prs.save(str(slide_pptx))
+
+            with mock.patch.object(cli_mod, "_RENDERERS", ()):
+                ok, msg = cli_mod._render_background_png(
+                    "sk", sk_dir, slide_pptx, set(),
+                )
+            self.assertFalse(ok)
+            self.assertIn("no renderer", msg.lower())
+
+    def test_strips_slot_shapes_before_render(self):
+        """Verify the temp stripped pptx has the slot shape removed
+        before being handed to a renderer."""
+        import sys as _sys
+        if "cli" not in _sys.modules:
+            import cli as cli_mod  # noqa: F401
+        cli_mod = _sys.modules["cli"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sk_dir = root / "sk"
+            sk_dir.mkdir()
+            prs = make_title_body_deck(1)
+            slide_pptx = root / "slide_01.pptx"
+            prs.save(str(slide_pptx))
+
+            # Pick a shape id to strip
+            src_prs = Presentation(str(slide_pptx))
+            shape_to_strip_id = next(iter(src_prs.slides[0].shapes)).shape_id
+            shape_count_before = len(list(src_prs.slides[0].shapes))
+
+            recorded = {}
+
+            def fake_renderer(stripped_path, out_png, size):
+                # Open the stripped pptx and check the shape is gone
+                p = Presentation(str(stripped_path))
+                shape_ids = [s.shape_id for s in p.slides[0].shapes]
+                recorded["shape_ids"] = shape_ids
+                recorded["count"] = len(shape_ids)
+                # Pretend success — write a tiny PNG
+                out_png.write_bytes(_TINY_PNG)
+                return True
+
+            with mock.patch.object(cli_mod, "_RENDERERS",
+                                   (("fake", fake_renderer),)):
+                ok, _ = cli_mod._render_background_png(
+                    "sk", sk_dir, slide_pptx, {shape_to_strip_id},
+                )
+            self.assertTrue(ok)
+            self.assertNotIn(shape_to_strip_id, recorded["shape_ids"])
+            self.assertEqual(recorded["count"], shape_count_before - 1)
+            self.assertTrue((sk_dir / "background.png").exists())
+
+
+class TestComposeRunV5Routing(unittest.TestCase):
+    """The /api/compose/run endpoint now auto-routes v5-shaped plans
+    to reader.py compose-v5 with an auto-picked theme. Tests cover the
+    plan-shape detection, theme-picking strategy, and staged bundle
+    layout — without actually invoking the subprocess (that's covered
+    by TestComposeRoundTrip).
+    """
+
+    def setUp(self):
+        # Import app lazily so the module sees the patched WORKSPACE.
+        import importlib
+        import sys as _sys
+        # Pre-clear cached app/cli modules so they pick up the
+        # workspace override below.
+        for mod in ("app", "cli"):
+            if mod in _sys.modules:
+                del _sys.modules[mod]
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+        # Patch cli.WORKSPACE before importing app so app.WORKSPACE
+        # follows the override.
+        import cli as cli_mod
+        self._cli_workspace_patch = mock.patch.object(
+            cli_mod, "WORKSPACE", self.workspace,
+        )
+        self._cli_workspace_patch.start()
+        import app as app_mod
+        self._app_workspace_patch = mock.patch.object(
+            app_mod, "WORKSPACE", self.workspace,
+        )
+        self._app_workspace_patch.start()
+        self.app_mod = app_mod
+        self.cli_mod = cli_mod
+
+    def tearDown(self):
+        self._app_workspace_patch.stop()
+        self._cli_workspace_patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_detects_v5_plan_by_skeleton_id(self):
+        v5_plan = [{"skeleton_id": "sk_01", "slots": {"title": "x"}}]
+        v4_plan = [{"template": "tpl_01", "slots": {"title": "x"}}]
+        self.assertTrue(self.app_mod._plan_looks_like_v5(v5_plan))
+        self.assertFalse(self.app_mod._plan_looks_like_v5(v4_plan))
+
+    def test_stage_v5_bundle_includes_themes_skeletons_index(self):
+        # Lay down a tiny workspace
+        (self.workspace / "themes" / "deckA").mkdir(parents=True)
+        (self.workspace / "themes" / "deckA" / "theme.yaml").write_text(
+            "id: deckA\npalette: {primary: '#FF0000'}\nfonts: {major: Calibri}\n"
+        )
+        # Build a real master.pptx so the staging path doesn't choke
+        make_title_body_deck(1).save(
+            str(self.workspace / "themes" / "deckA" / "master.pptx"))
+
+        (self.workspace / "skeletons" / "sk_01").mkdir(parents=True)
+        (self.workspace / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+            "id: sk_01\nsource_deck: deckA\nsource_slide_index: 1\n"
+            "status: done\ncategories: [content]\n"
+            "slots:\n  - id: t\n    kind: heading\n"
+            "    geometry: {x: 0, y: 0, w: 1, h: 0.2}\n"
+            "    constraints: {max_chars: 50}\n"
+        )
+        # A rejected skeleton — should be excluded from staging
+        (self.workspace / "skeletons" / "sk_bad").mkdir(parents=True)
+        (self.workspace / "skeletons" / "sk_bad" / "skeleton.yaml").write_text(
+            "id: sk_bad\nsource_deck: deckA\nsource_slide_index: 2\n"
+            "status: rejected\ncategories: [content]\nslots: []\n"
+        )
+
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            self.app_mod._stage_compose_v5_bundle(staging)
+
+            self.assertTrue((staging / "reader.py").exists())
+            self.assertTrue((staging / "index.json").exists())
+            self.assertTrue((staging / "themes" / "deckA" / "theme.yaml").exists())
+            self.assertTrue((staging / "themes" / "deckA" / "master.pptx").exists())
+            self.assertTrue((staging / "skeletons" / "sk_01" / "skeleton.yaml").exists())
+            self.assertFalse((staging / "skeletons" / "sk_bad").exists(),
+                             "rejected skeletons must not be staged")
+
+            idx = json.loads((staging / "index.json").read_text())
+            self.assertEqual(idx["version"], 5)
+            sk_ids = [s["id"] for s in idx["skeletons"]]
+            self.assertIn("sk_01", sk_ids)
+            self.assertNotIn("sk_bad", sk_ids)
+
+    def test_pick_theme_matches_source_deck(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            # Two themes; skeleton points at deckB
+            for tid in ("deckA", "deckB"):
+                (staging / "themes" / tid).mkdir(parents=True)
+            (staging / "skeletons" / "sk_01").mkdir(parents=True)
+            (staging / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+                "id: sk_01\nsource_deck: deckB\nstatus: done\nslots: []\n"
+            )
+            plan = [{"skeleton_id": "sk_01", "slots": {}}]
+            theme, reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertEqual(theme, "deckB")
+            self.assertIn("deckB", reason)
+
+    def test_pick_theme_honors_explicit_plan_theme(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            for tid in ("deckA", "deckB"):
+                (staging / "themes" / tid).mkdir(parents=True)
+            (staging / "skeletons" / "sk_01").mkdir(parents=True)
+            (staging / "skeletons" / "sk_01" / "skeleton.yaml").write_text(
+                "id: sk_01\nsource_deck: deckB\nstatus: done\nslots: []\n"
+            )
+            plan = [{"skeleton_id": "sk_01", "slots": {}, "theme": "deckA"}]
+            theme, _reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertEqual(theme, "deckA")
+
+    def test_pick_theme_returns_none_when_no_themes(self):
+        with tempfile.TemporaryDirectory() as staging_tmp:
+            staging = Path(staging_tmp)
+            plan = [{"skeleton_id": "x", "slots": {}}]
+            theme, reason = self.app_mod._pick_v5_theme(plan, staging)
+            self.assertIsNone(theme)
+            self.assertIn("no themes", reason)
 
 
 if __name__ == "__main__":
