@@ -1,0 +1,31 @@
+id: asset_12579fa6
+sha1: 12579fa6e0c1347324167bdbbd2db2ac159600ae
+sources:
+- deck: standard_templates
+  slide: 8
+kind: table
+width: 0
+height: 0
+aspect: 0.0
+colors_hex: []
+tags: []
+description: ''
+status: pending
+notes: ''
+table:
+  rows: 5
+  cols: 3
+  headers:
+  - Function
+  - Q4 plan
+  - Q1 plan
+  sample_cells:
+  - - Engineering
+    - '+6'
+    - '+4'
+  - - Product
+    - '+2'
+    - '+1'
+  - - Sales
+    - '+3'
+    - '+5'

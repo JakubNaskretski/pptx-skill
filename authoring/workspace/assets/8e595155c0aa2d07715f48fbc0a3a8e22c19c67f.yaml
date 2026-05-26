@@ -1,0 +1,18 @@
+id: asset_8e595155
+sha1: 8e595155c0aa2d07715f48fbc0a3a8e22c19c67f
+sources:
+- deck: standard_templates
+  slide: 10
+kind: chart
+width: 0
+height: 0
+aspect: 0.0
+colors_hex: []
+tags: []
+description: ''
+status: pending
+notes: ''
+chart:
+  type: column_clustered (51)
+  series_count: 1
+  categories_count: 4

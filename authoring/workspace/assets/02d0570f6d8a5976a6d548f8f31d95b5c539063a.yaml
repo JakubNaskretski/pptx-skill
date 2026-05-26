@@ -1,0 +1,24 @@
+id: asset_02d0570f
+sha1: 02d0570f6d8a5976a6d548f8f31d95b5c539063a
+sources:
+- deck: standard_templates
+  slide: 1
+- deck: standard_templates
+  slide: 2
+- deck: standard_templates
+  slide: 3
+- deck: standard_templates
+  slide: 6
+kind: chart
+width: 0
+height: 0
+aspect: 0.0
+colors_hex: []
+tags: []
+description: ''
+status: pending
+notes: ''
+chart:
+  type: column_clustered (51)
+  series_count: 1
+  categories_count: 4

@@ -1,13 +1,62 @@
-# Authoring working state — transient, regenerated from source decks
+# Authoring working state — transient, regenerated from source decks.
+# Exceptions below: the predigested example resources (artifacts from
+# ingesting examples/*.pptx) are committed so a fresh clone has a
+# working corpus without running the builders or ingest first. The
+# user's own decks / assets / themes / skeletons stay gitignored.
 authoring/workspace/*
 !authoring/workspace/.gitkeep
+!authoring/workspace/tag_vocab.yaml
+
+# Predigested example decks (committed; output of cli.py ingest on
+# examples/standard_templates.pptx and examples/title_and_breaks.pptx)
+!authoring/workspace/decks/
+authoring/workspace/decks/*
+!authoring/workspace/decks/standard_templates/
+!authoring/workspace/decks/standard_templates/**
+!authoring/workspace/decks/title_and_breaks/
+!authoring/workspace/decks/title_and_breaks/**
+
+!authoring/workspace/themes/
+authoring/workspace/themes/*
+!authoring/workspace/themes/standard_templates/
+!authoring/workspace/themes/standard_templates/**
+!authoring/workspace/themes/title_and_breaks/
+!authoring/workspace/themes/title_and_breaks/**
+
+!authoring/workspace/skeletons/
+authoring/workspace/skeletons/*
+!authoring/workspace/skeletons/standard_templates_*/
+!authoring/workspace/skeletons/standard_templates_*/**
+!authoring/workspace/skeletons/title_and_breaks_*/
+!authoring/workspace/skeletons/title_and_breaks_*/**
+
+# Example-deck assets by SHA. If you re-run ingest on the example
+# decks and SHAs change, update this list.
+!authoring/workspace/assets/
+authoring/workspace/assets/*
+!authoring/workspace/assets/02d0570f6d8a5976a6d548f8f31d95b5c539063a.yaml
+!authoring/workspace/assets/12579fa6e0c1347324167bdbbd2db2ac159600ae.yaml
+!authoring/workspace/assets/59d9c95bd987a687ad1d10d42f1299e0f342d676.png
+!authoring/workspace/assets/59d9c95bd987a687ad1d10d42f1299e0f342d676.yaml
+!authoring/workspace/assets/7a7601bd006a166061f7bcae53ef297b184c39bd.png
+!authoring/workspace/assets/7a7601bd006a166061f7bcae53ef297b184c39bd.yaml
+!authoring/workspace/assets/8c3044a9ecc149b01898bf7bb545e7b0b965f17b.png
+!authoring/workspace/assets/8c3044a9ecc149b01898bf7bb545e7b0b965f17b.yaml
+!authoring/workspace/assets/8e595155c0aa2d07715f48fbc0a3a8e22c19c67f.yaml
+!authoring/workspace/assets/a747ab10252038b4121296c6856c6b5bb03d2f17.yaml
+!authoring/workspace/assets/b3659c6a8ea46919f6919e89f8045dcd22a85067.yaml
 
 # Source decks (often sensitive client material) — never tracked,
-# except the canonical example decks shipped from examples/build_*.py
-# so anyone cloning the repo has a working corpus without running
-# the builders first.
+# except the canonical example decks (committed under examples/ and
+# the predigested copies under authoring/workspace/) so anyone
+# cloning the repo has a working corpus without running the builders
+# or ingest first.
 *.pptx
 !examples/*.pptx
+!authoring/workspace/decks/standard_templates/**/*.pptx
+!authoring/workspace/decks/title_and_breaks/**/*.pptx
+!authoring/workspace/themes/standard_templates/master.pptx
+!authoring/workspace/themes/title_and_breaks/master.pptx
 
 # Built consumer artifacts
 authoring/dist/

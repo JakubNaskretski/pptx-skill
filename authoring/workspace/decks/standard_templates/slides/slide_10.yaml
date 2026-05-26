@@ -1,0 +1,29 @@
+intent: ''
+feel: ''
+suitable_for: []
+status: pending
+notes: ''
+interpretation: ''
+id: standard_templates_10
+layout: text@top-center, text#2@top-left, text#3@middle-left, text#4@middle-left, text#5@bottom-left,
+  chart@middle-right, text#6@bottom-center
+theme_colors:
+  primary: '#1F497D'
+  accent: '#4F81BD'
+  text: '#000000'
+  background: '#FFFFFF'
+fonts:
+  major: Calibri
+  minor: Calibri
+slots: []
+inventory:
+- atom: asset_8e595155
+  kind: chart
+  x: 0.503
+  y: 0.193
+  w: 0.46
+  h: 0.693
+  region: middle-right
+sources:
+- deck: standard_templates
+  slide: 10

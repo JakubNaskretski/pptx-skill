@@ -1,0 +1,16 @@
+id: asset_59d9c95b
+sha1: 59d9c95bd987a687ad1d10d42f1299e0f342d676
+sources:
+- deck: standard_templates
+  slide: 4
+kind: ''
+width: 760
+height: 640
+aspect: 1.1875
+colors_hex:
+- '#EBEEF3'
+- '#CCD0D8'
+tags: []
+description: ''
+status: pending
+notes: ''

@@ -1,0 +1,109 @@
+id: title_and_breaks_06
+source_deck: title_and_breaks
+source_slide_index: 6
+status: pending
+categories:
+- closing
+preview: preview.png
+background_image: null
+slots:
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.0875
+    y: 0.3067
+    w: 0.825
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 12.0
+    bold: true
+    alignment: center
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 25
+    max_lines: 1
+    required: true
+  source_excerpt: QUESTIONS WELCOME
+  shape_id: 2
+  role: caption
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0875
+    y: 0.38
+    w: 0.825
+    h: 0.2133
+  style:
+    font_role: major
+    size_pt: 64.0
+    bold: true
+    alignment: center
+    color: '#222A35'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: Thank you
+  shape_id: 3
+  role: kpi_value
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.0875
+    y: 0.6133
+    w: 0.825
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 20.0
+    bold: false
+    alignment: center
+    color: '#6B7382'
+  constraints:
+    max_chars: 69
+    max_lines: 1
+    required: true
+  source_excerpt: Reach out — happy to dig deeper on any of this
+  shape_id: 4
+  role: body
+- id: body_3
+  kind: paragraph
+  geometry:
+    x: 0.0875
+    y: 0.74
+    w: 0.825
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 14.0
+    bold: false
+    alignment: center
+    color: '#222A35'
+  constraints:
+    max_chars: 76
+    max_lines: 1
+    required: true
+  source_excerpt: jakub@example.com · linkedin.com/in/jakubnaskretski
+  shape_id: 5
+  role: body
+- id: body_4
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 45
+    max_lines: 1
+    required: false
+  source_excerpt: Template · closing / thank you
+  shape_id: 6
+  role: footnote
+unmapped_shapes: []

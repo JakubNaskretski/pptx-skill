@@ -1,0 +1,23 @@
+intent: ''
+feel: ''
+suitable_for: []
+status: pending
+notes: ''
+interpretation: ''
+id: title_and_breaks_02
+layout: text@top-center, text#2@top-left, text#3@top-center, text#4@middle-left, text#5@middle-center,
+  text#6@middle-left, text#7@middle-center, text#8@bottom-left, text#9@bottom-center, text#10@bottom-left,
+  text#11@bottom-center, text#12@bottom-center
+theme_colors:
+  primary: '#1F497D'
+  accent: '#4F81BD'
+  text: '#000000'
+  background: '#FFFFFF'
+fonts:
+  major: Calibri
+  minor: Calibri
+slots: []
+inventory: []
+sources:
+- deck: title_and_breaks
+  slide: 2

@@ -1,0 +1,16 @@
+id: asset_8c3044a9
+sha1: 8c3044a9ecc149b01898bf7bb545e7b0b965f17b
+sources:
+- deck: standard_templates
+  slide: 9
+kind: ''
+width: 760
+height: 640
+aspect: 1.1875
+colors_hex:
+- '#EBEEF3'
+- '#D3D7DE'
+tags: []
+description: ''
+status: pending
+notes: ''

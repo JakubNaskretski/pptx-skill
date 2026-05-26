@@ -1,0 +1,131 @@
+id: title_and_breaks_01
+source_deck: title_and_breaks
+source_slide_index: 1
+status: pending
+categories:
+- content
+preview: preview.png
+background_image: null
+slots:
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.075
+    y: 0.2667
+    w: 0.825
+    h: 0.06
+  style:
+    font_role: major
+    size_pt: 12.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: ANNUAL REVIEW
+  shape_id: 3
+  role: kpi_label
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.075
+    y: 0.34
+    w: 0.825
+    h: 0.2133
+  style:
+    font_role: major
+    size_pt: 54.0
+    bold: true
+    color: '#222A35'
+  constraints:
+    max_chars: 30
+    max_lines: 1
+    required: true
+  source_excerpt: FY26 Business Update
+  shape_id: 4
+  role: kpi_value
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.075
+    y: 0.54
+    w: 0.825
+    h: 0.1333
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 73
+    max_lines: 1
+    required: true
+  source_excerpt: Markets, momentum, and the path through next year
+  shape_id: 5
+  role: body
+- id: body_3
+  kind: paragraph
+  geometry:
+    x: 0.075
+    y: 0.74
+    w: 0.825
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 14.0
+    bold: true
+    color: '#222A35'
+  constraints:
+    max_chars: 24
+    max_lines: 1
+    required: true
+  source_excerpt: Jakub Naskretski
+  shape_id: 6
+- id: body_4
+  kind: paragraph
+  geometry:
+    x: 0.075
+    y: 0.8067
+    w: 0.825
+    h: 0.06
+  style:
+    font_role: major
+    size_pt: 12.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 39
+    max_lines: 1
+    required: false
+  source_excerpt: Q4 board review · May 2026
+  shape_id: 7
+  role: caption
+- id: body_5
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 33
+    max_lines: 1
+    required: false
+  source_excerpt: Template · title cover
+  shape_id: 8
+  role: footnote
+unmapped_shapes:
+- shape_id: 2
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0
+    y: 0.0
+    w: 0.0263
+    h: 1.0
+  skipped_reason: 'conscious-drop: freeform / auto-shape'

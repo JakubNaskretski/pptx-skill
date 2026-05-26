@@ -5,8 +5,26 @@ Two neutral-brand 16:9 builder scripts that emit ready-to-ingest
 needs (cover / agenda / dividers / quote / closing) plus the content
 slides that fill in between (header + text + chart/image/table).
 
-The compiled `.pptx` outputs ship in this directory so anyone cloning
-the repo has a working corpus without running the builders first.
+The compiled `.pptx` outputs ship in this directory **and** the
+predigested artifacts (theme.yaml, skeleton.yaml, asset binaries +
+sidecars) ship under `authoring/workspace/` so a fresh clone has a
+fully ingested corpus — no builder script, no `cli.py ingest` step
+required. Run the workflow (`cli.py validate`, `cli.py build-v5`,
+the web app, …) immediately after `git pull`.
+
+To regenerate the predigested resources after editing a builder:
+
+```bash
+python3 examples/build_standard_templates.py
+python3 examples/build_title_and_breaks.py
+python3 authoring/cli.py remove-deck standard_templates
+python3 authoring/cli.py remove-deck title_and_breaks
+python3 authoring/cli.py ingest examples/standard_templates.pptx
+python3 authoring/cli.py ingest examples/title_and_breaks.pptx
+```
+
+(If the asset SHAs change, update the explicit exceptions in
+`.gitignore` to match the new file names.)
 
 ## Standard content templates — `build_standard_templates.py`
 

@@ -1,0 +1,89 @@
+id: title_and_breaks_04
+source_deck: title_and_breaks
+source_slide_index: 4
+status: pending
+categories:
+- content
+preview: preview.png
+background_image: null
+slots:
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0875
+    y: 0.2267
+    w: 0.825
+    h: 0.4267
+  style:
+    font_role: major
+    size_pt: 180.0
+    bold: true
+    alignment: center
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: '03'
+  shape_id: 2
+  role: kpi_value
+- id: heading_2
+  kind: heading
+  geometry:
+    x: 0.0875
+    y: 0.6467
+    w: 0.825
+    h: 0.12
+  style:
+    font_role: major
+    size_pt: 36.0
+    bold: true
+    alignment: center
+    color: '#222A35'
+  constraints:
+    max_chars: 28
+    max_lines: 1
+    required: true
+  source_excerpt: The product roadmap
+  shape_id: 3
+  role: kpi_value
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.0875
+    y: 0.7667
+    w: 0.825
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 18.0
+    bold: false
+    alignment: center
+    color: '#6B7382'
+  constraints:
+    max_chars: 54
+    max_lines: 1
+    required: true
+  source_excerpt: Where the next four releases take us
+  shape_id: 4
+  role: kpi_label
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 55
+    max_lines: 1
+    required: false
+  source_excerpt: Template · section break (big number)
+  shape_id: 5
+  role: footnote
+unmapped_shapes: []

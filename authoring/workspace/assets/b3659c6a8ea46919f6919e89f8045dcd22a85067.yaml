@@ -1,0 +1,31 @@
+id: asset_b3659c6a
+sha1: b3659c6a8ea46919f6919e89f8045dcd22a85067
+sources:
+- deck: standard_templates
+  slide: 5
+kind: table
+width: 0
+height: 0
+aspect: 0.0
+colors_hex: []
+tags: []
+description: ''
+status: pending
+notes: ''
+table:
+  rows: 6
+  cols: 3
+  headers:
+  - Account
+  - ARR
+  - Stage
+  sample_cells:
+  - - Acme Co.
+    - $1.2M
+    - Renewal
+  - - Globex
+    - $0.9M
+    - Upsell
+  - - Initech
+    - $0.7M
+    - At risk

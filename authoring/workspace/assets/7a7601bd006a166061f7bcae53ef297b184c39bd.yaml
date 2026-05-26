@@ -1,0 +1,16 @@
+id: asset_7a7601bd
+sha1: 7a7601bd006a166061f7bcae53ef297b184c39bd
+sources:
+- deck: standard_templates
+  slide: 7
+kind: ''
+width: 760
+height: 640
+aspect: 1.1875
+colors_hex:
+- '#EBEEF3'
+- '#CED3DA'
+tags: []
+description: ''
+status: pending
+notes: ''
