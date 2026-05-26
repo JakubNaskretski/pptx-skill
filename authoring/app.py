@@ -3345,6 +3345,11 @@ COMPOSE_HTML = r"""<!doctype html>
               display: block; }
     .msg.err { background: #ffe9e9; color: #a00; border: 1px solid #f5b8b8;
                display: block; }
+    .msg.err pre { white-space: pre-wrap; word-break: break-word;
+                   max-height: 240px; overflow: auto; margin: 6px 0 0;
+                   font-family: ui-monospace, monospace; font-size: 11px;
+                   background: #fff5f5; padding: 6px 8px; border-radius: 3px;
+                   border: 1px solid #f0c8c8; color: #5a0000; }
     .group-label { font-size: 13px; font-weight: 600; color: #333;
                    margin: 12px 0 6px; }
     pre.preview-text { background: #f8f8f8; border: 1px solid #ddd;
@@ -3644,6 +3649,31 @@ function showMsg(id, text, ok) {
   el.textContent = text;
 }
 
+function showComposeError(j) {
+  const el = document.getElementById("composeMsg");
+  el.className = "msg err";
+  el.textContent = "";
+  const head = document.createElement("div");
+  // Pull the most useful line out of stderr: the last "SomethingError: ..." line
+  // is almost always the actual exception.
+  const stderr = (j && j.stderr) || "";
+  const lines = stderr.split(/\r?\n/).filter(Boolean);
+  const errLine = [...lines].reverse().find(l => /^[A-Z][A-Za-z_]*(Error|Exception): /.test(l.trim()));
+  const mode = (j && j.mode) ? " [" + j.mode + "]" : "";
+  head.textContent = (j && j.error ? j.error : "compose failed") + mode +
+                     (errLine ? "  —  " + errLine : "");
+  el.appendChild(head);
+  if (stderr) {
+    const pre = document.createElement("pre");
+    // Show the last ~60 lines so the relevant traceback frames are visible
+    // without flooding the panel. Full stderr is also dumped to console.
+    pre.textContent = lines.slice(-60).join("\n");
+    el.appendChild(pre);
+    console.error("compose stderr:\n" + stderr);
+    if (j && j.stdout) console.error("compose stdout:\n" + j.stdout);
+  }
+}
+
 document.getElementById("dlBundle").onclick = async () => {
   showMsg("bundleMsg", "building…", true);
   const r = await fetch("/api/compose/bundle", {
@@ -3745,7 +3775,7 @@ document.getElementById("runCompose").onclick = async () => {
   });
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
-    showMsg("composeMsg", (j.error || "compose failed") + (j.stderr ? " — " + j.stderr.slice(0, 300) : ""), false);
+    showComposeError(j);
     return;
   }
   const blob = await r.blob();
