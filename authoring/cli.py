@@ -1119,6 +1119,16 @@ def _iter_shapes_recursive(container, _depth: int = 0):
             yield shape
 
 
+# When False, _extract_*_atom helpers skip writing the .xml binary
+# for table/chart/smartart/callout/freeform atoms. The YAML sidecar
+# is still written (table headers, chart series, etc. — useful for
+# agent reasoning). v5 compose never reads these XML binaries; v4
+# compose only uses them for table/callout/freeform deep-copy, which
+# we currently don't exercise. Set back to True to re-enable on
+# future v4 work — re-ingesting the source deck restores the XML.
+_EXTRACT_XML_ATOMS = False
+
+
 def _extract_table_atom(shape, deck_stem: str, slide_number: int, assets_dir: Path) -> str | None:
     table = shape.table
     xml = _serialize_shape_xml(shape)
@@ -1138,7 +1148,7 @@ def _extract_table_atom(shape, deck_stem: str, slide_number: int, assets_dir: Pa
 
     bin_path = assets_dir / f"{sha}.xml"
     yaml_path = assets_dir / f"{sha}.yaml"
-    if not bin_path.exists():
+    if _EXTRACT_XML_ATOMS and not bin_path.exists():
         bin_path.write_bytes(xml)
     write_asset_yaml_stub(
         yaml_path, asset_id, sha, deck_stem, slide_number,
@@ -1181,7 +1191,7 @@ def _extract_chart_atom(shape, deck_stem: str, slide_number: int, assets_dir: Pa
 
     bin_path = assets_dir / f"{sha}.xml"
     yaml_path = assets_dir / f"{sha}.yaml"
-    if not bin_path.exists():
+    if _EXTRACT_XML_ATOMS and not bin_path.exists():
         bin_path.write_bytes(xml)
     write_asset_yaml_stub(
         yaml_path, asset_id, sha, deck_stem, slide_number,
@@ -1218,7 +1228,7 @@ def _extract_geometric_atom(
 
     bin_path = assets_dir / f"{sha}.xml"
     yaml_path = assets_dir / f"{sha}.yaml"
-    if not bin_path.exists():
+    if _EXTRACT_XML_ATOMS and not bin_path.exists():
         bin_path.write_bytes(xml)
     write_asset_yaml_stub(
         yaml_path, asset_id, sha, deck_stem, slide_number,
@@ -1244,7 +1254,7 @@ def _extract_smartart_atom(shape, deck_stem: str, slide_number: int, assets_dir:
     # it when instantiating the atom.
     bin_path = assets_dir / f"{sha}.xml"
     yaml_path = assets_dir / f"{sha}.yaml"
-    if not bin_path.exists():
+    if _EXTRACT_XML_ATOMS and not bin_path.exists():
         bin_path.write_bytes(xml)
     write_asset_yaml_stub(
         yaml_path, asset_id, sha, deck_stem, slide_number,
