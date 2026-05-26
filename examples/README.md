@@ -26,6 +26,7 @@ chart / image / table on the right.
 pip install python-pptx Pillow
 python3 examples/build_standard_templates.py
 # → examples/standard_templates.pptx
+python3 authoring/cli.py ingest examples/standard_templates.pptx
 ```
 
 The script builds real `python-pptx` chart / table / picture
@@ -46,3 +47,72 @@ BODY_FONT  = "Calibri"
 ```
 
 Re-run the script to regenerate the deck.
+
+## Cleanup
+
+Decks and their derived artifacts live under
+`authoring/workspace/` (gitignored):
+
+```
+workspace/
+├── decks/<stem>/         deck folder + theme.yaml + slides/slide_NN.pptx
+├── themes/<stem>/        v5 theme (one-to-one with deck on ingest)
+├── skeletons/<sk>/       v5 skeleton.yaml + preview.png + background.png
+└── assets/               extracted atoms shared across decks
+    ├── <sha>.png/.jpg    raster images (consumed by v5 image slots)
+    ├── <sha>.xml         table / chart / smartart / freeform OOXML
+    └── <sha>.yaml        sidecar metadata (headers, sample cells, etc.)
+```
+
+### Remove a deck
+
+```bash
+python3 authoring/cli.py remove-deck <stem> [--dry-run]
+```
+
+Drops the deck folder, its v5 theme, and every skeleton sourced from
+it. **Assets stay** — they're deduplicated by content SHA and reusable
+across decks; only the dead `sources:` refs in each asset yaml are
+pruned. Quote stems with spaces: `remove-deck "deck with spaces"`.
+
+### Manual asset cleanup
+
+There's no central asset registry (asset listing is a glob of
+`workspace/assets/*.yaml` at read time), so just `rm` what you don't
+want:
+
+```bash
+cd authoring/workspace/assets
+rm asset_<id>.png asset_<id>.yaml             # specific image
+rm *.xml                                      # all XML atoms (see below)
+```
+
+### XML atom purge (safe today)
+
+The `.xml` asset binaries — extracted table / chart / SmartArt /
+freeform OOXML fragments — are **not consumed by current compose
+paths**:
+
+- v5 compose builds tables and charts from python-pptx primitives
+  (`add_table` / `add_chart`); the XML is ignored.
+- v4 compose deep-copies tables but explicitly skips chart and
+  smartart atoms ("not yet placeable").
+
+The sidecar `*.yaml` files are still useful for agent reasoning
+(table headers, chart series names, etc.). Purge the binaries
+without losing metadata:
+
+```bash
+cd authoring/workspace/assets
+rm *.xml
+```
+
+…or drop both binary and sidecar if the metadata isn't worth
+carrying either:
+
+```bash
+cd authoring/workspace/assets
+for f in *.xml; do rm "${f}" "${f%.xml}.yaml"; done
+```
+
+Raster images (`*.png`, `*.jpg`) are real content — keep those.
