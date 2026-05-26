@@ -4483,6 +4483,9 @@ V5_HTML = r"""<!doctype html>
     .slot-overlay.footer    { border-color: #757575; }
     .slot-overlay.unmapped  { border-color: #999; border-style: dashed; opacity: 0.7; }
     .slot-overlay.unmapped .slot-label { background: rgba(80,80,80,0.85); }
+    .slot-overlay.hover-highlight { box-shadow: 0 0 0 3px #ffc107, 0 0 14px 2px rgba(255,193,7,0.55);
+                                    opacity: 1; z-index: 50; }
+    .slot-overlay.hover-highlight .slot-label { background: #ffc107; color: #000; }
 
     .preview-empty { color: #999; font-size: 13px; text-align: center; padding: 40px;
                      line-height: 1.5; }
@@ -4944,13 +4947,47 @@ V5_HTML = r"""<!doctype html>
       document.querySelectorAll(`.unmapped-card[data-unmapped-index="${idx}"]`).forEach(c => {
         c.classList.toggle('active', on);
       });
+      document.querySelectorAll(`.slot-overlay.unmapped[data-unmapped-index="${idx}"]`).forEach(o => {
+        o.classList.toggle('hover-highlight', on);
+      });
     }
 
     function highlightSlot(slotId, on) {
       document.querySelectorAll(`.slot-card[data-slot-id="${CSS.escape(slotId)}"]`).forEach(c => {
         c.classList.toggle('active', on);
       });
+      document.querySelectorAll(`.slot-overlay[data-slot-id="${CSS.escape(slotId)}"]`).forEach(o => {
+        o.classList.toggle('hover-highlight', on);
+      });
     }
+
+    // Reverse highlight: hover over a panel card -> glow the preview overlay.
+    // Event delegation on #panel so it survives innerHTML re-renders.
+    (function wirePanelHoverHighlight() {
+      const panel = document.getElementById('panel');
+      if (!panel || panel.dataset.hoverWired) return;
+      panel.dataset.hoverWired = '1';
+      panel.addEventListener('mouseover', e => {
+        const slotCard = e.target.closest('.slot-card[data-slot-id]');
+        if (slotCard && !slotCard.contains(e.relatedTarget)) {
+          highlightSlot(slotCard.dataset.slotId, true); return;
+        }
+        const unCard = e.target.closest('.unmapped-card[data-unmapped-index]');
+        if (unCard && !unCard.contains(e.relatedTarget)) {
+          highlightUnmapped(Number(unCard.dataset.unmappedIndex), true);
+        }
+      });
+      panel.addEventListener('mouseout', e => {
+        const slotCard = e.target.closest('.slot-card[data-slot-id]');
+        if (slotCard && !slotCard.contains(e.relatedTarget)) {
+          highlightSlot(slotCard.dataset.slotId, false); return;
+        }
+        const unCard = e.target.closest('.unmapped-card[data-unmapped-index]');
+        if (unCard && !unCard.contains(e.relatedTarget)) {
+          highlightUnmapped(Number(unCard.dataset.unmappedIndex), false);
+        }
+      });
+    })();
 
     function escapeHtml(s) {
       return (s == null ? '' : String(s)).replace(/[&<>"']/g,
