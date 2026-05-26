@@ -359,6 +359,59 @@ def api_ingest():
     return jsonify(result)
 
 
+@app.post("/api/asset/add")
+def api_add_asset():
+    """Register a single image / SVG / XML fragment as a library asset.
+
+    Form fields:
+      file (required) — the binary
+      kind (optional) — override the inferred kind (must match the
+                        asset-vocab enum)
+
+    Returns ``{"asset_id", "sha1", "yaml_path", "binary_path", "kind"}``
+    on success. Idempotent — uploading the same content twice returns
+    the existing asset's id without rewriting the YAML.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "no file uploaded (expect form field 'file')"}), 400
+    f = request.files["file"]
+    name = f.filename or ""
+    if not name:
+        return jsonify({"error": "uploaded file has no name"}), 400
+    ext = Path(name).suffix.lower()
+    if ext not in cli_mod._ADD_ASSET_EXT_KIND:
+        return jsonify({
+            "error": (
+                f"unsupported extension {ext!r}; expected one of "
+                f"{sorted(cli_mod._ADD_ASSET_EXT_KIND)}"
+            ),
+        }), 400
+    kind_hint = (request.form.get("kind") or "").strip() or None
+    if kind_hint and kind_hint not in cli_mod.ASSET_KIND_ENUM:
+        return jsonify({
+            "error": (
+                f"invalid kind {kind_hint!r}; expected one of "
+                f"{sorted(cli_mod.ASSET_KIND_ENUM)}"
+            ),
+        }), 400
+    safe_basename = Path(name).name.lstrip(".").strip() or f"upload{ext}"
+    with tempfile.TemporaryDirectory(prefix="pptx_asset_") as td:
+        tmp_path = Path(td) / safe_basename
+        f.save(str(tmp_path))
+        try:
+            entry = cli_mod._add_asset_to_workspace(tmp_path, kind_hint=kind_hint)
+        except Exception as e:
+            debug_event("error", "add-asset",
+                        f"add-asset failed for {safe_basename}: {type(e).__name__}: {e}")
+            return jsonify({"error": f"add-asset failed: {e}"}), 500
+    debug_event(
+        "info", "add-asset",
+        f"added {entry['asset_id']} (kind={entry['kind'] or 'unset'}) from {safe_basename}",
+        **entry,
+    )
+    return jsonify(entry)
+
+
 @app.get("/api/item")
 def api_item():
     rel = request.args.get("yaml", "")
@@ -2615,6 +2668,16 @@ INDEX_HTML = r"""<!doctype html>
         Add a new deck to the workspace
       </span>
     </div>
+    <div class="ingest-row">
+      <input type="file" id="addAssetFile"
+             accept=".png,.jpg,.jpeg,.webp,.gif,.svg,.xml"
+             style="display:none;" />
+      <button id="addAssetBtn" type="button">+ Add asset</button>
+      <span class="ingest-msg" id="addAssetMsg"
+            title="Upload a single image / SVG / XML fragment. It lands as a pending asset YAML — describe it next to fill kind/feel/subject from the controlled vocab.">
+        Register a single image without a full deck ingest
+      </span>
+    </div>
     <div class="view-toggle">
       <button data-view="items" class="active">Single</button>
       <button data-view="batch">Bulk</button>
@@ -3276,6 +3339,46 @@ ingestFile.addEventListener("change", async () => {
   } finally {
     ingestBtn.disabled = false;
     ingestFile.value = "";  // allow re-uploading same filename
+  }
+});
+
+// --- Add single asset upload ----------------------------------------------
+const addAssetBtn = document.getElementById("addAssetBtn");
+const addAssetFile = document.getElementById("addAssetFile");
+const addAssetMsg = document.getElementById("addAssetMsg");
+
+function setAddAssetMsg(text, tone) {
+  addAssetMsg.textContent = text;
+  addAssetMsg.classList.remove("ok", "err");
+  if (tone) addAssetMsg.classList.add(tone);
+}
+
+addAssetBtn.addEventListener("click", () => addAssetFile.click());
+addAssetFile.addEventListener("change", async () => {
+  const f = addAssetFile.files && addAssetFile.files[0];
+  if (!f) return;
+  setAddAssetMsg("Uploading " + f.name + " …", null);
+  addAssetBtn.disabled = true;
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    const r = await fetch("/api/asset/add", { method: "POST", body: fd });
+    const data = await r.json().catch(() => ({error: "non-JSON response"}));
+    if (!r.ok) {
+      setAddAssetMsg(data.error || ("HTTP " + r.status), "err");
+    } else {
+      setAddAssetMsg(
+        "Added " + data.asset_id
+        + (data.kind ? " (kind=" + data.kind + ")" : " — describe next to set kind"),
+        "ok"
+      );
+      loadItems();  // surface the new pending asset in the sidebar
+    }
+  } catch (e) {
+    setAddAssetMsg("Upload failed: " + e.message, "err");
+  } finally {
+    addAssetBtn.disabled = false;
+    addAssetFile.value = "";
   }
 });
 

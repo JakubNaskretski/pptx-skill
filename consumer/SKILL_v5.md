@@ -59,7 +59,7 @@ consumer builds the deck on the chosen host theme.
 | `heading` | string | `max_chars`, `max_lines`, `required` |
 | `paragraph` | string | `max_chars`, `max_lines`, `required` |
 | `bullets` | list of strings | `max_items`, `max_chars_per_item`, `required` |
-| `image` | `"asset_<id>"` or `{"asset": "asset_<id>"}` | `aspect`, `required`, `auto_fit` |
+| `image` | `"asset_<id>"`, `{"asset": "asset_<id>"}`, or `"placeholder"` / `{"placeholder": true, "label": "..."}` for a labeled grey box | `aspect`, `required`, `auto_fit` |
 | `table` | `{"rows": N, "cols": N, "has_header": bool, "data": [[...]]}` | `max_rows`, `max_cols`, `has_header` |
 | `chart` | `{"type": "bar\|column\|line\|pie\|doughnut\|area" (+ `_stacked` / `_markers` variants), "categories": ["..."], "series": [{"name": "...", "values": [...]}]}` | `chart_type`, `max_series`, `max_categories` |
 | `footer` | string | `max_chars`, `max_lines`, `auto_from_host` |
@@ -102,12 +102,60 @@ yourself — call these instead:
 ```bash
 python reader.py measure-text "Q4 results" --against deckA_03.title
 python reader.py check-asset-fit asset_a1b2 deckA_03 hero
+python reader.py find-asset --kind photo --feel warm --suitable-for team
 ```
 
 `measure-text` returns `{chars, words, lines_est}` and, with
 `--against`, the headroom for a specific slot. `check-asset-fit`
 returns whether the asset fits a target image slot (aspect, kind,
-resolution) plus a `suggestion` if not.
+resolution) plus a `suggestion` if not. `find-asset` returns a
+deterministic shortlist — see "Picking images" below.
+
+## Picking images
+
+For every image slot, **call `find-asset` first** — do not scan
+`index.json` and pick by free-text fields. The shortlist is filtered
+purely on controlled-vocab tags (`kind`, `feel`, `composition`,
+`suitable_for`, `scope`, `colors`), so two runs against the same
+library produce the same candidates. Use `subject` / `depicts` only
+to break ties among the returned shortlist.
+
+```bash
+python reader.py find-asset \
+  --kind photo \
+  --feel warm \
+  --suitable-for team \
+  --limit 5
+```
+
+Algorithm:
+
+1. Call `find-asset` with the slot's required `kind` plus the deck's
+   `feel` and the slot's intent (`suitable_for`).
+2. If `matches: []`, drop the constraint named in `suggestion` and
+   retry (broaden order: `--colors`, `--composition`, `--scope`,
+   `--suitable-for`, `--feel`).
+3. From the surviving shortlist, pick one whose `subject` / `depicts`
+   fits the slide topic.
+4. If you exhaust the broadening order and the slot is **not**
+   required, omit the slot from the plan — the build skips it.
+5. If the slot IS required and nothing fits, choose one:
+   - **External source.** Use your own web tools to find an image,
+     `POST /api/asset/add` with the file, get back an `asset_id`,
+     and use it in the plan. Re-running `find-asset` after the upload
+     will return it on the next call.
+   - **Placeholder.** Pass `"placeholder"` (the literal string) as
+     the asset value. The build draws a dashed grey box labeled
+     `image needed: <slot_id>` and emits a warning in the sidecar so
+     the user knows to swap it in by hand. Pass
+     `{"placeholder": true, "label": "Customer logo here"}` for a
+     custom hint label.
+
+Don't pick assets by reading `index.json` directly — the free-text
+fields drift between describe passes, so a vibes-based pick gives
+different results on different runs. `find-asset` is the idempotent
+selector; reserve free-text reading for tiebreaks among ≤5 already-
+vetted candidates.
 
 ## Categories
 

@@ -2280,6 +2280,111 @@ def cmd_v5_check_asset_fit(args: argparse.Namespace) -> None:
     sys.stdout.write("\n")
 
 
+def cmd_v5_find_asset(args: argparse.Namespace) -> None:
+    """Deterministic shortlist filter over the asset library.
+
+    Filters index.json's assets by structural tags only (kind required;
+    feel / composition / scope / suitable_for / colors optional). Free-
+    text fields (subject, depicts) are NOT used as filter inputs — the
+    agent uses them to pick the final 1-of-N from the returned shortlist.
+
+    Two compose runs against the same library + same query produce the
+    same shortlist in the same order (sorted by id, ascending). Idempo-
+    tent by construction.
+
+    If the filter is too tight to return any candidates, ``suggestion``
+    names the field to drop first; the agent should retry with a broader
+    filter before falling back to "placeholder" or external sourcing.
+    """
+    index = load_index()
+    assets = index.get("assets", []) or []
+
+    def _matches(entry: dict, key: str, wants: list[str]) -> bool:
+        got = entry.get(key)
+        if got is None or got == "":
+            return False
+        if isinstance(got, list):
+            haystack = [str(x) for x in got]
+            return any(w in haystack for w in wants)
+        return str(got) in wants
+
+    pool = [a for a in assets if str(a.get("kind", "")) == args.kind]
+    total_kind = len(pool)
+    if args.feel:
+        pool = [a for a in pool if _matches(a, "feel", [args.feel])]
+    if args.composition:
+        pool = [a for a in pool if _matches(a, "composition", [args.composition])]
+    if args.suitable_for:
+        pool = [a for a in pool if _matches(a, "suitable_for", args.suitable_for)]
+    if args.scope:
+        pool = [a for a in pool if _matches(a, "scope", args.scope)]
+    if args.colors:
+        pool = [a for a in pool if _matches(a, "colors", args.colors)]
+
+    pool.sort(key=lambda a: str(a.get("id", "")))
+    limit = max(1, int(args.limit or 5))
+    shortlist = pool[:limit]
+
+    suggestion: str | None = None
+    if not shortlist:
+        # Drop order: most-specific first, so the agent broadens the
+        # weakest constraints before giving up structural signal.
+        drop_order = []
+        if args.colors:
+            drop_order.append("--colors")
+        if args.composition:
+            drop_order.append("--composition")
+        if args.scope:
+            drop_order.append("--scope")
+        if args.suitable_for:
+            drop_order.append("--suitable-for")
+        if args.feel:
+            drop_order.append("--feel")
+        if drop_order:
+            suggestion = (
+                f"no match — drop {drop_order[0]} and retry "
+                f"(broaden order: {', '.join(drop_order)}). If still "
+                f"empty, either stage a new asset (POST /api/asset/add) "
+                f'or pass "placeholder" as the asset_id to render a '
+                f"labeled grey box for manual replacement post-build."
+            )
+        else:
+            suggestion = (
+                f"no assets of kind={args.kind!r} in the library. "
+                f'Stage one via /api/asset/add or use "placeholder".'
+            )
+
+    out = {
+        "query": {
+            "kind": args.kind,
+            "feel": args.feel,
+            "composition": args.composition,
+            "suitable_for": args.suitable_for or [],
+            "scope": args.scope or [],
+            "colors": args.colors or [],
+        },
+        "matches": [
+            {
+                "id": a.get("id"),
+                "kind": a.get("kind"),
+                "feel": a.get("feel", ""),
+                "composition": a.get("composition", ""),
+                "suitable_for": list(a.get("suitable_for") or []),
+                "scope": list(a.get("scope") or []),
+                "colors": list(a.get("colors") or []),
+                "subject": a.get("subject", ""),
+                "depicts": a.get("depicts", ""),
+            }
+            for a in shortlist
+        ],
+        "count": len(shortlist),
+        "total_of_kind": total_kind,
+        "suggestion": suggestion,
+    }
+    json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
 def cmd_v5_compose(args: argparse.Namespace) -> None:
     """Build a deck from a v5 plan on a chosen host theme's master.
 
@@ -2594,15 +2699,65 @@ def _v5_place_bullets(slide, slot: dict, items: list, slide_w, slide_h, theme, o
     return warnings
 
 
+def _v5_draw_placeholder_box(slide, left: int, top: int, w: int, h: int, label: str) -> None:
+    """Draw a labeled grey rectangle in place of a missing image asset.
+
+    Used by the "placeholder" sentinel asset_id — agents emit this when
+    find-asset returns empty for a required slot. The box is dashed +
+    light grey so it reads as "fix me" in the final deck.
+    """
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, w, h)
+    fill = shape.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(0xEE, 0xEE, 0xEE)
+    line = shape.line
+    line.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
+    try:
+        from pptx.enum.dml import MSO_LINE_DASH_STYLE
+        line.dash_style = MSO_LINE_DASH_STYLE.DASH
+    except Exception:
+        pass
+    tf = shape.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = label
+    run.font.size = Pt(12)
+    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    run.font.italic = True
+
+
 def _v5_place_image(slide, slot: dict, value, slide_w, slide_h, theme) -> list[dict]:
     warnings: list[dict] = []
     left, top, w, h = _v5_emu_geometry(slot, slide_w, slide_h)
     # Resolve asset id from value
     asset_id = None
+    placeholder_label: str | None = None
     if isinstance(value, str):
         asset_id = value
     elif isinstance(value, dict):
-        asset_id = value.get("asset") or value.get("asset_id")
+        if value.get("placeholder"):
+            placeholder_label = str(value.get("label") or "")
+            asset_id = "placeholder"
+        else:
+            asset_id = value.get("asset") or value.get("asset_id")
+    # Placeholder sentinel: emit a labeled grey box instead of a binary.
+    # The agent uses this when find-asset returns empty for a required
+    # slot and no online sourcing was possible. Build emits a warning so
+    # the user sees in the sidecar which slots still need a real asset.
+    if asset_id in ("placeholder", "asset_placeholder"):
+        slot_id = slot.get("id") or "?"
+        label = placeholder_label or f"image needed: {slot_id}"
+        _v5_draw_placeholder_box(slide, left, top, w, h, label)
+        warnings.append({
+            "violation": "image_placeholder",
+            "slot_id": slot_id,
+            "message": f"placeholder rendered for slot {slot_id!r} — replace with a real asset",
+        })
+        return warnings
     if not asset_id:
         warnings.append({"violation": "no_asset", "message": "image value missing asset id"})
         return warnings
@@ -2919,6 +3074,45 @@ def main(argv: list[str] | None = None) -> None:
     p_cf.add_argument("skeleton_id")
     p_cf.add_argument("slot_id")
     p_cf.set_defaults(func=cmd_v5_check_asset_fit)
+
+    p_fa = sub.add_parser(
+        "find-asset",
+        help="Deterministic shortlist filter over the asset library "
+             "(structural tags only — feel/suitable_for/colors). Always "
+             "call this BEFORE picking an asset_id by reading index.json.",
+    )
+    p_fa.add_argument(
+        "--kind", required=True,
+        help="photo|icon|logo|illustration|screenshot|vector|table|"
+             "chart|callout|freeform|smartart",
+    )
+    p_fa.add_argument(
+        "--feel", default=None,
+        help="formal|warm|clinical|punchy|playful|minimal|dramatic",
+    )
+    p_fa.add_argument(
+        "--composition", default=None,
+        help="centered|left-weighted|right-weighted|full-bleed|"
+             "top-heavy|scattered",
+    )
+    p_fa.add_argument(
+        "--suitable-for", action="append", default=None, dest="suitable_for",
+        help="repeatable; any-match (e.g. --suitable-for team)",
+    )
+    p_fa.add_argument(
+        "--scope", action="append", default=None,
+        help="repeatable; any-match (e.g. --scope generic, "
+             "--scope client:acme-bank)",
+    )
+    p_fa.add_argument(
+        "--colors", action="append", default=None,
+        help="repeatable; any-match against semantic color words",
+    )
+    p_fa.add_argument(
+        "--limit", type=int, default=5,
+        help="cap on shortlist size (default 5)",
+    )
+    p_fa.set_defaults(func=cmd_v5_find_asset)
 
     p_mt = sub.add_parser("measure-text",
                           help="Char/word/line counts; optional fit against a slot.")

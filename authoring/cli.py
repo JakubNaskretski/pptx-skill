@@ -811,7 +811,17 @@ def _current_deck_stems() -> set[str]:
 
 
 def _prune_dead_sources(sources: list, valid_decks: set[str]) -> list:
-    return [s for s in sources if (s.get("deck") or "") in valid_decks]
+    # Entries without a `deck` key are external sources (manual uploads,
+    # web-fetched images, etc.) — keep them; only drop deck-derived
+    # entries whose parent deck is no longer in the workspace.
+    out = []
+    for s in sources:
+        if "deck" not in s:
+            out.append(s)
+            continue
+        if (s.get("deck") or "") in valid_decks:
+            out.append(s)
+    return out
 
 
 _ASSET_DESCRIPTIVE_DEFAULTS = {
@@ -1916,6 +1926,150 @@ def remove_deck(deck_stem: str, dry_run: bool) -> None:
     click.echo(f"pruned dead sources in {pruned_count} asset yaml(s).")
 
 
+# --- add-asset -------------------------------------------------------------
+#
+# Single-file ingestion: register one image / SVG / XML fragment into the
+# asset library without going through a full .pptx ingest. Same on-disk
+# layout (<sha1>.<ext> + <sha1>.yaml), same id convention (asset_<sha8>).
+# The sidecar lands as a pending stub with empty descriptive fields, ready
+# for the existing describe flow to populate.
+
+_ADD_ASSET_EXT_KIND = {
+    ".png":  "photo",  ".jpg":  "photo",  ".jpeg": "photo",
+    ".webp": "photo",  ".gif":  "photo",
+    ".svg":  "vector",
+    ".xml":  "",        # leave kind blank — could be table / chart / callout
+}
+
+
+def _add_asset_to_workspace(src: Path, *, kind_hint: str | None = None) -> dict:
+    """Register one file as a library asset. Returns the persisted entry.
+
+    Idempotent: if the same content (same sha1) is already in the library,
+    the existing YAML is preserved and the entry is returned unchanged.
+    Manual additions are stamped with an ``external: manual-upload`` source
+    so the next ingest pass doesn't prune them as dead deck references.
+    """
+    if not src.exists() or not src.is_file():
+        raise click.ClickException(f"file not found: {src}")
+    ext = src.suffix.lower()
+    if ext not in _ADD_ASSET_EXT_KIND:
+        raise click.ClickException(
+            f"unsupported extension {ext!r}; expected one of "
+            f"{sorted(_ADD_ASSET_EXT_KIND)}"
+        )
+    assets_dir = WORKSPACE / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    blob = src.read_bytes()
+    sha = hashlib.sha1(blob).hexdigest()
+    asset_id = f"asset_{sha[:8]}"
+    bin_path = assets_dir / f"{sha}{ext}"
+    yaml_path = assets_dir / f"{sha}.yaml"
+    if not bin_path.exists():
+        bin_path.write_bytes(blob)
+
+    inferred_kind = kind_hint or _ADD_ASSET_EXT_KIND[ext] or None
+    if inferred_kind and inferred_kind not in ASSET_KIND_ENUM:
+        raise click.ClickException(
+            f"--kind must be one of {sorted(ASSET_KIND_ENUM)}, got {inferred_kind!r}"
+        )
+
+    colors_hex: list[str] = []
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        try:
+            colors_hex = _extract_dominant_colors_hex(bin_path)
+        except Exception:
+            colors_hex = []
+
+    recolor_targets: list[str] | None = None
+    if inferred_kind == "vector" and ext == ".svg":
+        try:
+            from xml.etree import ElementTree as _ET
+            svg_text = bin_path.read_text(encoding="utf-8", errors="ignore")
+            recolor_targets = _extract_svg_colors(svg_text.encode("utf-8"))
+            if recolor_targets:
+                colors_hex = recolor_targets
+        except Exception:
+            pass
+
+    # write_asset_yaml_stub expects a (deck_stem, slide_number) pair for
+    # the source. For manual adds, append a non-deck `external` entry
+    # directly to the YAML — _prune_dead_sources keeps entries without a
+    # `deck` key. Re-use the stub to seed descriptive defaults + structural
+    # blocks, then patch the sources list.
+    existing = {}
+    if yaml_path.exists():
+        try:
+            existing = read_yaml(yaml_path)
+        except Exception:
+            existing = {}
+
+    # Use a sentinel deck stem that doesn't collide with real decks. The
+    # stub will append it; we strip it back out and add an external entry.
+    _MANUAL_SENTINEL_DECK = "__manual_upload__"
+    write_asset_yaml_stub(
+        yaml_path,
+        asset_id,
+        sha,
+        _MANUAL_SENTINEL_DECK,
+        0,
+        kind=inferred_kind,
+        colors_hex=colors_hex or None,
+        recolor_targets=recolor_targets,
+    )
+    data = read_yaml(yaml_path)
+    sources = [
+        s for s in (data.get("sources") or [])
+        if s.get("deck") != _MANUAL_SENTINEL_DECK
+    ]
+    from datetime import datetime as _dt
+    already_external = any(
+        s.get("external") == "manual-upload" for s in sources
+    )
+    if not already_external:
+        sources.append({
+            "external": "manual-upload",
+            "filename": src.name,
+            "at": _dt.now().isoformat(timespec="seconds"),
+        })
+    data["sources"] = sources
+    write_yaml(yaml_path, data)
+    return {
+        "asset_id": asset_id,
+        "sha1": sha,
+        "yaml_path": str(yaml_path),
+        "binary_path": str(bin_path),
+        "kind": data.get("kind") or "",
+        "created": not bin_path.exists() or True,
+    }
+
+
+@cli.command(name="add-asset")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--kind", default=None,
+    type=click.Choice(sorted(VOCAB["asset"]["kind"])),
+    help="Override the inferred kind. If omitted, photo is assumed for "
+         "raster images and vector for SVG; XML fragments leave kind "
+         "blank for hand-editing.",
+)
+def add_asset(path: Path, kind: str | None) -> None:
+    """Register a single image / SVG / XML fragment as a library asset.
+
+    The file is hashed (sha1) and copied into workspace/assets/ alongside
+    a stub YAML sidecar with empty descriptive fields and status: pending.
+    Run `cli.py describe` (or the web app's Describe button) to fill in
+    kind/feel/subject/suitable_for from the controlled vocab. The next
+    `cli.py validate` will auto-promote the YAML to done.
+    """
+    entry = _add_asset_to_workspace(path, kind_hint=kind)
+    click.echo(
+        f"added {entry['asset_id']} (kind={entry['kind'] or 'unset'}) → "
+        f"{entry['yaml_path']}"
+    )
+
+
 # --- status ----------------------------------------------------------------
 
 
@@ -2687,8 +2841,24 @@ def build_v5(allow_pending: bool, out_path: Path | None, skill_md_path: Path | N
             "slot_kinds": sorted({s.get("kind") for s in (sk.get("slots") or [])}),
             "status": sk.get("status", "pending"),
         } for sid, _, sk in skeletons],
+        # Asset records carry the full structural-vocab block (kind, feel,
+        # composition, suitable_for, scope, colors, colors_hex) so the
+        # consumer-side `find-asset` can filter deterministically without
+        # opening every sidecar YAML. Free-text fields (subject, depicts)
+        # ride along too for shortlist tiebreaks.
         "assets": [
-            {"id": d.get("id"), "kind": d.get("kind"), "subject": d.get("subject", "")}
+            {
+                "id": d.get("id"),
+                "kind": d.get("kind", ""),
+                "feel": d.get("feel", ""),
+                "composition": d.get("composition", ""),
+                "suitable_for": list(d.get("suitable_for") or []),
+                "scope": list(d.get("scope") or []),
+                "colors": list(d.get("colors") or []),
+                "colors_hex": list(d.get("colors_hex") or []),
+                "subject": d.get("subject", ""),
+                "depicts": d.get("depicts", ""),
+            }
             for d in (read_yaml(p) for p in asset_yamls)
         ],
     }
