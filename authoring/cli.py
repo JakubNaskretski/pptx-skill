@@ -1811,16 +1811,13 @@ def ingest(deck: Path) -> None:
 
 @cli.command(name="remove-deck")
 @click.argument("deck_stem")
-@click.option("--drop-skeletons", is_flag=True, default=False,
-              help="Also delete v5 skeletons whose source_deck matches.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Print what would change without touching disk.")
-def remove_deck(deck_stem: str, drop_skeletons: bool, dry_run: bool) -> None:
-    """Remove a deck folder. Keeps extracted assets (deduplicated by
-    content SHA, reusable across decks). v5 skeletons sourced from
-    this deck are kept by default; pass --drop-skeletons to also
-    remove them. Dead deck references in assets/<id>.yaml `sources`
-    lists are pruned automatically.
+def remove_deck(deck_stem: str, dry_run: bool) -> None:
+    """Remove a deck folder, its v5 theme, and every v5 skeleton sourced
+    from it. Extracted assets are kept (deduplicated by content SHA,
+    reusable across decks). Dead deck references in assets/<id>.yaml
+    `sources` lists are pruned automatically.
     """
     deck_dir = WORKSPACE / "decks" / deck_stem
     if not deck_dir.exists():
@@ -1829,7 +1826,7 @@ def remove_deck(deck_stem: str, drop_skeletons: bool, dry_run: bool) -> None:
             f"(available: {sorted(_current_deck_stems()) or 'none'})"
         )
 
-    # Skeletons sourced from this deck.
+    # Skeletons sourced from this deck — always dropped.
     skeleton_dirs: list[Path] = []
     sk_root = WORKSPACE / "skeletons"
     if sk_root.exists():
@@ -1863,24 +1860,20 @@ def remove_deck(deck_stem: str, drop_skeletons: bool, dry_run: bool) -> None:
     theme_dir = WORKSPACE / "themes" / deck_stem
     theme_present = theme_dir.exists()
 
-    # Plan summary.
     click.echo(f"deck:       {deck_dir}")
     click.echo(f"theme:      {theme_dir if theme_present else '(none)'}")
-    click.echo(f"skeletons:  {len(skeleton_dirs)} "
-               f"({'drop' if drop_skeletons else 'keep — preview re-render will warn'})")
-    click.echo(f"assets:     {len(asset_yamls_to_prune)} "
-               f"yaml(s) will have dead source pruned; binaries kept")
+    click.echo(f"skeletons:  {len(skeleton_dirs)} (drop)")
+    click.echo(f"assets:     {len(asset_yamls_to_prune)} yaml(s) will "
+               f"have dead source pruned; binaries kept")
 
     if dry_run:
         for sk in skeleton_dirs:
-            verb = "drop" if drop_skeletons else "keep"
-            click.echo(f"  would {verb} skeleton: {sk.name}")
+            click.echo(f"  would drop skeleton: {sk.name}")
         for ya in asset_yamls_to_prune:
             click.echo(f"  would prune sources in: {ya.name}")
         click.echo("dry-run: nothing changed.")
         return
 
-    # Execute.
     shutil.rmtree(deck_dir)
     click.echo(f"removed deck: {deck_dir}")
 
@@ -1888,10 +1881,9 @@ def remove_deck(deck_stem: str, drop_skeletons: bool, dry_run: bool) -> None:
         shutil.rmtree(theme_dir)
         click.echo(f"removed theme: {theme_dir}")
 
-    if drop_skeletons:
-        for sk_dir in skeleton_dirs:
-            shutil.rmtree(sk_dir)
-            click.echo(f"removed skeleton: {sk_dir.name}")
+    for sk_dir in skeleton_dirs:
+        shutil.rmtree(sk_dir)
+        click.echo(f"removed skeleton: {sk_dir.name}")
 
     # Prune dead `sources` entries on the remaining assets.
     valid = _current_deck_stems()
@@ -1908,13 +1900,6 @@ def remove_deck(deck_stem: str, drop_skeletons: bool, dry_run: bool) -> None:
             write_yaml(asset_yaml, meta)
             pruned_count += 1
     click.echo(f"pruned dead sources in {pruned_count} asset yaml(s).")
-
-    if not drop_skeletons and skeleton_dirs:
-        click.echo(
-            f"note: {len(skeleton_dirs)} skeleton(s) still reference deck "
-            f"{deck_stem!r}; their preview backgrounds will warn on next "
-            f"`preview` run (compose-v5 still works without the underlay)."
-        )
 
 
 # --- status ----------------------------------------------------------------
