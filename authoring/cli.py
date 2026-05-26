@@ -1820,11 +1820,7 @@ def remove_deck(deck_stem: str, dry_run: bool) -> None:
     `sources` lists are pruned automatically.
     """
     deck_dir = WORKSPACE / "decks" / deck_stem
-    if not deck_dir.exists():
-        raise click.ClickException(
-            f"deck {deck_stem!r} not in {WORKSPACE / 'decks'} "
-            f"(available: {sorted(_current_deck_stems()) or 'none'})"
-        )
+    deck_present = deck_dir.exists()
 
     # Skeletons sourced from this deck — always dropped.
     skeleton_dirs: list[Path] = []
@@ -1860,7 +1856,14 @@ def remove_deck(deck_stem: str, dry_run: bool) -> None:
     theme_dir = WORKSPACE / "themes" / deck_stem
     theme_present = theme_dir.exists()
 
-    click.echo(f"deck:       {deck_dir}")
+    # Bail only if there's genuinely nothing left to clean for this stem.
+    if not (deck_present or theme_present or skeleton_dirs or asset_yamls_to_prune):
+        raise click.ClickException(
+            f"nothing to remove for stem {deck_stem!r} "
+            f"(available decks: {sorted(_current_deck_stems()) or 'none'})"
+        )
+
+    click.echo(f"deck:       {deck_dir if deck_present else '(already gone)'}")
     click.echo(f"theme:      {theme_dir if theme_present else '(none)'}")
     click.echo(f"skeletons:  {len(skeleton_dirs)} (drop)")
     click.echo(f"assets:     {len(asset_yamls_to_prune)} yaml(s) will "
@@ -1874,8 +1877,9 @@ def remove_deck(deck_stem: str, dry_run: bool) -> None:
         click.echo("dry-run: nothing changed.")
         return
 
-    shutil.rmtree(deck_dir)
-    click.echo(f"removed deck: {deck_dir}")
+    if deck_present:
+        shutil.rmtree(deck_dir)
+        click.echo(f"removed deck: {deck_dir}")
 
     if theme_present:
         shutil.rmtree(theme_dir)
