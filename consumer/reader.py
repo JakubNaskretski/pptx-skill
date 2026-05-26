@@ -315,11 +315,15 @@ def _replace_image_shape_legacy(slide, shape, image_path: Path) -> None:
     """Remove the existing Picture shape and add a fresh one at the same
     geometry. Loses crop / border / shadow / rotation / transparency /
     effects / alt text. Used as a fallback when the in-place rewire
-    can't find what it needs."""
-    left = shape.left
-    top = shape.top
-    width = shape.width
-    height = shape.height
+    can't find what it needs.
+
+    Placeholder shapes inherit geometry from their layout/master and may
+    return None for left/top/width/height. We resolve those via the
+    placeholder chain when possible, and fall back to slide-fraction
+    defaults so add_picture never sees None (which raises a cryptic
+    "a real number is required" error inside python-pptx).
+    """
+    left, top, width, height = _resolve_shape_geometry(slide, shape)
     name = shape.name
 
     sp = shape._element
@@ -329,6 +333,54 @@ def _replace_image_shape_legacy(slide, shape, image_path: Path) -> None:
         str(image_path), left, top, width=width, height=height
     )
     new_pic.name = name
+
+
+def _resolve_shape_geometry(slide, shape) -> tuple[int, int, int, int]:
+    """Return (left, top, width, height) in EMU for any shape, including
+    placeholders that inherit geometry. Walks placeholder -> layout
+    placeholder -> master placeholder, then falls back to slide-fraction
+    defaults so the caller never has to deal with None.
+    """
+    def chain(attr: str):
+        v = getattr(shape, attr, None)
+        if v is not None:
+            return v
+        try:
+            ph_format = shape.placeholder_format
+            if ph_format is not None and ph_format.idx is not None:
+                layout = slide.slide_layout
+                for layout_ph in layout.placeholders:
+                    if layout_ph.placeholder_format.idx == ph_format.idx:
+                        v = getattr(layout_ph, attr, None)
+                        if v is not None:
+                            return v
+                        master = layout.slide_master
+                        for master_ph in master.placeholders:
+                            if master_ph.placeholder_format.idx == ph_format.idx:
+                                mv = getattr(master_ph, attr, None)
+                                if mv is not None:
+                                    return mv
+        except Exception:
+            pass
+        return None
+
+    left = chain("left")
+    top = chain("top")
+    width = chain("width")
+    height = chain("height")
+
+    prs = slide.part.package.presentation_part.presentation
+    slide_w = prs.slide_width or 9144000
+    slide_h = prs.slide_height or 6858000
+    if left is None:
+        left = 0
+    if top is None:
+        top = 0
+    if width is None:
+        width = int(slide_w * 0.4)
+    if height is None:
+        height = int(slide_h * 0.3)
+    return int(left), int(top), int(width), int(height)
 
 
 def _replace_image_shape(slide, shape, image_path: Path) -> None:
@@ -367,10 +419,11 @@ def _replace_image_shape(slide, shape, image_path: Path) -> None:
     # versions. We grab the rel id, then remove the temporary shape
     # — the image part stays bound to the slide via the rel.
     try:
+        _l, _t, _w, _h = _resolve_shape_geometry(slide, shape)
         tmp_pic = slide.shapes.add_picture(
             str(image_path),
             left=0, top=0,
-            width=shape.width, height=shape.height,
+            width=_w, height=_h,
         )
         tmp_blip = tmp_pic._element.find(".//" + qn("a:blip"))
         if tmp_blip is None:
@@ -506,7 +559,10 @@ def _apply_slot_value(slide, slot_id: str, value: Any, kind_hint: str | None) ->
         if bin_path is None:
             warnings.append(f"slot '{slot_id}': asset {aid} not found in bundle")
             return warnings
-        _replace_image_shape(slide, shape, bin_path)
+        try:
+            _replace_image_shape(slide, shape, bin_path)
+        except Exception as e:
+            warnings.append(f"slot '{slot_id}': image replace failed: {type(e).__name__}: {e}")
         return warnings
 
     if kind == "bullets":
