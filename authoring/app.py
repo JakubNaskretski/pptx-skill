@@ -1050,37 +1050,44 @@ def _build_prompt_bundle_zip(skeletons: list[dict], assets: list[dict], brief: s
                            sort_keys=False, allow_unicode=True),
         )
 
-        # Themes
+        # Themes — text-only. theme.yaml carries palette + fonts that the
+        # agent reasons about; the master.pptx + preview.png stay on the
+        # authoring machine and only get materialized at compose-run time
+        # (server-side), not in the agent's context.
         for t in themes:
             tid = t.get("id") or t["_dir"]
             src_dir = themes_root / t["_dir"]
-            for fn in ("theme.yaml", "master.pptx", "preview.png"):
-                src = src_dir / fn
-                if src.exists():
-                    zf.write(src, f"themes/{tid}/{fn}")
+            theme_yaml = src_dir / "theme.yaml"
+            if theme_yaml.exists():
+                zf.write(theme_yaml, f"themes/{tid}/theme.yaml")
 
-        # Skeletons (sidecar + previews)
+        # Skeletons — text-only. skeleton.yaml is the full structural
+        # description the agent picks against; preview.png + background.png
+        # are render aids that stay on the authoring machine. Sending
+        # rendered slide PNGs to the LLM would bloat the bundle for no
+        # behavioral gain (the YAML carries every slot + geometry the
+        # agent reasons about).
         for sk in skeletons:
             sid = sk["id"]
             src_dir = skeletons_root / sk["_dir"]
-            for fn in ("skeleton.yaml", "preview.png", "background.png"):
-                src = src_dir / fn
-                if src.exists():
-                    zf.write(src, f"skeletons/{sid}/{fn}")
+            sk_yaml = src_dir / "skeleton.yaml"
+            if sk_yaml.exists():
+                zf.write(sk_yaml, f"skeletons/{sid}/skeleton.yaml")
 
-        # KB assets (slim sidecar + binary)
+        # KB assets — YAML SIDECAR ONLY. The agent picks asset_ids by
+        # reading description / tags / dimensions; the binary stays on
+        # the authoring machine and is spliced in at compose-run time.
+        # Shipping binaries here would balloon the bundle and defeat the
+        # "no vision at consume time" contract (each asset can be 100s
+        # of KB; a workspace of 30+ assets becomes a multi-megabyte
+        # bundle for nothing).
         for a in assets:
             aid = a["id"]
-            yaml_path: Path = a["_yaml_path"]
             clean = {k: v for k, v in a.items() if not k.startswith("_")}
             zf.writestr(
                 f"assets/{aid}.yaml",
                 yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
             )
-            binary = _asset_binary(yaml_path)
-            if binary is not None:
-                ext = binary.suffix.lstrip(".") or "bin"
-                zf.write(binary, f"assets/{aid}.{ext}")
 
         # User-supplied assets: low-res previews + manifest with original
         # dimensions. Full-res originals stay on the user's machine and

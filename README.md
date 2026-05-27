@@ -88,25 +88,31 @@ The zip is the deliverable to consuming agents — see
            │   build-v5  OR  /compose page in the web app
            ▼
 
-┌─ consumer/ — what ships to the agent ────────────────────────────────┐
+┌─ The brief bundle — what ships to the agent (text-only) ─────────────┐
 │                                                                      │
 │   SKILL.md          ← agent contract (`SKILL_v5.md` content)         │
 │   reader.py         ← the agent calls this for find-asset,           │
-│                       check-asset-fit, match-skeletons, compose-v5   │
+│                       check-asset-fit, match-skeletons               │
 │   tag_vocab.yaml    ← live tag list                                  │
 │   brand.md          ← (optional) per-org palette / voice / taboos    │
 │   brief.md          ← user's deck brief (typed in /compose)          │
 │   index.json        ← v5 summary catalog:                            │
 │                       {version: 5, themes, skeletons, assets,        │
 │                        tag_vocab}                                    │
-│   themes/<id>/      ← only the themes whose decks contributed a      │
-│                       skeleton to this bundle                        │
-│   skeletons/<id>/   ← non-rejected skeletons (after review)          │
-│   assets/<id>.*     ← KB asset sidecars + binaries                   │
+│   themes/<id>/theme.yaml      ← palette + fonts only                 │
+│   skeletons/<id>/skeleton.yaml ← structural slot layout              │
+│   assets/<id>.yaml            ← slim sidecar (kind, tags,            │
+│                                  description, dimensions, colors)    │
 │   user_assets/      ← (optional) user-attached images for THIS       │
-│                       request — low-res previews in the zip, full-   │
-│                       res spliced back in at compose time            │
+│                       request — low-res previews in the zip,         │
+│                       full-res spliced back in at compose time       │
 └──────────────────────────────────────────────────────────────────────┘
+
+The bundle is **text only**. No KB asset binaries, no rendered slide
+previews, no master.pptx — the agent picks IDs by reading YAML; the
+actual binaries live on the authoring machine and get spliced in
+server-side at compose-run time. Typical bundle is ~100 KB for a
+30-skeleton workspace.
 ```
 
 ### How the pieces relate
