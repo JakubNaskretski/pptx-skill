@@ -2438,14 +2438,16 @@ def _v5_place_text(slide, slot: dict, value, slide_w, slide_h, theme, overflow) 
     tb = slide.shapes.add_textbox(left, top, w, h)
     tf = tb.text_frame
     tf.word_wrap = True
-    if overflow == "shrink":
-        # MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE doesn't exist universally;
-        # use word_wrap + autofit via tf.auto_size if available.
+    # Auto-shrink is the default. If the text fits at the configured
+    # font size, PowerPoint leaves it alone; if it overflows, the
+    # font is shrunk until the wrapped text fits the box height.
+    # This avoids text leaking into adjacent slots when the agent
+    # writes content that exceeds max_chars. Opt out by passing the
+    # slot value as {"value": "...", "overflow": "none"}.
+    if overflow != "none":
         try:
             from pptx.enum.text import MSO_AUTO_SIZE
             tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-            warnings.append({"overflow_kind": "shrink",
-                             "message": "text autofit enabled per overflow:shrink"})
         except Exception:
             pass
 
@@ -2475,12 +2477,13 @@ def _v5_place_bullets(slide, slot: dict, items: list, slide_w, slide_h, theme, o
     tb = slide.shapes.add_textbox(left, top, w, h)
     tf = tb.text_frame
     tf.word_wrap = True
-    if overflow == "shrink":
+    # Same auto-shrink default as _v5_place_text. PowerPoint leaves
+    # well-sized lists alone; long lists / long items get shrunk to
+    # fit. Opt out via {"value": [...], "overflow": "none"}.
+    if overflow != "none":
         try:
             from pptx.enum.text import MSO_AUTO_SIZE
             tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-            warnings.append({"overflow_kind": "shrink",
-                             "message": "bullet autofit enabled per overflow:shrink"})
         except Exception:
             pass
 
