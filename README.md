@@ -22,25 +22,63 @@ Two layers:
 # 1. Install authoring deps (one-time).
 pip install -r authoring/requirements.txt
 
-# 2. Strip a deck into the workspace.
-python3 authoring/cli.py ingest path/to/your_deck.pptx
-
-# 3. Launch the local web app to review skeletons + describe assets.
+# 2. Launch the local web app.
 python3 authoring/app.py
 # → http://localhost:5050 opens automatically
+```
 
-# 4. (Optional) Render skeleton preview PNGs so the review UI has
-#    thumbnails. Tries PowerPoint (Windows), LibreOffice, then macOS
-#    Quick Look. Skipped silently if no renderer is available.
-python3 authoring/cli.py preview
+You can compose right away — the repo ships with **two predigested
+example decks** (`standard_templates`, `title_and_breaks`) already
+in the workspace. See the next section for what those are.
 
-# 5. Build the portable consumer artifact.
-python3 authoring/cli.py build-v5
-# → authoring/dist/skill-v5.zip
+To ingest your own decks:
+
+```bash
+python3 authoring/cli.py ingest path/to/your_deck.pptx
+python3 authoring/cli.py preview        # optional: render thumbnails
+python3 authoring/cli.py build-v5       # optional: emit dist/skill-v5.zip
 ```
 
 The zip is the deliverable to consuming agents — see
 [`consumer/SKILL_v5.md`](consumer/SKILL_v5.md) for the contract.
+
+## What's pre-loaded on a fresh clone
+
+The repo ships predigested examples so the `/` review page and
+`/compose` brief flow work end-to-end before you ingest anything
+of your own:
+
+| Deck | Source | Skeletons | Theme |
+|---|---|---|---|
+| `standard_templates` | `examples/standard_templates.pptx` | 10 generic content layouts (opener, content, data, closing) | shipped at `authoring/workspace/themes/standard_templates/` |
+| `title_and_breaks` | `examples/title_and_breaks.pptx` | 6 title-card / section-divider layouts | shipped at `authoring/workspace/themes/title_and_breaks/` |
+
+Both are bare-bones — neutral palette, no brand marks — designed
+to be **structurally instructive** (so you can see what a slot
+inventory looks like, what categories the system uses, how
+compose-v5 picks a host theme) without polluting the look of
+decks you author later.
+
+What this gives you out of the box:
+- A populated **Skeletons** tab on `/` you can click around.
+- Two ready-to-pick themes in `/compose` filter rail.
+- A successful `/api/compose/run` on any of the 16 example
+  skeletons (compose returns a valid `.pptx` using the
+  matching example theme as host).
+
+What's **not** shipped: extracted assets from these example decks
+(the `.pptx` files are mostly empty layouts). The **Assets** tab
+will be empty until you ingest a deck of your own or use
+`+ Add asset` to upload one. Image slots on the example
+skeletons render with the `"placeholder"` sentinel (a labeled
+grey box) until you give them real assets.
+
+If you want to start fresh (delete the examples):
+
+```bash
+python3 authoring/cli.py remove-deck standard_templates
+python3 authoring/cli.py remove-deck title_and_breaks
+```
 
 ---
 

@@ -13,12 +13,27 @@ authoring/workspace/skeletons/*
 !authoring/workspace/skeletons/title_and_breaks_*/
 !authoring/workspace/skeletons/title_and_breaks_*/**
 
+# Predigested example themes — ship the palette + master alongside the
+# predigested skeletons above so a fresh clone can compose the demo
+# decks without re-ingesting. User-ingested themes (anything else)
+# stay per-user/gitignored via the workspace/* rule above.
+!authoring/workspace/themes/
+authoring/workspace/themes/*
+!authoring/workspace/themes/standard_templates/
+!authoring/workspace/themes/standard_templates/**
+!authoring/workspace/themes/title_and_breaks/
+!authoring/workspace/themes/title_and_breaks/**
+
 # Source decks (often sensitive client material) — never tracked,
 # except the canonical example deck binaries under examples/ so a
 # fresh clone has them on hand to ingest if/when the user wants
 # matching themes/assets in their workspace.
 *.pptx
 !examples/*.pptx
+# Master.pptx of the predigested example themes — needed so compose
+# can render against the right host on a fresh clone.
+!authoring/workspace/themes/standard_templates/master.pptx
+!authoring/workspace/themes/title_and_breaks/master.pptx
 
 # Built consumer artifacts
 authoring/dist/

@@ -1,0 +1,18 @@
+id: title_and_breaks
+palette:
+  primary: '#1F497D'
+  accent: '#4F81BD'
+  text_default: '#000000'
+  background: '#FFFFFF'
+fonts:
+  major: Calibri
+  minor: Calibri
+master_pptx: master.pptx
+preview: preview.png
+decorations:
+- kind: page_number
+  geometry:
+    x: 0.5375
+    y: 0.9269
+    w: 0.175
+    h: 0.0532
