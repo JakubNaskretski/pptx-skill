@@ -1851,7 +1851,6 @@ def api_compose_run():
                 "error": "compose failed",
                 "stdout": result.stdout,
                 "stderr": result.stderr,
-                "mode": "v5" if is_v5 else "v4",
             }), 500
         try:
             summary = json_mod.loads(result.stdout)
@@ -1862,16 +1861,15 @@ def api_compose_run():
         persisted = WORKSPACE / "_compose_out"
         persisted.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        suffix = "v5" if is_v5 else "v4"
-        out_persisted = persisted / f"deck-{suffix}-{ts}.pptx"
+        out_persisted = persisted / f"deck-{ts}.pptx"
         shutil.copyfile(out_path, out_persisted)
         debug_event(
             "info", "compose",
-            f"compose finished ({suffix}) — {out_persisted.name}, "
+            f"compose finished — {out_persisted.name}, "
             f"{out_persisted.stat().st_size // 1024} KB, "
             f"{len(plan)} plan entries",
             file=out_persisted.name, size_bytes=out_persisted.stat().st_size,
-            entries=len(plan), mode=suffix,
+            entries=len(plan),
         )
 
     return send_file(
