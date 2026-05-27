@@ -134,16 +134,23 @@ The zip is the deliverable to consuming agents — see
 
 ### Web UI surface
 
-Local Flask app on `http://localhost:5050`:
+Local Flask app on `http://localhost:5050`. Two pages.
 
-- **`/`** — describe-page. Per-asset form (kind / tags / description /
-  notes) for the asset library. Pending assets surface for re-tag /
-  re-describe; bulk-describe-via-LLM workflow attached.
-- **`/v5`** — skeleton review. Sidebar lists all ingested skeletons
-  grouped by deck; checkboxes for bulk approve/reject; main pane
-  shows preview + slot inventory + per-slot kind/role overrides;
-  panel auto-advances to the next pending after approve/reject.
-- **`/compose`** — brief builder. Left rail filters the library by
+- **`/` — review.** One tabbed page covering everything you ingest.
+  Tab switcher in the sidebar:
+    - **Skeletons** — every ingested slide grouped by deck. Checkboxes
+      for bulk approve/reject; preview pane shows the slide with
+      colored slot overlays; right panel lets you override slot
+      kind / role, promote unmapped shapes, set overlap decisions.
+      Auto-advances to the next pending after a single approve/reject.
+    - **Assets** — every deduped image / icon / atom from every deck.
+      Sidebar lists them by id with a Hide-done filter; preview pane
+      shows the binary; right panel is the describe form
+      (kind / tags / description / notes). Save promotes pending → done
+      and jumps to the next pending automatically. `+ Add asset`
+      uploads a single image without re-ingesting a deck.
+  `/v5` redirects here for old bookmarks.
+- **`/compose` — brief builder.** Left rail filters the library by
   skeleton `categories` and asset `kind` / `tags`. Middle pane is
   your brief text + optional user-attached assets. Bottom emits a
   zip bundle (download) or flat-text view (copy/paste). Plan from

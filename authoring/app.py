@@ -26,7 +26,7 @@ from pathlib import Path
 from threading import Lock, Timer
 
 import yaml
-from flask import Flask, abort, g, jsonify, render_template_string, request, send_file
+from flask import Flask, abort, g, jsonify, redirect, render_template_string, request, send_file
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -2042,898 +2042,11 @@ DEBUG_WIDGET = r"""
 """
 
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>pptx-skill describe</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           margin: 0; height: 100vh; display: flex; color: #222; }
-    .sidebar { width: 280px; border-right: 1px solid #ddd; background: #fafafa;
-               overflow-y: auto; display: flex; flex-direction: column; }
-    .sidebar header { padding: 12px 14px; border-bottom: 1px solid #ddd; }
-    .tabs { display: flex; border-bottom: 1px solid #ddd; }
-    .tabs button { flex: 1; padding: 8px; border: none; background: none;
-                   cursor: pointer; font-weight: 500; border-bottom: 2px solid transparent;
-                   font-size: 13px; }
-    .tabs button.active { border-bottom-color: #0066cc; color: #0066cc; }
-    .filter-row { padding: 8px 14px; font-size: 12px; color: #555;
-                  display: flex; gap: 6px; align-items: center; }
-    .item-list { list-style: none; padding: 0; margin: 0; flex: 1; overflow-y: auto; }
-    .item-list li { padding: 8px 14px; cursor: pointer; font-size: 12px;
-                    display: flex; justify-content: space-between; align-items: center;
-                    border-bottom: 1px solid #eee; }
-    .item-list li:hover { background: #eef4ff; }
-    .item-list li.active { background: #d8e8ff; }
-    .pill { font-size: 9px; padding: 2px 6px; border-radius: 8px;
-            text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; }
-    .pill.pending { background: #ffeaa7; color: #8c6900; }
-    .pill.done { background: #c8e6c9; color: #1b5e20; }
-    .pill.locked { background: #d1c4e9; color: #311b92; }
-
-    .preview { flex: 1; background: #1c1c1c; display: flex; align-items: center;
-               justify-content: center; padding: 20px; min-width: 0; }
-    .preview img { max-width: 100%; max-height: 100%;
-                   box-shadow: 0 4px 30px rgba(0,0,0,0.4); background: white; }
-    .preview .empty { color: #666; font-size: 13px; }
-
-    .panel { width: 400px; border-left: 1px solid #ddd; padding: 16px;
-             overflow-y: auto; background: white; }
-    .panel h2 { margin: 0 0 4px; font-size: 15px; word-break: break-all; }
-    .panel .sub { color: #888; font-size: 11px; margin-bottom: 12px;
-                  word-break: break-all; }
-    .panel label { display: block; font-size: 11px; font-weight: 700;
-                   margin: 12px 0 4px; color: #555; text-transform: uppercase;
-                   letter-spacing: 0.4px; }
-    .panel label .hint { font-weight: 400; color: #999; text-transform: none;
-                         letter-spacing: 0; margin-left: 6px; }
-    .panel input, .panel select, .panel textarea {
-      width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;
-      font-size: 13px; font-family: inherit; background: white;
-    }
-    .panel textarea { resize: vertical; min-height: 50px; }
-    .checks { display: flex; flex-wrap: wrap; gap: 4px; }
-    .checks label { display: inline-flex; align-items: center; gap: 4px;
-                    font-weight: normal; font-size: 11px; padding: 3px 8px;
-                    border: 1px solid #ccc; border-radius: 12px; cursor: pointer;
-                    background: #fff; margin: 0; text-transform: none;
-                    letter-spacing: 0; }
-    .checks input { width: auto; margin: 0; }
-    .checks label:has(input:checked) { background: #d8e8ff; border-color: #0066cc;
-                                        color: #003e7e; font-weight: 600; }
-
-    .btnrow { display: flex; gap: 8px; margin-top: 16px; }
-    button.primary { background: #0066cc; color: white; border: none;
-                     padding: 8px 14px; border-radius: 4px; cursor: pointer;
-                     font-weight: 500; font-size: 13px; }
-    button.primary:hover { background: #0052a3; }
-    button.ghost { background: white; color: #333; border: 1px solid #ccc;
-                   padding: 8px 14px; border-radius: 4px; cursor: pointer;
-                   font-size: 13px; }
-    button.ghost:hover { background: #f0f0f0; }
-
-    .mode-toggle { display: flex; gap: 0; border: 1px solid #ccc;
-                   border-radius: 4px; overflow: hidden; margin: 12px 0; }
-    .mode-toggle button { flex: 1; padding: 6px 10px; border: none;
-                          background: white; cursor: pointer; font-size: 12px;
-                          color: #555; font-weight: 500; }
-    .mode-toggle button.active { background: #0066cc; color: white;
-                                  font-weight: 600; }
-    .mode-toggle button + button { border-left: 1px solid #ccc; }
-
-    .paste-full textarea { width: 100%; min-height: 280px;
-                            font-family: ui-monospace, Menlo, monospace;
-                            font-size: 12px; padding: 10px; border: 1px solid #ccc;
-                            border-radius: 4px; resize: vertical; }
-    .paste-hint { font-size: 11px; color: #888; margin: 4px 0 8px; }
-    .errors { background: #ffe9e9; color: #a00; padding: 8px;
-              border-radius: 4px; margin-top: 10px; font-size: 12px;
-              border: 1px solid #f5b8b8; }
-    .errors ul { margin: 4px 0 0 16px; padding: 0; }
-    .ok { color: #1b5e20; font-size: 12px; margin-top: 8px;
-          background: #e8f5e9; padding: 8px; border-radius: 4px;
-          border: 1px solid #c8e6c9; }
-    .placeholder { color: #888; padding: 40px 16px; text-align: center;
-                   font-size: 13px; }
-
-    .batch-thumbs { padding: 20px; display: grid; align-content: start;
-                     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-                     gap: 12px; overflow-y: auto; max-height: 100%; width: 100%; }
-    .batch-thumbs .bt { background: white; border-radius: 4px; padding: 6px;
-                         box-shadow: 0 1px 4px rgba(0,0,0,0.25); text-align: center;
-                         min-width: 0; }
-    .batch-thumbs .bt img { width: 100%; height: 100px; object-fit: contain;
-                             background: #f8f8f8; border-radius: 2px; display: block; }
-    .batch-thumbs .bt .lbl { font-size: 11px; color: #555; margin-top: 4px;
-                              font-family: ui-monospace, Menlo, monospace;
-                              white-space: nowrap; overflow: hidden;
-                              text-overflow: ellipsis; }
-    .batch-thumbs-empty { color: #666; padding: 40px 20px; text-align: center;
-                           font-size: 13px; }
-
-    .view-toggle { padding: 8px 14px; border-bottom: 1px solid #ddd;
-                   display: flex; gap: 6px; }
-    .view-toggle button { flex: 1; padding: 6px 8px; border: 1px solid #ccc;
-                          background: white; border-radius: 4px;
-                          font-size: 12px; cursor: pointer; }
-    .view-toggle button.active { background: #0066cc; color: white;
-                                  border-color: #0066cc; font-weight: 600; }
-
-    .batch-view { flex: 1; padding: 24px 32px; overflow-y: auto;
-                  background: #f7f7f7; }
-    .batch-view .card { background: white; border: 1px solid #e0e0e0;
-                         border-radius: 6px; padding: 20px; margin-bottom: 16px; }
-    .batch-view h2 { margin-top: 0; }
-    .batch-view label.row { display: block; margin-bottom: 10px;
-                             font-size: 12px; font-weight: 600; color: #555; }
-    .batch-view .inline { display: flex; gap: 16px; align-items: center;
-                           margin-bottom: 16px; }
-    .batch-view .inline label { font-weight: 600; font-size: 12px; color: #555; }
-    .batch-view input[type=number], .batch-view select {
-      padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;
-      font-size: 13px; }
-    .batch-view textarea { width: 100%; min-height: 200px; padding: 10px;
-                            font-family: ui-monospace, Menlo, monospace;
-                            font-size: 12px; border: 1px solid #ccc;
-                            border-radius: 4px; }
-    .batch-view .results { font-size: 12px; margin-top: 12px; }
-    .batch-view .results table { width: 100%; border-collapse: collapse; }
-    .batch-view .results th, .batch-view .results td {
-      text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
-    .batch-view .results th { background: #fafafa; font-weight: 600;
-                               font-size: 11px; text-transform: uppercase;
-                               letter-spacing: 0.4px; color: #555; }
-    .batch-view code { background: #eef; padding: 1px 4px; border-radius: 3px;
-                        font-size: 11px; }
-    .recent-batch { font-size: 12px; color: #555; margin: 8px 0; }
-
-    .ingest-row { padding: 8px 14px; border-bottom: 1px solid #ddd;
-                  background: #fafafa; display: flex; align-items: center;
-                  gap: 8px; flex-wrap: wrap; }
-    .ingest-row button { font-size: 12px; padding: 4px 10px;
-                          border: 1px solid #0066cc; background: white;
-                          color: #0066cc; border-radius: 4px; cursor: pointer; }
-    .ingest-row button:hover { background: #eef4ff; }
-    .ingest-row button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .ingest-row .ingest-msg { font-size: 11px; color: #555; flex: 1;
-                               min-width: 0; overflow: hidden;
-                               text-overflow: ellipsis; white-space: nowrap; }
-    .ingest-row .ingest-msg.ok { color: #1b5e20; }
-    .ingest-row .ingest-msg.err { color: #a00; white-space: normal; }
-  </style>
-</head>
-<body>
-  <aside class="sidebar">
-    <header>
-      <strong>pptx-skill</strong>
-      <span id="counts" style="color:#888;font-size:11px;margin-left:6px;"></span>
-      <span style="float:right;font-size:11px;">
-        <a href="/v5" style="color:#0066cc;text-decoration:none;margin-right:8px;">Skeletons →</a>
-        <a href="/compose" style="color:#0066cc;text-decoration:none;">Compose →</a>
-      </span>
-    </header>
-    <div class="ingest-row">
-      <input type="file" id="ingestFile" accept=".pptx"
-             style="display:none;" />
-      <button id="ingestBtn" type="button">+ Ingest .pptx</button>
-      <span class="ingest-msg" id="ingestMsg"
-            title="Upload a .pptx to ingest as a new deck. Re-uploads of an existing deck are rejected — delete its workspace/decks/&lt;name&gt;/ dir first.">
-        Add a new deck to the workspace
-      </span>
-    </div>
-    <div class="ingest-row">
-      <input type="file" id="addAssetFile"
-             accept=".png,.jpg,.jpeg,.webp,.gif,.svg,.xml"
-             style="display:none;" />
-      <button id="addAssetBtn" type="button">+ Add asset</button>
-      <span class="ingest-msg" id="addAssetMsg"
-            title="Upload a single image / SVG / XML fragment. It lands as a pending asset YAML — describe it next to fill kind / tags / description.">
-        Register a single image without a full deck ingest
-      </span>
-    </div>
-    <div class="view-toggle">
-      <button data-view="items" class="active">Single</button>
-      <button data-view="batch">Bulk</button>
-    </div>
-    <div class="tabs" id="kindTabs">
-      <button data-tab="slides" title="Slides moved to /v5 — describe page now owns assets only"
-              style="display:none;">Slides</button>
-      <button data-tab="assets" class="active">Assets</button>
-    </div>
-    <div style="padding:6px 14px;font-size:11px;color:#888;border-bottom:1px solid #eee;
-                line-height:1.4;">
-      Slide review moved to <a href="/v5" style="color:#0066cc;text-decoration:none;">/v5 →</a>
-      — this page now describes assets only.
-    </div>
-    <div class="filter-row" id="filterRow">
-      <label><input type="checkbox" id="hideDone" checked> Hide done</label>
-    </div>
-    <ul class="item-list" id="list"></ul>
-  </aside>
-
-  <main class="preview" id="preview">
-    <span class="empty">Pick an item from the sidebar</span>
-  </main>
-
-  <section class="batch-view" id="batchView" hidden>
-    <div class="card">
-      <h2>Bulk describe</h2>
-      <p style="color:#666;font-size:13px;margin-top:0;">
-        Package the next N pending items into a zip you can hand to a vision
-        LLM. The model returns one JSON object; paste it back below to apply
-        all descriptions at once.
-      </p>
-      <div class="inline">
-        <label>Kind:
-          <select id="batchKind">
-            <option value="asset">Assets</option>
-            <option value="slide">Slides</option>
-            <option value="slide_with_assets">Slides + their assets (bundled)</option>
-          </select>
-        </label>
-        <label>Count:
-          <input type="number" id="batchCount" min="1" max="20" value="10">
-        </label>
-        <button class="primary" id="batchGenBtn">Generate batch</button>
-        <span id="pendingHint" style="color:#888;font-size:12px;"></span>
-      </div>
-      <div class="recent-batch" id="recentBatch"></div>
-    </div>
-
-    <div class="card">
-      <h2>Apply LLM response</h2>
-      <p style="color:#666;font-size:12px;">
-        Paste the JSON object the LLM returned. Items are matched by id
-        (<code>"01"</code>, <code>"02"</code>, …) against the selected
-        batch's saved manifest. Each entry is validated independently;
-        entries that pass auto-promote to <code>done</code>.
-      </p>
-      <div class="inline" style="margin-bottom:12px;">
-        <label>Target batch:
-          <select id="batchSelect"></select>
-        </label>
-        <button class="ghost" id="batchRefreshBtn">↻</button>
-        <span id="batchTargetLabel" style="color:#888;font-size:12px;"></span>
-      </div>
-      <textarea id="batchYaml" placeholder='{&#10;  "01": { "kind": "photo", "tags": ["people"], "description": "..." },&#10;  "02": { ... }&#10;}'></textarea>
-      <div class="btnrow" style="margin-top:10px;">
-        <button class="primary" id="batchApplyBtn">Apply batch</button>
-      </div>
-      <div class="results" id="batchResults"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel">
-    <div class="placeholder" id="placeholder">Select an item to begin.</div>
-    <div id="formWrap" hidden>
-      <h2 id="itemTitle"></h2>
-      <div class="sub" id="itemSub"></div>
-
-      <div class="btnrow">
-        <button class="ghost" id="copyPrompt">Copy describe prompt</button>
-      </div>
-
-      <div class="mode-toggle" role="tablist">
-        <button data-mode="form" class="active">Form</button>
-        <button data-mode="paste">Paste YAML</button>
-      </div>
-
-      <div id="formMode">
-        <form id="form" onsubmit="return false;"></form>
-      </div>
-
-      <div id="pasteMode" class="paste-full" hidden>
-        <div class="paste-hint">
-          Paste the LLM's YAML response. Existing values shown so you can edit
-          or replace entirely. Save promotes to <code>done</code> if valid.
-        </div>
-        <textarea id="pasteFull" spellcheck="false"></textarea>
-      </div>
-
-      <div id="msg"></div>
-      <div class="btnrow">
-        <button class="primary" id="saveBtn">Save → Next</button>
-        <button class="ghost" id="saveOnly">Save</button>
-      </div>
-    </div>
-  </section>
-
-<script>
-// Controlled vocab — fetched from /api/vocab on load (single source:
-// authoring/schemas/vocab.yaml). Populated by `loadVocab()` before any
-// form is built; do not edit inline.
-let SLIDE_FEEL = [];
-let SLIDE_TAGS = [];
-let ASSET_KIND = [];
-let ASSET_TAGS = [];
-
-async function loadVocab() {
-  const r = await fetch("/api/vocab");
-  if (!r.ok) throw new Error("vocab load failed");
-  const v = await r.json();
-  SLIDE_FEEL = v.slide.feel;
-  SLIDE_TAGS = v.slide.suitable_for;
-  ASSET_KIND = v.asset.kind;
-  ASSET_TAGS = v.asset.tags || [];
-}
-
-let activeTab = "assets";  // v5: slide tab hidden; describe page owns assets only
-let items = {slides: [], assets: []};
-let current = null;
-let mode = localStorage.getItem("describe.mode") || "form";
-let view = localStorage.getItem("describe.view") || "items";
-let currentBatchId = localStorage.getItem("describe.batchId") || null;
-
-function el(tag, attrs, ...kids) {
-  const e = document.createElement(tag);
-  attrs = attrs || {};
-  for (const k in attrs) {
-    if (k === "checked" || k === "selected") { if (attrs[k]) e[k] = true; }
-    else if (k === "html") e.innerHTML = attrs[k];
-    else e.setAttribute(k, attrs[k]);
-  }
-  kids.forEach(k => e.append(k));
-  return e;
-}
-
-async function loadItems() {
-  const r = await fetch("/api/items");
-  items = await r.json();
-  renderCounts();
-  renderList();
-}
-
-function renderCounts() {
-  const sd = items.slides.filter(i => i.status === "done").length;
-  const ad = items.assets.filter(i => i.status === "done").length;
-  document.getElementById("counts").textContent =
-    `slides ${sd}/${items.slides.length} · assets ${ad}/${items.assets.length}`;
-  refreshPendingHint();
-}
-
-function renderList() {
-  const list = document.getElementById("list");
-  list.innerHTML = "";
-  const hideDone = document.getElementById("hideDone").checked;
-  const pool = items[activeTab];
-  pool.forEach(it => {
-    if (hideDone && it.status === "done") return;
-    const li = el("li", {});
-    if (current && current.yaml === it.yaml) li.classList.add("active");
-    li.addEventListener("click", () => loadItem(it.yaml));
-    li.append(el("span", {}, it.id));
-    li.append(el("span", {class: "pill " + it.status}, it.status));
-    list.append(li);
-  });
-}
-
-async function loadItem(yamlRel) {
-  const r = await fetch("/api/item?yaml=" + encodeURIComponent(yamlRel));
-  const item = await r.json();
-  current = item;
-  document.getElementById("preview").innerHTML =
-    `<img src="/preview?yaml=${encodeURIComponent(yamlRel)}&t=${Date.now()}" alt="preview">`;
-  document.getElementById("placeholder").hidden = true;
-  document.getElementById("formWrap").hidden = false;
-  document.getElementById("itemTitle").textContent = item.data.id || yamlRel;
-  document.getElementById("itemSub").textContent = yamlRel;
-  buildForm(item);
-  document.getElementById("pasteFull").value = item.yaml_text || "";
-  renderList();
-}
-
-function applyMode() {
-  document.querySelectorAll(".mode-toggle button").forEach(b => {
-    b.classList.toggle("active", b.dataset.mode === mode);
-  });
-  document.getElementById("formMode").hidden = mode !== "form";
-  document.getElementById("pasteMode").hidden = mode !== "paste";
-}
-
-function setMode(next) {
-  mode = next;
-  localStorage.setItem("describe.mode", mode);
-  applyMode();
-}
-
-function buildForm(item) {
-  const f = document.getElementById("form");
-  f.innerHTML = "";
-  const d = item.data || {};
-  if (item.kind === "slide") {
-    addText(f, "intent", d.intent || "", "one sentence, <20 words");
-    addSelect(f, "feel", d.feel || "", SLIDE_FEEL);
-    addChips(f, "suitable_for", d.suitable_for || [], SLIDE_TAGS);
-    addTextarea(f, "notes", d.notes || "", "human reviewer note");
-    addTextarea(f, "interpretation", d.interpretation || "",
-      "model's speculative observations — info only, not filterable");
-  } else {
-    addSelect(f, "kind", d.kind || "", ASSET_KIND);
-    addChips(f, "tags", d.tags || [], ASSET_TAGS);
-    addText(f, "description", d.description || "",
-      "one short sentence, <25 words, what is literally visible");
-    addTextarea(f, "notes", d.notes || "", "human reviewer note");
-  }
-  document.getElementById("msg").innerHTML = "";
-}
-
-function addText(parent, name, value, hint) {
-  const lbl = el("label", {for: name}, name);
-  if (hint) lbl.append(el("span", {class: "hint"}, hint));
-  parent.append(lbl);
-  parent.append(el("input", {type: "text", name, value, id: name}));
-}
-function addTextarea(parent, name, value, hint) {
-  const lbl = el("label", {for: name}, name);
-  if (hint) lbl.append(el("span", {class: "hint"}, hint));
-  parent.append(lbl);
-  parent.append(el("textarea", {name, id: name, rows: "3"}, value));
-}
-function addSelect(parent, name, value, options) {
-  parent.append(el("label", {for: name}, name));
-  const sel = el("select", {name, id: name});
-  sel.append(el("option", {value: ""}, "—"));
-  options.forEach(o => sel.append(el("option", {value: o, selected: o === value}, o)));
-  parent.append(sel);
-}
-function addChips(parent, name, values, options) {
-  parent.append(el("label", {}, name));
-  const wrap = el("div", {class: "checks", id: name});
-  options.forEach(o => {
-    const lbl = el("label", {},
-      el("input", {type: "checkbox", value: o, checked: values.includes(o)}),
-      o
-    );
-    wrap.append(lbl);
-  });
-  parent.append(wrap);
-}
-
-function gatherForm() {
-  if (!current) return {};
-  const out = {};
-  if (current.kind === "slide") {
-    out.intent = document.getElementById("intent").value.trim();
-    out.feel = document.getElementById("feel").value;
-    out.suitable_for = chipValues("suitable_for");
-    out.notes = document.getElementById("notes").value.trim();
-    out.interpretation = document.getElementById("interpretation").value.trim();
-  } else {
-    out.kind = document.getElementById("kind").value;
-    out.tags = chipValues("tags");
-    out.description = document.getElementById("description").value.trim();
-    out.notes = document.getElementById("notes").value.trim();
-  }
-  return out;
-}
-
-function chipValues(name) {
-  return [...document.querySelectorAll("#" + name + " input:checked")].map(c => c.value);
-}
-
-async function save(advance) {
-  if (!current) return;
-  let r;
-  if (mode === "paste") {
-    const text = document.getElementById("pasteFull").value;
-    r = await fetch("/api/save-raw", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({yaml: current.yaml, text}),
-    });
-  } else {
-    const fields = gatherForm();
-    r = await fetch("/api/save", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({yaml: current.yaml, fields}),
-    });
-  }
-  const result = await r.json();
-  const msg = document.getElementById("msg");
-  if (result.errors && result.errors.length) {
-    msg.innerHTML = '<div class="errors"><strong>Validation errors</strong><ul>'
-      + result.errors.map(e => "<li>" + escapeHtml(e) + "</li>").join("")
-      + '</ul></div>';
-    return;
-  }
-  msg.innerHTML = '<div class="ok">Saved — status: ' + escapeHtml(result.status || "") + '</div>';
-  const poolKey = current.kind === "slide" ? "slides" : "assets";
-  const it = items[poolKey].find(i => i.yaml === current.yaml);
-  if (it) it.status = result.status;
-  renderCounts();
-  renderList();
-  if (advance) {
-    const next = items[poolKey].find(i => i.status === "pending");
-    if (next) loadItem(next.yaml);
-    else msg.innerHTML += '<div class="ok" style="margin-top:6px;">No more pending in this tab 🎉</div>';
-  }
-}
-
-async function copyPrompt() {
-  if (!current) return;
-  const r = await fetch("/api/prompt?kind=" + current.kind);
-  const j = await r.json();
-  try {
-    await navigator.clipboard.writeText(j.text);
-    const btn = document.getElementById("copyPrompt");
-    const orig = btn.textContent;
-    btn.textContent = "Copied ✓";
-    setTimeout(() => (btn.textContent = orig), 1500);
-  } catch (e) {
-    alert("Could not copy to clipboard:\n" + e.message + "\n\nPrompt:\n\n" + j.text);
-  }
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])
-  );
-}
-
-document.querySelectorAll(".tabs button").forEach(b => {
-  b.addEventListener("click", () => {
-    activeTab = b.dataset.tab;
-    document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("active", x === b));
-    renderList();
-  });
-});
-document.querySelectorAll(".view-toggle button").forEach(b => {
-  b.addEventListener("click", () => setView(b.dataset.view));
-});
-
-function applyView() {
-  document.querySelectorAll(".view-toggle button").forEach(b => {
-    b.classList.toggle("active", b.dataset.view === view);
-  });
-  const inItems = view === "items";
-  document.getElementById("kindTabs").style.display = inItems ? "" : "none";
-  document.getElementById("filterRow").style.display = inItems ? "" : "none";
-  document.getElementById("list").style.display = inItems ? "" : "none";
-  document.getElementById("panel").hidden = !inItems;
-  document.getElementById("batchView").hidden = inItems;
-  if (inItems) {
-    const pane = document.getElementById("preview");
-    if (current) {
-      pane.innerHTML =
-        `<img src="/preview?yaml=${encodeURIComponent(current.yaml)}&t=${Date.now()}" alt="preview">`;
-    } else {
-      pane.innerHTML = '<span class="empty">Pick an item from the sidebar</span>';
-    }
-  } else {
-    loadBatches().then(() => renderBatchThumbnails(currentBatchId));
-  }
-}
-
-async function renderBatchThumbnails(batchId) {
-  const pane = document.getElementById("preview");
-  if (!batchId) {
-    pane.innerHTML =
-      '<div class="batch-thumbs-empty">Generate or select a batch to see its items.</div>';
-    return;
-  }
-  pane.innerHTML = '<div class="batch-thumbs-empty">loading…</div>';
-  try {
-    const r = await fetch("/api/batch/" + encodeURIComponent(batchId));
-    if (!r.ok) throw new Error("batch fetch failed");
-    const m = await r.json();
-    const items = m.items || {};
-    if (!Object.keys(items).length) {
-      pane.innerHTML = '<div class="batch-thumbs-empty">Batch is empty.</div>';
-      return;
-    }
-    const cards = Object.entries(items).map(([k, v]) => {
-      // slide_with_assets entries are {slide, assets}; render the slide
-      // preview and a small count of bundled assets.
-      if (v && typeof v === "object" && v.slide) {
-        const nAssets = Object.keys(v.assets || {}).length;
-        const slideRel = v.slide;
-        return `<div class="bt" title="${escapeHtml(slideRel)}">
-          <img src="/preview?yaml=${encodeURIComponent(slideRel)}" alt="${escapeHtml(k)}" loading="lazy">
-          <div class="lbl">${escapeHtml(k)} · ${escapeHtml(slideRel.split("/").pop().replace(/\.yaml$/, ""))} <em>(+${nAssets})</em></div>
-         </div>`;
-      }
-      return `<div class="bt" title="${escapeHtml(v)}">
-        <img src="/preview?yaml=${encodeURIComponent(v)}" alt="${escapeHtml(k)}" loading="lazy">
-        <div class="lbl">${escapeHtml(k)} · ${escapeHtml(v.split("/").pop().replace(/\.yaml$/, ""))}</div>
-       </div>`;
-    }).join("");
-    pane.innerHTML = `<div class="batch-thumbs">${cards}</div>`;
-  } catch (e) {
-    pane.innerHTML =
-      '<div class="batch-thumbs-empty">Could not load batch (' + escapeHtml(e.message) + ').</div>';
-  }
-}
-function setView(next) {
-  view = next;
-  localStorage.setItem("describe.view", view);
-  applyView();
-}
-
-function refreshBatchLabel() {
-  const lbl = document.getElementById("batchTargetLabel");
-  if (currentBatchId) {
-    lbl.textContent = "";
-  } else {
-    lbl.textContent = "(generate one above)";
-  }
-}
-
-async function loadBatches(selectId) {
-  const sel = document.getElementById("batchSelect");
-  const r = await fetch("/api/batches");
-  const j = await r.json();
-  sel.innerHTML = "";
-  if (!j.batches.length) {
-    const opt = document.createElement("option");
-    opt.value = ""; opt.textContent = "— no batches yet —";
-    sel.append(opt);
-    currentBatchId = null;
-    localStorage.removeItem("describe.batchId");
-    refreshBatchLabel();
-    return;
-  }
-  j.batches.forEach(b => {
-    const opt = document.createElement("option");
-    opt.value = b.batch_id;
-    opt.textContent = `${b.batch_id} — ${b.kind} × ${b.count}`;
-    sel.append(opt);
-  });
-  const desired = selectId || currentBatchId || j.batches[0].batch_id;
-  const exists = j.batches.some(b => b.batch_id === desired);
-  sel.value = exists ? desired : j.batches[0].batch_id;
-  currentBatchId = sel.value;
-  localStorage.setItem("describe.batchId", currentBatchId);
-  refreshBatchLabel();
-}
-
-function _shortPath(p) { return p.split("/").slice(-2).join("/"); }
-
-function _skippedHtml(skipped) {
-  if (!skipped || !skipped.length) return "";
-  const rows = skipped.map(s =>
-    `<li><code>${escapeHtml(_shortPath(s.yaml))}</code>: ${escapeHtml(s.reason)}</li>`
-  ).join("");
-  return `<div style="background:#fff8e1;border:1px solid #ffd980;padding:8px;
-    border-radius:4px;margin-top:8px;font-size:12px;">
-    <strong>${skipped.length} skipped</strong> (not in zip)
-    <ul style="margin:4px 0 0 16px;">${rows}</ul></div>`;
-}
-
-function refreshPendingHint() {
-  const kind = document.getElementById("batchKind").value;
-  const pool = kind === "asset" ? items.assets : items.slides;
-  const n = pool.filter(i => i.status === "pending").length;
-  const hint = document.getElementById("pendingHint");
-  const label = (
-    kind === "asset" ? "asset" :
-    kind === "slide" ? "slide" :
-    "slide bundle"
-  );
-  hint.textContent = `(${n} pending ${label}${n === 1 ? "" : "s"})`;
-  hint.style.color = n === 0 ? "#a00" : "#888";
-  document.getElementById("batchGenBtn").disabled = n === 0;
-}
-
-async function batchGenerate() {
-  const kind = document.getElementById("batchKind").value;
-  const count = parseInt(document.getElementById("batchCount").value, 10) || 10;
-  const recent = document.getElementById("recentBatch");
-  recent.innerHTML = '<em style="color:#888;">generating…</em>';
-
-  const r = await fetch("/api/batch/create", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({kind, count}),
-  });
-
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({error: "unknown error"}));
-    recent.innerHTML =
-      `<div class="errors"><strong>${escapeHtml(e.error || r.statusText)}</strong></div>`
-      + _skippedHtml(e.skipped);
-    return;
-  }
-
-  const j = await r.json();
-  currentBatchId = j.batch_id;
-  localStorage.setItem("describe.batchId", currentBatchId);
-
-  const itemsList = Object.entries(j.items).map(([k, v]) => {
-    // slide_with_assets entries are nested {slide, assets}; others are strings.
-    if (v && typeof v === "object" && v.slide) {
-      const nAssets = Object.keys(v.assets || {}).length;
-      return `<code>${k}</code> → ${escapeHtml(_shortPath(v.slide))} <em>(+${nAssets} asset${nAssets === 1 ? "" : "s"})</em>`;
-    }
-    return `<code>${k}</code> → ${escapeHtml(_shortPath(v))}`;
-  }).join("<br>");
-
-  const summary = (j.count < (j.requested || j.count))
-    ? `${j.count} of ${j.requested} requested`
-    : `${j.count} ${j.kind}(s)`;
-
-  recent.innerHTML =
-    `<strong>Batch ${j.batch_id}</strong> — ${summary}. ` +
-    `<a href="${j.download_url}" download>Download zip</a><br>` +
-    `<details style="margin-top:6px;"><summary>Items</summary>${itemsList}</details>`
-    + _skippedHtml(j.skipped);
-
-  await loadBatches(currentBatchId);
-  refreshPendingHint();
-  renderBatchThumbnails(currentBatchId);
-  window.location.href = j.download_url;
-}
-
-async function batchApply() {
-  if (!currentBatchId) {
-    alert("Generate a batch first.");
-    return;
-  }
-  const text = document.getElementById("batchYaml").value;
-  if (!text.trim()) { alert("Paste the LLM's JSON first."); return; }
-  const r = await fetch("/api/batch/" + currentBatchId + "/apply", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({text}),
-  });
-  const j = await r.json();
-  if (j.error) {
-    document.getElementById("batchResults").innerHTML =
-      `<div class="errors">${escapeHtml(j.error)}</div>`;
-    return;
-  }
-  const rows = j.results.map(rr => {
-    const pillCls = rr.status === "done" ? "done" :
-                    rr.status === "pending" ? "pending" : "locked";
-    const errs = (rr.errors && rr.errors.length)
-      ? "<br><small style='color:#a00;'>" + rr.errors.map(escapeHtml).join("; ") + "</small>"
-      : "";
-    return `<tr>
-      <td><code>${escapeHtml(rr.id)}</code></td>
-      <td>${escapeHtml(rr.yaml.split("/").slice(-2).join("/"))}</td>
-      <td><span class="pill ${pillCls}">${escapeHtml(rr.status)}</span>${errs}</td>
-    </tr>`;
-  }).join("");
-  let diag = "";
-  if (j.found_keys) {
-    const matched = j.matched || 0;
-    diag = `<div style="margin-bottom:8px;font-size:12px;color:#555;">
-      <strong>${matched}/${j.results.length}</strong> matched.
-      Top-level keys found in your YAML:
-      ${j.found_keys.length
-        ? j.found_keys.map(k => "<code>" + escapeHtml(k) + "</code>").join(" ")
-        : "<em>none</em>"}
-    </div>`;
-  }
-  document.getElementById("batchResults").innerHTML = diag +
-    `<table><thead><tr><th>Id</th><th>Target</th><th>Result</th></tr></thead>
-     <tbody>${rows}</tbody></table>`;
-  // Refresh sidebar counts so user sees the progress reflected
-  loadItems();
-}
-
-document.getElementById("batchGenBtn").addEventListener("click", batchGenerate);
-document.getElementById("batchApplyBtn").addEventListener("click", batchApply);
-document.getElementById("batchKind").addEventListener("change", refreshPendingHint);
-document.getElementById("batchSelect").addEventListener("change", e => {
-  currentBatchId = e.target.value || null;
-  if (currentBatchId) localStorage.setItem("describe.batchId", currentBatchId);
-  else localStorage.removeItem("describe.batchId");
-  refreshBatchLabel();
-  if (view === "batch") renderBatchThumbnails(currentBatchId);
-});
-document.getElementById("batchRefreshBtn").addEventListener("click", async () => {
-  await loadBatches();
-  if (view === "batch") renderBatchThumbnails(currentBatchId);
-});
-document.getElementById("hideDone").addEventListener("change", renderList);
-document.getElementById("saveBtn").addEventListener("click", () => save(true));
-document.getElementById("saveOnly").addEventListener("click", () => save(false));
-document.getElementById("copyPrompt").addEventListener("click", copyPrompt);
-document.querySelectorAll(".mode-toggle button").forEach(b => {
-  b.addEventListener("click", () => setMode(b.dataset.mode));
-});
-
-// --- Ingest .pptx upload ---------------------------------------------------
-const ingestBtn = document.getElementById("ingestBtn");
-const ingestFile = document.getElementById("ingestFile");
-const ingestMsg = document.getElementById("ingestMsg");
-
-function setIngestMsg(text, tone) {
-  ingestMsg.textContent = text;
-  ingestMsg.classList.remove("ok", "err");
-  if (tone) ingestMsg.classList.add(tone);
-}
-
-ingestBtn.addEventListener("click", () => ingestFile.click());
-ingestFile.addEventListener("change", async () => {
-  const f = ingestFile.files && ingestFile.files[0];
-  if (!f) return;
-  setIngestMsg("Uploading " + f.name + " …", null);
-  ingestBtn.disabled = true;
-  const fd = new FormData();
-  fd.append("pptx", f);
-  try {
-    const r = await fetch("/api/ingest", { method: "POST", body: fd });
-    const data = await r.json().catch(() => ({error: "non-JSON response"}));
-    if (!r.ok) {
-      setIngestMsg(data.error || ("HTTP " + r.status), "err");
-    } else {
-      setIngestMsg(
-        "Ingested " + data.deck_stem + ": "
-        + data.slides + " slides, "
-        + data.pictures + " pictures, "
-        + data.atoms + " atoms",
-        "ok"
-      );
-      loadItems();  // refresh sidebar so new pending items appear
-    }
-  } catch (e) {
-    setIngestMsg("Upload failed: " + e.message, "err");
-  } finally {
-    ingestBtn.disabled = false;
-    ingestFile.value = "";  // allow re-uploading same filename
-  }
-});
-
-// --- Add single asset upload ----------------------------------------------
-const addAssetBtn = document.getElementById("addAssetBtn");
-const addAssetFile = document.getElementById("addAssetFile");
-const addAssetMsg = document.getElementById("addAssetMsg");
-
-function setAddAssetMsg(text, tone) {
-  addAssetMsg.textContent = text;
-  addAssetMsg.classList.remove("ok", "err");
-  if (tone) addAssetMsg.classList.add(tone);
-}
-
-addAssetBtn.addEventListener("click", () => addAssetFile.click());
-addAssetFile.addEventListener("change", async () => {
-  const f = addAssetFile.files && addAssetFile.files[0];
-  if (!f) return;
-  setAddAssetMsg("Uploading " + f.name + " …", null);
-  addAssetBtn.disabled = true;
-  const fd = new FormData();
-  fd.append("file", f);
-  try {
-    const r = await fetch("/api/asset/add", { method: "POST", body: fd });
-    const data = await r.json().catch(() => ({error: "non-JSON response"}));
-    if (!r.ok) {
-      setAddAssetMsg(data.error || ("HTTP " + r.status), "err");
-    } else {
-      setAddAssetMsg(
-        "Added " + data.asset_id
-        + (data.kind ? " (kind=" + data.kind + ")" : " — describe next to set kind"),
-        "ok"
-      );
-      loadItems();  // surface the new pending asset in the sidebar
-    }
-  } catch (e) {
-    setAddAssetMsg("Upload failed: " + e.message, "err");
-  } finally {
-    addAssetBtn.disabled = false;
-    addAssetFile.value = "";
-  }
-});
-
-applyMode();
-applyView();
-loadVocab().then(loadItems).catch(err => {
-  document.getElementById("msg").innerHTML = "vocab load failed: " + err.message;
-  loadItems();
-});
-</script>
-{{ debug_widget|safe }}
-</body>
-</html>
-"""
 
 
 @app.get("/")
 def index():
-    return render_template_string(INDEX_HTML, debug_widget="")
+    return render_template_string(UNIFIED_HTML)
 
 
 COMPOSE_HTML = r"""<!doctype html>
@@ -3065,8 +2178,7 @@ COMPOSE_HTML = r"""<!doctype html>
 <body>
   <div class="top">
     <strong>pptx-skill</strong>
-    <a href="/">← describe</a>
-    <a href="/v5">v5 skeletons →</a>
+    <a href="/">← review</a>
     <span style="color:#999;font-size:12px;margin-left:auto;" id="kbSummary"></span>
   </div>
 
@@ -3764,9 +2876,9 @@ def api_v5_get_theme(theme_id):
 
 @app.get("/v5")
 def v5_page():
-    # Debug widget intentionally omitted — it's a v4 compose-flow tool
-    # and clutters the skeleton review with no upside on this page.
-    return render_template_string(V5_HTML)
+    # Skeleton review lives on / now (Skeletons tab). Keep a redirect so
+    # bookmarked URLs and the old `Skeletons →` links still work.
+    return redirect("/", code=302)
 
 
 # --- C-actions: write-back endpoints ------------------------------------
@@ -4090,19 +3202,51 @@ def _v5_default_slot_for_kind(kind: str, unmapped_entry: dict, used_ids: set) ->
     return out
 
 
-V5_HTML = r"""<!doctype html>
+UNIFIED_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>pptx-skill v5 — skeletons</title>
+  <title>pptx-skill — review</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
            margin: 0; height: 100vh; display: flex; color: #222; }
 
-    .sidebar { width: 280px; border-right: 1px solid #ddd; background: #fafafa;
+    .sidebar { width: 300px; border-right: 1px solid #ddd; background: #fafafa;
                display: flex; flex-direction: column; }
-    #skeletons-list { flex: 1; min-height: 0; overflow-y: auto; }
+    .list-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+    .list-scroll.hidden { display: none; }
+    .tab-bar { display: flex; border-bottom: 1px solid #ddd; background: #fff; flex-shrink: 0; }
+    .tab-bar button { flex: 1; padding: 9px 8px; border: none; background: none;
+                      cursor: pointer; font-weight: 500; font-size: 13px;
+                      border-bottom: 2px solid transparent; color: #555; }
+    .tab-bar button.active { border-bottom-color: #0066cc; color: #0066cc; font-weight: 600; }
+    .tab-bar button:hover { background: #f5f5f5; }
+    .filter-row { padding: 6px 14px; font-size: 12px; color: #555;
+                  display: flex; gap: 10px; align-items: center;
+                  border-bottom: 1px solid #eee; flex-shrink: 0; background: #fafafa; }
+    .filter-row label { cursor: pointer; }
+    .ingest-row { padding: 6px 14px; border-bottom: 1px solid #eee;
+                  background: #fafafa; display: flex; align-items: center;
+                  gap: 6px; flex-shrink: 0; }
+    .ingest-row button { font-size: 11px; padding: 3px 8px;
+                          border: 1px solid #0066cc; background: white;
+                          color: #0066cc; border-radius: 3px; cursor: pointer; }
+    .ingest-row button:hover { background: #eef4ff; }
+    .ingest-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .ingest-row .ingest-msg { font-size: 10px; color: #777; flex: 1; min-width: 0;
+                               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ingest-row .ingest-msg.ok { color: #1b5e20; }
+    .ingest-row .ingest-msg.err { color: #a00; white-space: normal; font-size: 10px; }
+    /* Asset list rows — id pill plus status */
+    #assets-list .asset-item { padding: 8px 14px; cursor: pointer; font-size: 12px;
+                                display: flex; justify-content: space-between;
+                                align-items: center; border-bottom: 1px solid #eee; gap: 8px; }
+    #assets-list .asset-item:hover { background: #eef4ff; }
+    #assets-list .asset-item.active { background: #d8e8ff; }
+    #assets-list .asset-id { font-family: ui-monospace, monospace; font-size: 11px;
+                              color: #333; overflow: hidden; text-overflow: ellipsis;
+                              white-space: nowrap; min-width: 0; flex: 1; }
     .sidebar header { padding: 12px 14px; border-bottom: 1px solid #ddd; }
     .sidebar header h1 { font-size: 14px; margin: 0 0 4px; font-weight: 600; }
     .sidebar header .nav { font-size: 11px; color: #666; }
@@ -4262,6 +3406,43 @@ V5_HTML = r"""<!doctype html>
                    font-family: ui-monospace, monospace; color: #333; }
     .promote-btn:hover { background: #1e88e5; color: white; border-color: #1565c0; }
 
+    /* Asset describe form (Assets tab right panel) */
+    #asset-form label { display: block; font-size: 11px; font-weight: 700;
+                         margin: 12px 0 4px; color: #555; text-transform: uppercase;
+                         letter-spacing: 0.4px; }
+    #asset-form label .hint { font-weight: 400; color: #999; text-transform: none;
+                               letter-spacing: 0; margin-left: 6px; font-size: 11px; }
+    #asset-form input, #asset-form select, #asset-form textarea {
+      width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;
+      font-size: 13px; font-family: inherit; background: white;
+    }
+    #asset-form textarea { resize: vertical; min-height: 50px; }
+    #asset-form .checks { display: flex; flex-wrap: wrap; gap: 4px; }
+    #asset-form .checks label { display: inline-flex; align-items: center; gap: 4px;
+                                 font-weight: normal; font-size: 11px; padding: 3px 8px;
+                                 border: 1px solid #ccc; border-radius: 12px; cursor: pointer;
+                                 background: #fff; margin: 0; text-transform: none;
+                                 letter-spacing: 0; }
+    #asset-form .checks input { width: auto; margin: 0; }
+    #asset-form .checks label:has(input:checked) { background: #d8e8ff; border-color: #0066cc;
+                                                    color: #003e7e; font-weight: 600; }
+    .asset-btnrow { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+    .asset-btnrow button { font-size: 12px; padding: 6px 12px; border-radius: 4px;
+                           border: 1px solid #ccc; background: white; cursor: pointer; }
+    .asset-btnrow button.primary { background: #0066cc; color: white; border-color: #0066cc; }
+    .asset-btnrow button.primary:hover { background: #0052a3; }
+    .asset-btnrow button:hover { background: #f0f0f0; }
+    #asset-msg .errors { background: #ffe9e9; color: #a00; padding: 8px;
+                          border-radius: 4px; margin-top: 10px; font-size: 12px;
+                          border: 1px solid #f5b8b8; }
+    #asset-msg .errors ul { margin: 4px 0 0 16px; padding: 0; }
+    #asset-msg .ok { color: #1b5e20; font-size: 12px; margin-top: 8px;
+                      background: #e8f5e9; padding: 8px; border-radius: 4px;
+                      border: 1px solid #c8e6c9; }
+    .asset-preview-wrap img { max-width: 100%; max-height: calc(100vh - 80px);
+                              object-fit: contain; background: white;
+                              box-shadow: 0 4px 30px rgba(0,0,0,0.4); }
+
     /* Belt-and-suspenders: hide v4 debug-floater if it leaks in. */
     .dbg-floater { display: none !important; }
   </style>
@@ -4269,21 +3450,46 @@ V5_HTML = r"""<!doctype html>
 <body>
   <aside class="sidebar">
     <header>
-      <h1>pptx-skill v5 — skeletons</h1>
-      <div class="nav"><a href="/">describe</a><a href="/compose">compose</a></div>
+      <h1>pptx-skill — review</h1>
+      <div class="nav"><a href="/compose">compose →</a></div>
     </header>
-    <div id="skeletons-list"></div>
+    <div class="tab-bar" id="tab-bar">
+      <button data-tab="skeletons" class="active">Skeletons</button>
+      <button data-tab="assets">Assets</button>
+    </div>
+    <div class="ingest-row" id="ingest-row-skeletons">
+      <input type="file" id="ingestFile" accept=".pptx" style="display:none;" />
+      <button id="ingestBtn" type="button">+ Ingest .pptx</button>
+      <span class="ingest-msg" id="ingestMsg"
+            title="Upload a .pptx to extract skeletons + assets. Re-ingesting an existing deck is rejected — delete its workspace/decks/ dir first.">
+        Add a new deck
+      </span>
+    </div>
+    <div class="ingest-row hidden" id="ingest-row-assets">
+      <input type="file" id="addAssetFile"
+             accept=".png,.jpg,.jpeg,.webp,.gif,.svg,.xml" style="display:none;" />
+      <button id="addAssetBtn" type="button">+ Add asset</button>
+      <span class="ingest-msg" id="addAssetMsg"
+            title="Upload a single image / SVG / XML — lands as a pending asset, ready to describe.">
+        Register a single image
+      </span>
+    </div>
+    <div class="filter-row hidden" id="filter-row-assets">
+      <label><input type="checkbox" id="hideDoneAssets"> Hide done</label>
+    </div>
+    <div id="skeletons-list" class="list-scroll"></div>
+    <div id="assets-list" class="list-scroll hidden"></div>
     <div id="bulk-bar" class="bulk-bar hidden"></div>
   </aside>
   <main class="preview-area" id="preview-area">
     <div class="preview-empty">
-      <div>Select a skeleton on the left.</div>
-      <div class="hint">colored boxes = our digest proposal · hover for details</div>
+      <div>Select a skeleton or asset on the left.</div>
+      <div class="hint">tab switcher above the list · skeletons = layouts · assets = images</div>
     </div>
   </main>
   <aside class="panel" id="panel">
     <div class="preview-empty" style="text-align:center;padding-top:40px;">
-      No skeleton selected.
+      Nothing selected.
     </div>
   </aside>
 
@@ -4785,7 +3991,280 @@ V5_HTML = r"""<!doctype html>
         c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
-    loadSkeletons();
+    // ===========================================================================
+    // Tab switching: skeletons <-> assets
+    // ===========================================================================
+
+    let activeTab = localStorage.getItem('reviewTab') || 'skeletons';
+    let ASSET_KIND = [];
+    let ASSET_TAGS = [];
+    let assetItems = [];        // array of {id, yaml, status}
+    let currentAsset = null;    // {kind, yaml, data, yaml_text} from /api/item
+
+    function setTab(tab) {
+      activeTab = tab;
+      localStorage.setItem('reviewTab', tab);
+      document.querySelectorAll('.tab-bar button').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === tab));
+      const showSk = tab === 'skeletons';
+      document.getElementById('skeletons-list').classList.toggle('hidden', !showSk);
+      document.getElementById('assets-list').classList.toggle('hidden', showSk);
+      document.getElementById('ingest-row-skeletons').classList.toggle('hidden', !showSk);
+      document.getElementById('ingest-row-assets').classList.toggle('hidden', showSk);
+      document.getElementById('filter-row-assets').classList.toggle('hidden', showSk);
+      // Multi-select is skeleton-only — clear any held selection when leaving.
+      if (!showSk && selected.size) clearSelection();
+      // Reset main panes — switching tab should not show stale detail.
+      resetMainPanes();
+      if (tab === 'assets') {
+        if (!ASSET_KIND.length) loadAssetVocab();
+        loadAssets();
+      } else {
+        loadSkeletons();
+      }
+    }
+
+    function resetMainPanes() {
+      const area = document.getElementById('preview-area');
+      area.innerHTML = `<div class="preview-empty"><div>Select an item on the left.</div></div>`;
+      const panel = document.getElementById('panel');
+      panel.innerHTML = `<div class="preview-empty" style="text-align:center;padding-top:40px;">Nothing selected.</div>`;
+    }
+
+    document.querySelectorAll('.tab-bar button').forEach(b => {
+      b.addEventListener('click', () => setTab(b.dataset.tab));
+    });
+
+    // ===========================================================================
+    // Assets tab — list + select + describe form
+    // ===========================================================================
+
+    async function loadAssetVocab() {
+      const r = await fetch('/api/vocab');
+      if (!r.ok) return;
+      const v = await r.json();
+      ASSET_KIND = (v.asset && v.asset.kind) || [];
+      ASSET_TAGS = (v.asset && v.asset.tags) || [];
+    }
+
+    async function loadAssets() {
+      const r = await fetch('/api/items');
+      const data = await r.json();
+      assetItems = data.assets || [];
+      renderAssetList();
+    }
+
+    function renderAssetList() {
+      const root = document.getElementById('assets-list');
+      const hideDone = document.getElementById('hideDoneAssets').checked;
+      const visible = hideDone ? assetItems.filter(a => a.status !== 'done') : assetItems;
+      if (!visible.length) {
+        root.innerHTML = `<div style="padding:14px;color:#888;font-size:12px;">
+          No assets${hideDone ? ' pending' : ''}.</div>`;
+        return;
+      }
+      root.innerHTML = '';
+      visible.forEach(it => {
+        const div = document.createElement('div');
+        div.className = 'asset-item';
+        div.dataset.yaml = it.yaml;
+        if (currentAsset && currentAsset.yaml === it.yaml) div.classList.add('active');
+        div.innerHTML = `<span class="asset-id" title="${it.yaml}">${escapeHtml(it.id)}</span>
+          <span class="pill ${it.status}">${it.status}</span>`;
+        div.addEventListener('click', () => selectAsset(it.yaml));
+        root.appendChild(div);
+      });
+    }
+
+    document.getElementById('hideDoneAssets').addEventListener('change', renderAssetList);
+
+    async function selectAsset(yamlRel) {
+      const r = await fetch('/api/item?yaml=' + encodeURIComponent(yamlRel));
+      const item = await r.json();
+      currentAsset = item;
+      renderAssetPreview(yamlRel);
+      renderAssetPanel(item);
+      renderAssetList();
+    }
+
+    function renderAssetPreview(yamlRel) {
+      const area = document.getElementById('preview-area');
+      area.innerHTML = `<div class="asset-preview-wrap">
+        <img src="/preview?yaml=${encodeURIComponent(yamlRel)}&t=${Date.now()}" alt="preview">
+      </div>`;
+    }
+
+    function renderAssetPanel(item) {
+      const d = item.data || {};
+      const panel = document.getElementById('panel');
+      panel.innerHTML = `
+        <h2>${escapeHtml(d.id || item.yaml)}</h2>
+        <div class="subtitle">${escapeHtml(item.yaml)}</div>
+        <form id="asset-form" onsubmit="event.preventDefault(); saveAsset(true);"></form>
+        <div class="asset-btnrow">
+          <button type="button" class="primary" onclick="saveAsset(true)">Save + next</button>
+          <button type="button" onclick="saveAsset(false)">Save</button>
+          <button type="button" onclick="copyAssetPrompt()" id="copyAssetPromptBtn">Copy describer prompt</button>
+        </div>
+        <div id="asset-msg"></div>
+      `;
+      const f = document.getElementById('asset-form');
+      addAssetSelect(f, 'kind', d.kind || '', ASSET_KIND);
+      addAssetChips(f, 'tags', d.tags || [], ASSET_TAGS);
+      addAssetText(f, 'description', d.description || '',
+        'one short sentence, <=25 words, what is literally visible');
+      addAssetTextarea(f, 'notes', d.notes || '', 'human reviewer note');
+    }
+
+    function addAssetText(parent, name, value, hint) {
+      parent.insertAdjacentHTML('beforeend',
+        `<label for="af-${name}">${name}${hint ? ' <span class="hint">' + hint + '</span>' : ''}</label>
+         <input type="text" id="af-${name}" name="${name}" value="${escapeHtml(value)}">`);
+    }
+    function addAssetTextarea(parent, name, value, hint) {
+      parent.insertAdjacentHTML('beforeend',
+        `<label for="af-${name}">${name}${hint ? ' <span class="hint">' + hint + '</span>' : ''}</label>
+         <textarea id="af-${name}" name="${name}" rows="3">${escapeHtml(value)}</textarea>`);
+    }
+    function addAssetSelect(parent, name, value, options) {
+      const opts = ['<option value="">—</option>'].concat(
+        options.map(o => `<option value="${escapeHtml(o)}"${o === value ? ' selected' : ''}>${escapeHtml(o)}</option>`)
+      ).join('');
+      parent.insertAdjacentHTML('beforeend',
+        `<label for="af-${name}">${name}</label>
+         <select id="af-${name}" name="${name}">${opts}</select>`);
+    }
+    function addAssetChips(parent, name, values, options) {
+      const valSet = new Set(values);
+      const chips = options.map(o =>
+        `<label><input type="checkbox" value="${escapeHtml(o)}"${valSet.has(o) ? ' checked' : ''}> ${escapeHtml(o)}</label>`
+      ).join('');
+      parent.insertAdjacentHTML('beforeend',
+        `<label>${name}</label>
+         <div class="checks" id="af-${name}">${chips || '<span style="color:#888;font-size:11px;">(no tags in vocab; add via cli.py tag-vocab add)</span>'}</div>`);
+    }
+
+    function gatherAssetForm() {
+      const tags = [...document.querySelectorAll('#af-tags input:checked')].map(c => c.value);
+      return {
+        kind: document.getElementById('af-kind').value,
+        tags,
+        description: document.getElementById('af-description').value.trim(),
+        notes: document.getElementById('af-notes').value.trim(),
+      };
+    }
+
+    async function saveAsset(advance) {
+      if (!currentAsset) return;
+      const fields = gatherAssetForm();
+      const r = await fetch('/api/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({yaml: currentAsset.yaml, fields}),
+      });
+      const result = await r.json();
+      const msg = document.getElementById('asset-msg');
+      if (result.errors && result.errors.length) {
+        msg.innerHTML = '<div class="errors"><strong>Validation errors</strong><ul>'
+          + result.errors.map(e => '<li>' + escapeHtml(e) + '</li>').join('')
+          + '</ul></div>';
+        return;
+      }
+      msg.innerHTML = '<div class="ok">Saved — status: ' + escapeHtml(result.status || '') + '</div>';
+      const it = assetItems.find(i => i.yaml === currentAsset.yaml);
+      if (it) it.status = result.status;
+      renderAssetList();
+      if (advance) {
+        const next = assetItems.find(i => i.status === 'pending' && i.yaml !== currentAsset.yaml);
+        if (next) { await selectAsset(next.yaml); }
+        else { msg.innerHTML += '<div class="ok" style="margin-top:6px;">No more pending assets 🎉</div>'; }
+      }
+    }
+
+    async function copyAssetPrompt() {
+      const r = await fetch('/api/prompt');
+      const j = await r.json();
+      try {
+        await navigator.clipboard.writeText(j.text);
+        const btn = document.getElementById('copyAssetPromptBtn');
+        const orig = btn.textContent;
+        btn.textContent = 'Copied ✓';
+        setTimeout(() => (btn.textContent = orig), 1500);
+      } catch (e) {
+        alert('Copy failed:\n' + e.message);
+      }
+    }
+
+    // ===========================================================================
+    // Ingest + add-asset uploads (existing endpoints, unchanged behavior)
+    // ===========================================================================
+
+    document.getElementById('ingestBtn').addEventListener('click', () => {
+      document.getElementById('ingestFile').click();
+    });
+    document.getElementById('ingestFile').addEventListener('change', async (ev) => {
+      const file = ev.target.files[0];
+      if (!file) return;
+      const msg = document.getElementById('ingestMsg');
+      msg.textContent = `Ingesting ${file.name}…`;
+      msg.className = 'ingest-msg';
+      const fd = new FormData(); fd.append('pptx', file);
+      try {
+        const r = await fetch('/api/ingest', {method: 'POST', body: fd});
+        const j = await r.json();
+        if (!r.ok) {
+          msg.textContent = j.error || 'ingest failed';
+          msg.className = 'ingest-msg err';
+        } else {
+          msg.textContent = `Ingested ${j.deck_stem}: ${j.slides} slides, ${j.pictures + j.atoms} assets`;
+          msg.className = 'ingest-msg ok';
+          if (activeTab === 'skeletons') loadSkeletons(); else loadAssets();
+        }
+      } catch (e) {
+        msg.textContent = 'ingest failed: ' + e.message;
+        msg.className = 'ingest-msg err';
+      } finally {
+        ev.target.value = '';
+      }
+    });
+
+    document.getElementById('addAssetBtn').addEventListener('click', () => {
+      document.getElementById('addAssetFile').click();
+    });
+    document.getElementById('addAssetFile').addEventListener('change', async (ev) => {
+      const file = ev.target.files[0];
+      if (!file) return;
+      const msg = document.getElementById('addAssetMsg');
+      msg.textContent = `Uploading ${file.name}…`;
+      msg.className = 'ingest-msg';
+      const fd = new FormData(); fd.append('file', file);
+      try {
+        const r = await fetch('/api/asset/add', {method: 'POST', body: fd});
+        const j = await r.json();
+        if (!r.ok) {
+          msg.textContent = j.error || 'add-asset failed';
+          msg.className = 'ingest-msg err';
+        } else {
+          msg.textContent = `Added ${j.id} (${j.kind})`;
+          msg.className = 'ingest-msg ok';
+          if (activeTab === 'assets') loadAssets();
+        }
+      } catch (e) {
+        msg.textContent = 'add-asset failed: ' + e.message;
+        msg.className = 'ingest-msg err';
+      } finally {
+        ev.target.value = '';
+      }
+    });
+
+    // ===========================================================================
+    // Boot
+    // ===========================================================================
+
+    (async () => {
+      await loadAssetVocab();
+      setTab(activeTab);  // calls loadSkeletons() or loadAssets() as appropriate
+    })();
   </script>
 </body>
 </html>
@@ -4794,16 +4273,15 @@ V5_HTML = r"""<!doctype html>
 
 def main():
     port = int(os.environ.get("PPTX_SKILL_PORT", "5050"))
-    # On the v5 redesign branch, /v5 is the primary surface — auto-open
-    # there rather than the v4 describe page. Pass PPTX_SKILL_LANDING=/
-    # to keep the v4 landing for asset-describe sessions.
-    landing = os.environ.get("PPTX_SKILL_LANDING", "/v5")
+    # `/` is the unified review page (Skeletons | Assets tabs).
+    # /v5 redirects to / for old bookmarks.
+    landing = os.environ.get("PPTX_SKILL_LANDING", "/")
     url = f"http://127.0.0.1:{port}{landing}"
-    Timer(1.2, lambda: webbrowser.open(url)).start()
+    if not os.environ.get("PPTX_SKILL_NO_BROWSER"):
+        Timer(1.2, lambda: webbrowser.open(url)).start()
     print(f"pptx-skill app → {url}")
-    print(f"  v5 skeletons:   http://127.0.0.1:{port}/v5")
-    print(f"  v4 describe:    http://127.0.0.1:{port}/")
-    print(f"  compose:        http://127.0.0.1:{port}/compose")
+    print(f"  review:    http://127.0.0.1:{port}/")
+    print(f"  compose:   http://127.0.0.1:{port}/compose")
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
