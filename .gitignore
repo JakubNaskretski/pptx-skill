@@ -39,6 +39,7 @@ Thumbs.db
 # Editors
 .idea/
 .vscode/
+.claude/
 *.swp
 
 # Local-only handover / session notes
