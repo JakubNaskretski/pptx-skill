@@ -2438,23 +2438,57 @@ def _v5_place_text(slide, slot: dict, value, slide_w, slide_h, theme, overflow) 
     tb = slide.shapes.add_textbox(left, top, w, h)
     tf = tb.text_frame
     tf.word_wrap = True
-    # Auto-shrink is the default. If the text fits at the configured
-    # font size, PowerPoint leaves it alone; if it overflows, the
-    # font is shrunk until the wrapped text fits the box height.
-    # This avoids text leaking into adjacent slots when the agent
-    # writes content that exceeds max_chars. Opt out by passing the
-    # slot value as {"value": "...", "overflow": "none"}.
-    if overflow != "none":
-        try:
-            from pptx.enum.text import MSO_AUTO_SIZE
-            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        except Exception:
-            pass
+
+    text = str(value)
+    style = slot.get("style") or {}
+    configured_pt = float(style.get("size_pt") or 18.0)
+
+    # Auto-shrink policy (text + bullet slots):
+    #   default        — autofit IF text estimated to fit at floor
+    #                    (max(8pt, 70% of configured); else leave
+    #                    overflowing AND warn so user sees + fixes
+    #   "shrink"       — force autofit even when it'd go below floor
+    #                    (explicit opt-in to potential illegibility)
+    #   "none"         — no autofit, raw overflow (pre-#18 behavior)
+    enable_autofit = False
+    if overflow == "shrink":
+        enable_autofit = True
+    elif overflow == "none":
+        enable_autofit = False
+    else:
+        # Default: only enable if text fits at floor.
+        floor_pt = max(8.0, 0.7 * configured_pt)
+        fits, est = _v5_estimate_fits(text, w, h, floor_pt)
+        if fits:
+            enable_autofit = True
+        else:
+            warnings.append({
+                "violation": "text_overflow",
+                "slot_id": slot.get("id"),
+                "message": (
+                    f"text in slot {slot.get('id')!r} won't fit at floor "
+                    f"({floor_pt:.0f}pt): {len(text)} chars vs an estimated "
+                    f"{est} fitting at floor. Rendered with overflow — "
+                    f"shorten the text, or pass overflow:'shrink' to force "
+                    f"unbounded auto-shrink."
+                ),
+            })
+
+    try:
+        from pptx.enum.text import MSO_AUTO_SIZE
+        # Explicit set in both cases: enable_autofit → TEXT_TO_FIT_SHAPE
+        # (font shrinks to fit). Otherwise → NONE (text overflows the
+        # visible box but the shape stays at slot bounds, so it doesn't
+        # push into adjacent slots). Default for add_textbox() is
+        # SHAPE_TO_FIT_TEXT which would grow the shape — exactly what
+        # we don't want when the user has a tight layout.
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE if enable_autofit else MSO_AUTO_SIZE.NONE
+    except Exception:
+        pass
 
     p = tf.paragraphs[0]
     run = p.add_run()
-    run.text = str(value)
-    style = slot.get("style") or {}
+    run.text = text
     if style.get("size_pt"):
         run.font.size = Pt(style["size_pt"])
     if style.get("bold") is not None:
@@ -2470,6 +2504,27 @@ def _v5_place_text(slide, slot: dict, value, slide_w, slide_h, theme, overflow) 
     return warnings
 
 
+def _v5_estimate_fits(text: str, w_emu: int, h_emu: int, font_pt: float) -> tuple[bool, int]:
+    """Rough estimate: does ``text`` fit in a ``w_emu × h_emu`` box at
+    ``font_pt`` font size? Returns (fits, est_chars_at_this_size).
+
+    Uses a sans-serif approximation: average char width ≈ 0.55 × font
+    size in points, line height ≈ 1.2 × font size. EMU ≈ 12700 per pt.
+    Conservative for short labels; less accurate for paragraphs with
+    very narrow / wide characters. Good enough to catch egregious
+    overflow ("200 chars in a 30-char slot").
+    """
+    if font_pt <= 0 or w_emu <= 0 or h_emu <= 0:
+        return True, len(text)
+    pt_to_emu = 12700.0
+    char_w = font_pt * 0.55 * pt_to_emu
+    line_h = font_pt * 1.2 * pt_to_emu
+    chars_per_line = max(1, int(w_emu / char_w))
+    lines_available = max(1, int(h_emu / line_h))
+    capacity = chars_per_line * lines_available
+    return len(text) <= capacity, capacity
+
+
 def _v5_place_bullets(slide, slot: dict, items: list, slide_w, slide_h, theme, overflow) -> list[dict]:
     from pptx.util import Pt
     warnings: list[dict] = []
@@ -2477,17 +2532,43 @@ def _v5_place_bullets(slide, slot: dict, items: list, slide_w, slide_h, theme, o
     tb = slide.shapes.add_textbox(left, top, w, h)
     tf = tb.text_frame
     tf.word_wrap = True
-    # Same auto-shrink default as _v5_place_text. PowerPoint leaves
-    # well-sized lists alone; long lists / long items get shrunk to
-    # fit. Opt out via {"value": [...], "overflow": "none"}.
-    if overflow != "none":
-        try:
-            from pptx.enum.text import MSO_AUTO_SIZE
-            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        except Exception:
-            pass
 
     style = slot.get("style") or {}
+    configured_pt = float(style.get("size_pt") or 14.0)
+    # Estimate per the same heuristic as _v5_place_text. We count the
+    # total chars across items + the bullet glyph + newlines as a rough
+    # proxy for visual length.
+    total_text = "\n".join(f"• {it}" for it in items)
+
+    enable_autofit = False
+    if overflow == "shrink":
+        enable_autofit = True
+    elif overflow == "none":
+        enable_autofit = False
+    else:
+        floor_pt = max(8.0, 0.7 * configured_pt)
+        fits, est = _v5_estimate_fits(total_text, w, h, floor_pt)
+        if fits:
+            enable_autofit = True
+        else:
+            warnings.append({
+                "violation": "bullets_overflow",
+                "slot_id": slot.get("id"),
+                "message": (
+                    f"bullets in slot {slot.get('id')!r} won't fit at floor "
+                    f"({floor_pt:.0f}pt): {len(total_text)} chars across "
+                    f"{len(items)} items vs an estimated {est} fitting at "
+                    f"floor. Rendered with overflow — trim items, or pass "
+                    f"overflow:'shrink' to force unbounded auto-shrink."
+                ),
+            })
+
+    try:
+        from pptx.enum.text import MSO_AUTO_SIZE
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE if enable_autofit else MSO_AUTO_SIZE.NONE
+    except Exception:
+        pass
+
     font_name = _v5_resolve_font_name(slot, theme)
     color = _v5_resolve_color(slot, theme)
 
@@ -2616,25 +2697,34 @@ def _v5_place_image(slide, slot: dict, value, slide_w, slide_h, theme) -> list[d
         slide.shapes.add_picture(str(bin_path), placed_left, placed_top, placed_w, placed_h)
         return warnings
 
-    # Default "cover": scale image larger than slot, crop overflow.
-    # python-pptx exposes pic.crop_left/right/top/bottom as fractions
-    # of the *displayed* image size (i.e. of placed_w / placed_h).
+    # Default "cover": picture shape stays at slot bounds; the SOURCE
+    # image gets cropped on the over-sized axis so the visible portion
+    # matches the slot's aspect. Previously the shape was inflated past
+    # the slot bounds and then crop hid the overflow — that worked
+    # visually for the cropped pixels but the shape's bounding box still
+    # extended into adjacent slots (and into the slide margin / off-slide
+    # for very wide assets), which broke layouts that put another slot
+    # right next to an image (e.g. standard_templates_04/09: bullets on
+    # the left, hero image on the right).
+    #
+    # python-pptx crop_* values are fractions of the SOURCE image to hide
+    # from each edge. By cropping the source so its visible region has
+    # the slot's aspect, the picture shape at slot dimensions renders the
+    # cropped region scaled to fill — no shape inflation needed.
+    pic = slide.shapes.add_picture(str(bin_path), left, top, w, h)
     if asset_aspect > slot_aspect:
-        # Asset wider than slot → match height, crop sides
-        placed_h = h
-        placed_w = int(h * asset_aspect)
-        crop_amount = (placed_w - w) / placed_w / 2
-        pic = slide.shapes.add_picture(str(bin_path), left - int(placed_w - w) // 2, top, placed_w, placed_h)
-        pic.crop_left = crop_amount
-        pic.crop_right = crop_amount
-    else:
-        # Asset taller than slot → match width, crop top/bottom
-        placed_w = w
-        placed_h = int(w / asset_aspect)
-        crop_amount = (placed_h - h) / placed_h / 2
-        pic = slide.shapes.add_picture(str(bin_path), left, top - int(placed_h - h) // 2, placed_w, placed_h)
-        pic.crop_top = crop_amount
-        pic.crop_bottom = crop_amount
+        # Asset is wider than slot → crop equal slivers off the sides.
+        # Visible source width = slot.w / (slot.h / asset.h) → ratio
+        # cropped per side = (1 - slot_aspect/asset_aspect) / 2.
+        crop = (1 - slot_aspect / asset_aspect) / 2
+        pic.crop_left = crop
+        pic.crop_right = crop
+    elif asset_aspect < slot_aspect:
+        # Asset is taller than slot → crop equal slivers off top + bottom.
+        crop = (1 - asset_aspect / slot_aspect) / 2
+        pic.crop_top = crop
+        pic.crop_bottom = crop
+    # asset_aspect == slot_aspect → no cropping needed, shape fits exactly.
     return warnings
 
 
