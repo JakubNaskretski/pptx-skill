@@ -2903,20 +2903,15 @@ def _asset_index_entry(a: dict) -> dict:
     out = {
         "id": a["id"],
         "kind": a.get("kind", ""),
-        "subject": a.get("subject", ""),
-        "depicts": a.get("depicts", ""),
-        "feel": a.get("feel", ""),
-        "composition": a.get("composition", ""),
-        "colors": a.get("colors", []),
-        "scope": a.get("scope", []),
-        "suitable_for": a.get("suitable_for", []),
+        "tags": a.get("tags", []),
+        "description": a.get("description", ""),
     }
-    # v4: structured colour + kind-specific blocks. All optional —
-    # only emit when present so the index stays focused on retrievable
-    # fields.
-    # v4.1: `interpretation` — model's speculative observations, info-only;
-    # never a filter target, surfaced to the compose-time agent as context.
+    # Optional structured blocks. Only emit when present so the
+    # index stays focused on retrievable fields. `interpretation` is
+    # the model's speculative observations — info-only, never a
+    # filter target, surfaced to the compose-time agent as context.
     for key in (
+        "width", "height", "aspect",
         "colors_hex", "recolor_targets", "table", "chart", "shape", "smartart",
         "interpretation",
     ):

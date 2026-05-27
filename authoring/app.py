@@ -1666,9 +1666,12 @@ def api_compose_text():
 def api_vocab():
     # Ship the controlled vocab + the editable workspace tag vocabulary
     # in one payload so the describe UI can render tag chips without a
-    # second round-trip.
+    # second round-trip. Build a fresh asset dict so we don't mutate
+    # the module-level VOCAB by adding `tags` to it on every request.
     payload = dict(cli_mod.VOCAB)
-    payload.setdefault("asset", {})["tags"] = cli_mod.load_tag_vocab()
+    asset_vocab = dict(cli_mod.VOCAB.get("asset", {}))
+    asset_vocab["tags"] = cli_mod.load_tag_vocab()
+    payload["asset"] = asset_vocab
     return jsonify(payload)
 
 
@@ -3599,7 +3602,7 @@ COMPOSE_HTML = r"""<!doctype html>
 
 <script>
 const tplFields = ["feel", "suitable_for"];
-const astFields = ["kind", "feel", "composition", "suitable_for", "scope", "colors"];
+const astFields = ["kind", "tags"];
 const state = { templates: {}, assets: {} };
 
 function fieldLabel(f) {
@@ -3607,9 +3610,7 @@ function fieldLabel(f) {
     feel: "feel",
     suitable_for: "suitable for",
     kind: "kind",
-    composition: "composition",
-    scope: "scope",
-    colors: "colors",
+    tags: "tags",
   })[f] || f;
 }
 

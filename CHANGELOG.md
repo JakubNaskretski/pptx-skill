@@ -49,8 +49,9 @@ without editing source schemas.
   feed the slim-shape describer over your existing library without
   re-ingesting.
 - **`cli.py validate`** — rewired. Asset checks now: `kind` in
-  enum, `tags` is a list of ≤4 entries each present in
-  `tag_vocab.yaml`, `description` non-empty and ≤25 words.
+  enum, `tags` is a non-empty list of ≤4 entries each present in
+  `tag_vocab.yaml`, `description` non-empty and ≤30 words
+  (recommended ≤25).
 - **`cli.py add-asset`** — unchanged externally. Internally writes
   the new slim sidecar shape, with `width`/`height`/`aspect` computed
   from the binary at ingest time.
@@ -86,6 +87,12 @@ python3 authoring/cli.py migrate-asset-yaml --apply # writes; backs up
 python3 authoring/cli.py validate                   # confirms slim shape
 python3 authoring/cli.py build-v5                   # rebuild bundle
 ```
+
+Migrated sidecars land with `tags: []` and `status: pending` — the
+old `feel/composition/scope/...` fields don't map cleanly onto the
+new closed `tag_vocab`, so re-curation is intentional. `validate`
+will flag them as incomplete until a re-tagging pass (manual or via
+`redescribe` + the describer prompt).
 
 To re-describe existing assets against the new tag list without
 losing the migrated `description`:
