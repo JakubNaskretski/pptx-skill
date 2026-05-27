@@ -1044,7 +1044,7 @@ def preview():
 
 
 FILTER_DIMENSIONS = {
-    "templates": ("feel", "suitable_for"),
+    "skeletons": ("categories",),
     "assets": ("kind", "tags"),
 }
 
@@ -1084,14 +1084,40 @@ def _list_presets() -> list[dict]:
     return out
 
 
-def _collect_descriptions() -> tuple[list[dict], list[dict]]:
-    slides: list[dict] = []
-    for p in cli_mod.iter_slide_yamls():
-        d = _safe_read(p)
-        if not d:
+def _collect_skeletons() -> list[dict]:
+    """Read every workspace skeleton sidecar that's not rejected.
+
+    Each returned dict carries `_dir` (the on-disk directory name) so
+    bundle builders can re-resolve sibling files (preview.png,
+    background.png) without re-globbing the workspace.
+    """
+    root = cli_mod.WORKSPACE / "skeletons"
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
             continue
-        d["_yaml_path"] = p
-        slides.append(d)
+        sk_path = d / "skeleton.yaml"
+        if not sk_path.exists():
+            continue
+        data = _safe_read(sk_path)
+        if not data or data.get("status") == "rejected":
+            continue
+        data["_dir"] = d.name
+        data["_yaml_path"] = sk_path
+        out.append(data)
+    return out
+
+
+def _collect_descriptions() -> tuple[list[dict], list[dict]]:
+    """Return (skeletons, assets) for filter UI + brief bundle.
+
+    Slides (v4) are not collected — the compose flow is v5-native; v4
+    `decks/<deck>/slides/*.yaml` records are ignored here even if they
+    still exist on disk from a pre-redesign workspace.
+    """
+    skeletons = _collect_skeletons()
     assets: list[dict] = []
     for p in cli_mod.iter_asset_yamls():
         d = _safe_read(p)
@@ -1099,11 +1125,11 @@ def _collect_descriptions() -> tuple[list[dict], list[dict]]:
             continue
         d["_yaml_path"] = p
         assets.append(d)
-    return slides, assets
+    return skeletons, assets
 
 
 def _collect_filter_options() -> dict:
-    slides, assets = _collect_descriptions()
+    skeletons, assets = _collect_descriptions()
 
     def collect(items: list[dict], fields: tuple[str, ...]) -> dict:
         out: dict[str, set[str]] = {f: set() for f in fields}
@@ -1121,9 +1147,9 @@ def _collect_filter_options() -> dict:
         return {k: sorted(v) for k, v in out.items()}
 
     return {
-        "templates": {
-            "options": collect(slides, FILTER_DIMENSIONS["templates"]),
-            "total": len(slides),
+        "skeletons": {
+            "options": collect(skeletons, FILTER_DIMENSIONS["skeletons"]),
+            "total": len(skeletons),
         },
         "assets": {
             "options": collect(assets, FILTER_DIMENSIONS["assets"]),
@@ -1148,12 +1174,12 @@ def _matches_filters(item: dict, filters: dict) -> bool:
 
 
 def _filter_kb(filters: dict) -> tuple[list[dict], list[dict]]:
-    slides, assets = _collect_descriptions()
-    tpl_filters = filters.get("templates") or {}
+    skeletons, assets = _collect_descriptions()
+    sk_filters = filters.get("skeletons") or {}
     ast_filters = filters.get("assets") or {}
-    slides_out = [s for s in slides if _matches_filters(s, tpl_filters)]
+    skeletons_out = [s for s in skeletons if _matches_filters(s, sk_filters)]
     assets_out = [a for a in assets if _matches_filters(a, ast_filters)]
-    return slides_out, assets_out
+    return skeletons_out, assets_out
 
 
 def _read_skill_md() -> str:
@@ -1225,211 +1251,147 @@ def _format_user_assets_section(user_meta: dict) -> str:
 
 
 def _format_brief(brief: str, user_meta: dict | None = None) -> str:
+    """Slim brief.md for the v5 bundle. Just the user's brief plus the
+    user-assets section when present. The v4 four-pass preamble +
+    helpers docs + slot-polymorphism notes are dropped — SKILL_v5.md
+    is the canonical contract for v5 and covers the workflow.
+    """
     user_section = _format_user_assets_section(user_meta or {})
-    return (
+    out = (
         "# Deck brief\n\n"
-        f"{brief.strip() or '(no brief supplied)'}\n\n"
-        "---\n\n"
-        + (user_section + "---\n\n" if user_section else "")
-        + "# How to plan this deck\n\n"
-        "Work through the problem in **four passes**, in this order. The\n"
-        "Compose page extracts ONLY the final JSON code-fence at the end\n"
-        "of your response; everything else is reasoning prose that helps\n"
-        "you think clearly and helps the human spot mistakes. Show your\n"
-        "work — don't jump straight to JSON.\n"
-        "\n"
-        "## Pass 1 — outline (plain text)\n"
-        "\n"
-        "Before picking any templates, sketch the deck as a numbered list\n"
-        "of slide titles + one-line intents. Decide the narrative arc and\n"
-        "slide count from the brief. Output under the heading `## Outline`.\n"
-        "\n"
-        "Example shape:\n"
-        "```\n"
-        "## Outline\n"
-        "1. Opener — thesis title + author + university\n"
-        "2. Problem statement — why this matters\n"
-        "3. Methodology — how the study was conducted\n"
-        "4. Results — key findings + chart\n"
-        "5. Closing — implications + Q&A invitation\n"
-        "```\n"
-        "\n"
-        "## Pass 2 — template picks\n"
-        "\n"
-        "For each outline entry, pick ONE template id from `index.json`.\n"
-        "Justify each pick in one line: which `feel` / `suitable_for` /\n"
-        "inventory anatomy matched, and how the template's `theme_colors`\n"
-        "compare to brand policy (see `brand.md` if present).\n"
-        "\n"
-        "Use `helpers/kb_filter.py` to find candidates, then\n"
-        "`helpers/kb_inspect.py <template_id>` to read the picked\n"
-        "template's slots + inventory in denormalized form. Pick templates\n"
-        "ONLY from `index.json` (or from `user_assets/manifest.json` for\n"
-        "assets — see the user-assets section above when present).\n"
-        "\n"
-        "If a brief calls for a layout no existing template provides,\n"
-        "switch that entry to compose-mode\n"
-        "(`{\"compose\": true, \"layout\": \"...\", \"shapes\": [...]}`)\n"
-        "rather than forcing a template that doesn't fit.\n"
-        "\n"
-        "Output as a table or list under `## Picks`.\n"
-        "\n"
-        "## Pass 3 — slot values\n"
-        "\n"
-        "Now fill each pick's slots. Walk `helpers/kb_inspect.py\n"
-        "<template_id>` to see what slots the template exposes + their\n"
-        "constraints, then:\n"
-        "\n"
-        "- **Text slots** — plain string, respect each slot's `max_chars`.\n"
-        "  Use `helpers/kb_budget.py <template_id> <slot_id> \"draft\"` to\n"
-        "  check fit on tight slots.\n"
-        "- **Bullets slots** — array of plain strings. NO leading `•`, `-`,\n"
-        "  or `*` glyphs — the template applies bullets via layout.\n"
-        "- **Image slots** — an `asset_<id>` from `index.json`, or from\n"
-        "  `user_assets/manifest.json` when present. User-supplied assets\n"
-        "  outrank KB matches.\n"
-        "- If no asset fits a slot, omit the slot rather than forcing one.\n"
-        "\n"
-        "## Pass 4 — self-lint\n"
-        "\n"
-        "Save your draft as `plan.json` and run\n"
-        "`python helpers/kb_lint.py < plan.json` (or pipe directly). The\n"
-        "linter catches: slot ids not declared on the template, text over\n"
-        "`max_chars`, leading bullet glyphs, asset ids missing from both\n"
-        "index.json and user_assets, accepted-but-degraded shapes, and\n"
-        "compose-mode entries that the engine will currently skip. Fix\n"
-        "errors before emitting the final JSON.\n"
-        "\n"
-        "Exit code 0 = clean, 1 = errors — must be 0 to consider the plan\n"
-        "ready.\n"
-        "\n"
-        "## Final output\n"
-        "\n"
-        "End your response with the plan inside a single fenced block,\n"
-        "exactly like this (the fence is what the Compose page extracts):\n"
-        "\n"
-        "    ```json\n"
-        "    [\n"
-        "      {\"template\": \"<id>\", \"slots\": { ... }},\n"
-        "      ...\n"
-        "    ]\n"
-        "    ```\n"
-        "\n"
-        "Any prose before the fence is ignored by the system; any prose\n"
-        "after it is also ignored. Put only one JSON fence per response.\n"
-        "\n"
-        "## Helpers in this bundle\n"
-        "\n"
-        "Read-only Python utilities under `helpers/` — invoke them from the\n"
-        "bundle root (stdlib + pyyaml; exit codes 0 ok / 1 empty-or-fail / 2\n"
-        "bad input). They expose data; you decide the picks.\n"
-        "\n"
-        "- `python helpers/kb_summary.py` — facet counts; start here on a "
-        "fresh bundle\n"
-        "- `python helpers/kb_filter.py templates --feel formal "
-        "--suitable_for opener`\n"
-        "- `python helpers/kb_filter.py assets --kind photo --text \"team\"`\n"
-        "- `python helpers/kb_inspect.py <id>` — denormalized view; inlines "
-        "inventory atoms with their descriptions\n"
-        "- `python helpers/kb_lint.py < plan.json` — pre-flight validator "
-        "(slot ids, max_chars, bullet glyphs, missing assets, degraded "
-        "shapes)\n"
-        "- `python helpers/kb_themes.py [--resolve-role <role> --for-deck "
-        "<deck>]` — per-deck theme + alias-aware role resolution\n"
-        "- `python helpers/kb_budget.py <template_id> <slot_id> \"text\"` — "
-        "one-shot text-budget check\n"
-        "\n"
-        "See `helpers/README.md` for full docs.\n"
-        "\n"
-        "## v4 capabilities — what's new\n"
-        "\n"
-        "- Each template carries `theme_colors` and `fonts` showing the\n"
-        "  source deck's actual palette + theme fonts. Pick templates\n"
-        "  whose theme is close to brand policy when possible.\n"
-        "- Each template has `inventory` listing structured atoms it\n"
-        "  carries (tables, callouts, charts, smartart). Picking the\n"
-        "  template brings those atoms along for free.\n"
-        "- Asset kinds now include `vector`, `table`, `chart`, `callout`,\n"
-        "  `freeform`, `smartart` — filter on them via `kind=table` etc.\n"
-        "- Each asset has `colors_hex` (actual hex from binary inspection)\n"
-        "  alongside the human-readable `colors` words.\n"
-        "\n"
-        "## Slot value polymorphism — accepted but partially honored\n"
-        "\n"
-        "Slot values can be more than plain strings/arrays/asset ids:\n"
-        "  - {\"text\": \"…\", \"color_role\": \"accent\", \"bold\": true}\n"
-        "  - {\"runs\": [{\"text\": \"X\", \"bold\": true}, {\"text\": \" Y\"}]}\n"
-        "  - {\"asset\": \"asset_<id>\", \"recolor\": {\"#ff0000\": \"accent\"}}\n"
-        "\n"
-        "Current build: styling fields are accepted without crashing but\n"
-        "DROPPED at compose time with a one-line warning. Phase D will\n"
-        "honor them. Until then, prefer plain strings/arrays/asset ids\n"
-        "unless you have a specific reason to flag styling intent.\n"
-        "\n"
-        "## Compose-mode entries — accepted but skipped\n"
-        "\n"
-        "Plan entries of shape {\"compose\": true, \"layout\": \"…\",\n"
-        "\"shapes\": [...]} let you assemble a slide from atoms. The\n"
-        "engine currently SKIPS these entries with a warning (full\n"
-        "support lands in Phase D). For a slide to render today it\n"
-        "must use {\"template\": \"…\", \"slots\": {...}} shape.\n"
-        "\n"
-        "## Bullets — DO NOT prepend bullet glyphs\n"
-        "\n"
-        "PowerPoint templates apply bullets via layout formatting. If you\n"
-        "prepend a literal `•`, `-`, or `*` to lines, the rendered slide\n"
-        "shows two bullets per line (e.g. `•• My point`).\n"
-        "\n"
-        "Correct ways to produce a bulleted list:\n"
-        "\n"
-        "- For a slot of `kind: bullets` — pass an array of plain strings.\n"
-        "  GOOD: `\"body\": [\"First point\", \"Second point\"]`\n"
-        "  BAD:  `\"body\": [\"• First point\", \"• Second point\"]`\n"
-        "- For a `kind: text` slot that visually behaves as bullets in the\n"
-        "  template — pass plain strings joined by `\\n`, NO leading glyph.\n"
-        "  GOOD: `\"subtitle\": \"First point\\nSecond point\"`\n"
-        "  BAD:  `\"subtitle\": \"• First point\\n• Second point\"`\n"
+        f"{brief.strip() or '(no brief supplied)'}\n"
     )
+    if user_section:
+        out += "\n---\n\n" + user_section
+    return out
 
 
-def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str) -> bytes:
-    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
-    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
-    index = cli_mod.build_index(clean_slides, clean_assets)
+def _skeleton_index_entry(sk: dict) -> dict:
+    slots = sk.get("slots") or []
+    return {
+        "id": sk["id"],
+        "source_deck": sk.get("source_deck"),
+        "source_slide_index": sk.get("source_slide_index"),
+        "categories": sk.get("categories") or [],
+        "slot_count": len(slots),
+        "slot_kinds": sorted({s.get("kind") for s in slots if s.get("kind")}),
+        "status": sk.get("status", "pending"),
+    }
+
+
+def _v5_asset_summary(a: dict) -> dict:
+    out = {
+        "id": a["id"],
+        "kind": a.get("kind", ""),
+        "tags": a.get("tags", []),
+        "description": a.get("description", ""),
+    }
+    for k in ("width", "height", "aspect", "colors_hex",
+              "recolor_targets", "table", "chart", "shape", "smartart",
+              "interpretation"):
+        v = a.get(k)
+        if v:
+            out[k] = v
+    return out
+
+
+def _v5_theme_entry(theme: dict) -> dict:
+    return {
+        "id": theme.get("id"),
+        "palette": theme.get("palette", {}),
+        "fonts": theme.get("fonts", {}),
+    }
+
+
+def _build_v5_index(skeletons: list[dict], assets: list[dict],
+                    themes: list[dict]) -> dict:
+    return {
+        "version": 5,
+        "themes": [_v5_theme_entry(t) for t in themes],
+        "skeletons": [_skeleton_index_entry(s) for s in skeletons],
+        "assets": [_v5_asset_summary(a) for a in assets],
+        "tag_vocab": cli_mod.load_tag_vocab(),
+    }
+
+
+def _build_prompt_bundle_zip(skeletons: list[dict], assets: list[dict], brief: str) -> bytes:
+    """v5 brief bundle. Ships skill-v5 layout (SKILL_v5.md as SKILL.md,
+    skeletons/, themes/, assets/, reader.py, tag_vocab.yaml, index.json)
+    plus brand.md, brief.md, optional user_assets/ low-res previews +
+    manifest. Filter narrows which skeletons and assets are included;
+    themes are auto-restricted to the decks the included skeletons came
+    from.
+    """
     user_meta = _read_user_meta(USER_STAGED_DIR)
+    skeletons_root = cli_mod.WORKSPACE / "skeletons"
+    themes_root = cli_mod.WORKSPACE / "themes"
+
+    # Only ship themes whose deck has at least one skeleton in the
+    # bundle — mirrors the v4 theme-trim logic so the agent's view
+    # matches what it can actually use.
+    decks_in_bundle = {sk.get("source_deck") for sk in skeletons}
+    decks_in_bundle.discard(None)
+    themes: list[dict] = []
+    if themes_root.exists():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir() or d.name not in decks_in_bundle:
+                continue
+            theme_yaml = d / "theme.yaml"
+            if not theme_yaml.exists():
+                continue
+            t = _safe_read(theme_yaml)
+            if not t:
+                continue
+            t["_dir"] = d.name
+            themes.append(t)
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("SKILL.md", _read_skill_md())
+        # Consumer contract + reader so the agent can call find-asset / etc.
+        zf.writestr("SKILL.md", (cli_mod.CONSUMER / "SKILL_v5.md").read_text(encoding="utf-8"))
+        zf.writestr("reader.py", (cli_mod.CONSUMER / "reader.py").read_text(encoding="utf-8"))
         brand = _read_brand().strip()
         if brand:
             zf.writestr("brand.md", brand + "\n")
-        zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
         zf.writestr("brief.md", _format_brief(brief, user_meta))
-        # v4: per-deck theme.yaml. Filtered KB may have culled some
-        # decks entirely — only ship themes whose deck still has at
-        # least one template in the bundle (so the agent's bundle
-        # mirrors what they actually see).
-        decks_in_bundle = {
-            (s.get("sources") or [{}])[0].get("deck", "")
-            for s in clean_slides
-        }
-        decks_in_bundle.discard("")
-        for theme_yaml in sorted((cli_mod.WORKSPACE / "decks").glob("*/theme.yaml")):
-            if theme_yaml.parent.name not in decks_in_bundle:
-                continue
+        zf.writestr(
+            "tag_vocab.yaml",
+            yaml.safe_dump({"tags": cli_mod.load_tag_vocab()},
+                           sort_keys=False, allow_unicode=True),
+        )
+
+        # Themes
+        for t in themes:
+            tid = t.get("id") or t["_dir"]
+            src_dir = themes_root / t["_dir"]
+            for fn in ("theme.yaml", "master.pptx", "preview.png"):
+                src = src_dir / fn
+                if src.exists():
+                    zf.write(src, f"themes/{tid}/{fn}")
+
+        # Skeletons (sidecar + previews)
+        for sk in skeletons:
+            sid = sk["id"]
+            src_dir = skeletons_root / sk["_dir"]
+            for fn in ("skeleton.yaml", "preview.png", "background.png"):
+                src = src_dir / fn
+                if src.exists():
+                    zf.write(src, f"skeletons/{sid}/{fn}")
+
+        # KB assets (slim sidecar + binary)
+        for a in assets:
+            aid = a["id"]
+            yaml_path: Path = a["_yaml_path"]
+            clean = {k: v for k, v in a.items() if not k.startswith("_")}
             zf.writestr(
-                f"decks/{theme_yaml.parent.name}/theme.yaml",
-                theme_yaml.read_text(encoding="utf-8"),
+                f"assets/{aid}.yaml",
+                yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
             )
-        # Agent-side helpers: read-only kb_* scripts the agent invokes
-        # against the bundle from its own working dir (filter the catalog,
-        # inspect entries, lint a draft plan). See helpers/README.md inside
-        # the bundle. Stdlib + pyyaml only.
-        helpers_dir = cli_mod.CONSUMER / "helpers"
-        if helpers_dir.exists():
-            for hp in sorted(helpers_dir.iterdir()):
-                if hp.is_file() and not hp.name.startswith("."):
-                    zf.write(hp, f"helpers/{hp.name}")
+            binary = _asset_binary(yaml_path)
+            if binary is not None:
+                ext = binary.suffix.lstrip(".") or "bin"
+                zf.write(binary, f"assets/{aid}.{ext}")
+
         # User-supplied assets: low-res previews + manifest with original
         # dimensions. Full-res originals stay on the user's machine and
         # are spliced into compose-run staging when the plan comes back.
@@ -1440,8 +1402,6 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
                 src = USER_STAGED_DIR / f"{aid}.{ext}"
                 if not src.exists():
                     continue
-                # Write a low-res copy directly into the zip via a tmp
-                # file so we don't materialize huge images in RAM.
                 with tempfile.NamedTemporaryFile(
                     delete=False, suffix=f".{ext}",
                 ) as tf:
@@ -1474,25 +1434,56 @@ def _build_prompt_bundle_zip(slides: list[dict], assets: list[dict], brief: str)
                     indent=2, ensure_ascii=False,
                 ),
             )
+
+        # index.json last so it reflects the actually-included content.
+        index = _build_v5_index(skeletons, assets, themes)
+        zf.writestr("index.json", json_mod.dumps(index, indent=2, ensure_ascii=False))
+
     blob = buf.getvalue()
-    # Move staged → bundle AFTER the zip is finalized: the bundle/ dir
-    # is now the canonical snapshot compose-run will use to resolve any
-    # user asset ids the agent references in the plan.
+    # Move staged → bundle so compose-run can later resolve the same
+    # user asset ids the agent references in its plan.
     if user_meta:
         _move_staged_to_bundle()
     return blob
 
 
-def _flat_prompt_text(slides: list[dict], assets: list[dict], brief: str) -> str:
-    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
-    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
-    index = cli_mod.build_index(clean_slides, clean_assets)
+def _flat_prompt_text(skeletons: list[dict], assets: list[dict], brief: str) -> str:
+    """Flat-text mirror of the v5 brief bundle. Includes SKILL_v5.md
+    text, the v5 index.json, brand.md, and brief.md — i.e. the parts
+    the agent could read as text. Binaries (themes/master.pptx,
+    skeleton previews, asset images, user-asset previews) are not
+    included; users wanting those should download the .zip.
+    """
+    # Pick themes the same way the zip path does so the flat index
+    # matches the zip's contents.
+    skeletons_root = cli_mod.WORKSPACE / "skeletons"  # noqa: F841 — kept for symmetry
+    themes_root = cli_mod.WORKSPACE / "themes"
+    decks_in_bundle = {sk.get("source_deck") for sk in skeletons}
+    decks_in_bundle.discard(None)
+    themes: list[dict] = []
+    if themes_root.exists():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir() or d.name not in decks_in_bundle:
+                continue
+            theme_yaml = d / "theme.yaml"
+            if not theme_yaml.exists():
+                continue
+            t = _safe_read(theme_yaml)
+            if t:
+                themes.append(t)
+
     sections: list[str] = []
     brand = _read_brand().strip()
     if brand:
         sections.append("=== brand.md ===\n" + brand)
-    sections.append("=== SKILL.md ===\n" + _read_skill_md())
-    sections.append("=== index.json ===\n" + json_mod.dumps(index, indent=2, ensure_ascii=False))
+    sections.append(
+        "=== SKILL.md ===\n"
+        + (cli_mod.CONSUMER / "SKILL_v5.md").read_text(encoding="utf-8")
+    )
+    index = _build_v5_index(skeletons, assets, themes)
+    sections.append(
+        "=== index.json ===\n" + json_mod.dumps(index, indent=2, ensure_ascii=False)
+    )
     user_meta = _read_user_meta(USER_STAGED_DIR)
     sections.append("=== brief.md ===\n" + _format_brief(brief, user_meta))
     if user_meta:
@@ -1615,11 +1606,11 @@ def api_compose_options():
 def api_compose_preview():
     body = request.get_json(force=True) or {}
     filters = body.get("filters") or {}
-    slides, assets = _filter_kb(filters)
+    skeletons, assets = _filter_kb(filters)
     return jsonify({
-        "templates": len(slides),
+        "skeletons": len(skeletons),
         "assets": len(assets),
-        "template_ids": [s["id"] for s in slides],
+        "skeleton_ids": [s["id"] for s in skeletons],
         "asset_ids": [a["id"] for a in assets],
     })
 
@@ -1629,20 +1620,20 @@ def api_compose_bundle():
     body = request.get_json(force=True) or {}
     filters = body.get("filters") or {}
     brief = body.get("brief") or ""
-    slides, assets = _filter_kb(filters)
-    if not slides and not assets:
+    skeletons, assets = _filter_kb(filters)
+    if not skeletons and not assets:
         debug_event("warn", "bundle",
                     "bundle request rejected — filters match nothing")
         return jsonify({"error": "filters match nothing — broaden them"}), 400
     user_count = len(_read_user_meta(USER_STAGED_DIR))
-    blob = _build_prompt_bundle_zip(slides, assets, brief)
+    blob = _build_prompt_bundle_zip(skeletons, assets, brief)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     debug_event(
         "info", "bundle",
-        f"prompt bundle built — {len(slides)} templates, "
+        f"v5 brief bundle built — {len(skeletons)} skeletons, "
         f"{len(assets)} assets, {user_count} user assets, "
         f"{len(blob) // 1024} KB",
-        templates=len(slides), assets=len(assets),
+        skeletons=len(skeletons), assets=len(assets),
         user_assets=user_count, size_bytes=len(blob),
     )
     return send_file(
@@ -1658,8 +1649,8 @@ def api_compose_text():
     body = request.get_json(force=True) or {}
     filters = body.get("filters") or {}
     brief = body.get("brief") or ""
-    slides, assets = _filter_kb(filters)
-    return jsonify({"text": _flat_prompt_text(slides, assets, brief)})
+    skeletons, assets = _filter_kb(filters)
+    return jsonify({"text": _flat_prompt_text(skeletons, assets, brief)})
 
 
 @app.get("/api/vocab")
@@ -3533,7 +3524,7 @@ COMPOSE_HTML = r"""<!doctype html>
         Pick tags to narrow what the agent sees. Empty = no filter on that field.
         Within a field, multiple selections mean OR.
       </div>
-      <div class="group-label">Templates</div>
+      <div class="group-label">Skeletons</div>
       <div id="tplFilters"></div>
       <div class="group-label">Assets</div>
       <div id="astFilters"></div>
@@ -3583,10 +3574,8 @@ COMPOSE_HTML = r"""<!doctype html>
     <div class="step">
       <h2>3. Paste the agent's plan and compose</h2>
       <div class="desc">
-        Paste the JSON array the LLM returns. v4 plans
-        (<code>{"template": …, "slots": …}</code>) run via
-        <code>reader.py compose</code>. v5 plans
-        (<code>{"skeleton_id": …, "slots": …}</code>) auto-route to
+        Paste the JSON array the LLM returns. Entries are v5-shaped
+        (<code>{"skeleton_id": …, "slots": …}</code>) and run via
         <code>reader.py compose-v5</code>; host theme is picked from
         the first skeleton's <code>source_deck</code> unless a plan
         entry sets <code>"theme": "&lt;id&gt;"</code>.
@@ -3601,14 +3590,13 @@ COMPOSE_HTML = r"""<!doctype html>
   </div>
 
 <script>
-const tplFields = ["feel", "suitable_for"];
+const skFields = ["categories"];
 const astFields = ["kind", "tags"];
-const state = { templates: {}, assets: {} };
+const state = { skeletons: {}, assets: {} };
 
 function fieldLabel(f) {
   return ({
-    feel: "feel",
-    suitable_for: "suitable for",
+    categories: "categories",
     kind: "kind",
     tags: "tags",
   })[f] || f;
@@ -3672,20 +3660,22 @@ function renderFilters() {
   const astEl = document.getElementById("astFilters");
   tplEl.innerHTML = "";
   astEl.innerHTML = "";
-  if (state.options.templates.options) {
-    tplFields.forEach((f) => {
-      const vals = state.options.templates.options[f] || [];
-      if (vals.length) buildDimension(tplEl, "templates", f, vals);
+  if (state.options.skeletons && state.options.skeletons.options) {
+    skFields.forEach((f) => {
+      const vals = state.options.skeletons.options[f] || [];
+      if (vals.length) buildDimension(tplEl, "skeletons", f, vals);
     });
   }
-  if (state.options.assets.options) {
+  if (state.options.assets && state.options.assets.options) {
     astFields.forEach((f) => {
       const vals = state.options.assets.options[f] || [];
       if (vals.length) buildDimension(astEl, "assets", f, vals);
     });
   }
+  const skTotal = (state.options.skeletons && state.options.skeletons.total) || 0;
+  const astTotal = (state.options.assets && state.options.assets.total) || 0;
   document.getElementById("kbSummary").textContent =
-    `KB: ${state.options.templates.total} templates · ${state.options.assets.total} assets`;
+    `KB: ${skTotal} skeletons · ${astTotal} assets`;
 }
 
 function toggle(scope, field, value, el, det) {
@@ -3709,15 +3699,15 @@ async function refreshCount() {
   const r = await fetch("/api/compose/preview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filters: { templates: state.templates, assets: state.assets } }),
+    body: JSON.stringify({ filters: { skeletons: state.skeletons, assets: state.assets } }),
   });
   const j = await r.json();
   document.getElementById("countRow").textContent =
-    `matching: ${j.templates} template(s), ${j.assets} asset(s)`;
+    `matching: ${j.skeletons} skeleton(s), ${j.assets} asset(s)`;
 }
 
 function currentFilters() {
-  return { templates: state.templates, assets: state.assets };
+  return { skeletons: state.skeletons, assets: state.assets };
 }
 
 function showMsg(id, text, ok) {
@@ -4542,7 +4532,8 @@ V5_HTML = r"""<!doctype html>
            margin: 0; height: 100vh; display: flex; color: #222; }
 
     .sidebar { width: 280px; border-right: 1px solid #ddd; background: #fafafa;
-               overflow-y: auto; display: flex; flex-direction: column; }
+               display: flex; flex-direction: column; }
+    #skeletons-list { flex: 1; min-height: 0; overflow-y: auto; }
     .sidebar header { padding: 12px 14px; border-bottom: 1px solid #ddd; }
     .sidebar header h1 { font-size: 14px; margin: 0 0 4px; font-weight: 600; }
     .sidebar header .nav { font-size: 11px; color: #666; }
@@ -4567,6 +4558,20 @@ V5_HTML = r"""<!doctype html>
     .pill.done { background: #c8e6c9; color: #1b5e20; }
     .pill.rejected { background: #e0e0e0; color: #555; }
     .warn-dot { color: #d68b00; font-weight: 700; }
+    .item-list .sb-checkbox { margin: 0; flex-shrink: 0; cursor: pointer;
+                              width: 14px; height: 14px; }
+    .bulk-bar { flex-shrink: 0; background: #fff; border-top: 1px solid #ddd;
+                padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+                box-shadow: 0 -2px 8px rgba(0,0,0,0.05); font-size: 12px; }
+    .bulk-bar.hidden { display: none; }
+    .bulk-bar .count { color: #555; font-weight: 600; }
+    .bulk-bar .row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .bulk-bar button { font-size: 11px; padding: 5px 10px; border: 1px solid #ccc;
+                       background: #fff; border-radius: 4px; cursor: pointer; }
+    .bulk-bar button.primary { background: #2e7d32; color: #fff; border-color: #2e7d32; }
+    .bulk-bar button.danger { background: #c62828; color: #fff; border-color: #c62828; }
+    .bulk-bar button.ghost { background: #f5f5f5; }
+    .bulk-bar button:hover { filter: brightness(1.08); }
 
     .preview-area { flex: 1; background: #1c1c1c; display: flex; align-items: center;
                     justify-content: center; padding: 20px; min-width: 0; }
@@ -4699,6 +4704,7 @@ V5_HTML = r"""<!doctype html>
       <div class="nav"><a href="/">describe</a><a href="/compose">compose</a></div>
     </header>
     <div id="skeletons-list"></div>
+    <div id="bulk-bar" class="bulk-bar hidden"></div>
   </aside>
   <main class="preview-area" id="preview-area">
     <div class="preview-empty">
@@ -4718,6 +4724,11 @@ V5_HTML = r"""<!doctype html>
       'page_number', 'footnote', 'caption', 'key_points', 'detailed_list',
       'cta', 'byline', 'kpi_label', 'kpi_value', 'section_header'];
 
+    // Multi-select state survives across loadSkeletons() reloads so a
+    // bulk action followed by the list re-render doesn't drop selection.
+    // We prune stale ids after each reload.
+    const selected = new Set();
+
     async function loadSkeletons() {
       const r = await fetch('/api/v5/skeletons');
       const data = await r.json();
@@ -4726,8 +4737,11 @@ V5_HTML = r"""<!doctype html>
       const decks = Object.keys(data.decks).sort();
       if (decks.length === 0) {
         root.innerHTML = '<div style="padding:14px;color:#888;font-size:12px;line-height:1.5;">No skeletons yet.<br>Run:<br><code style="font-size:11px;">python3 authoring/cli.py ingest your_deck.pptx</code></div>';
+        selected.clear();
+        renderBulkBar();
         return;
       }
+      const allIds = new Set();
       decks.forEach(deck => {
         const group = document.createElement('div');
         group.className = 'deck-group';
@@ -4737,23 +4751,110 @@ V5_HTML = r"""<!doctype html>
         const ul = document.createElement('ul');
         ul.className = 'item-list';
         data.decks[deck].forEach(sk => {
+          allIds.add(sk.id);
           const li = document.createElement('li');
           li.dataset.id = sk.id;
           const cats = (sk.categories || []).join(', ') || '—';
           const warn = sk.has_warnings ? '<span class="warn-dot" title="overlap_detected">⚠</span> ' : '';
+          const checked = selected.has(sk.id) ? 'checked' : '';
           li.innerHTML = `
+            <input type="checkbox" class="sb-checkbox" ${checked} title="select for bulk action">
             <span class="label">
               <span class="top">${warn}slide ${sk.source_slide_index} · ${sk.slot_count} slots</span>
               <span class="cats">${cats}</span>
             </span>
             <span class="pill ${sk.status}">${sk.status}</span>
           `;
+          const cb = li.querySelector('.sb-checkbox');
+          // Stop click on checkbox from bubbling to <li> and triggering selectSkeleton.
+          cb.addEventListener('click', e => e.stopPropagation());
+          cb.addEventListener('change', e => toggleSelect(sk.id, e.target.checked));
           li.onclick = () => selectSkeleton(sk.id);
           ul.appendChild(li);
         });
         group.appendChild(ul);
         root.appendChild(group);
       });
+      // Drop any selected ids that no longer exist (e.g. after a delete).
+      for (const id of Array.from(selected)) {
+        if (!allIds.has(id)) selected.delete(id);
+      }
+      renderBulkBar();
+    }
+
+    function toggleSelect(id, on) {
+      if (on) selected.add(id); else selected.delete(id);
+      renderBulkBar();
+    }
+
+    function clearSelection() {
+      selected.clear();
+      document.querySelectorAll('.sb-checkbox').forEach(cb => { cb.checked = false; });
+      renderBulkBar();
+    }
+
+    function renderBulkBar() {
+      const bar = document.getElementById('bulk-bar');
+      if (!bar) return;
+      if (selected.size === 0) {
+        bar.classList.add('hidden');
+        bar.innerHTML = '';
+        return;
+      }
+      bar.classList.remove('hidden');
+      bar.innerHTML = `
+        <div class="count">${selected.size} selected</div>
+        <div class="row">
+          <button class="primary" onclick="bulkSetStatus('done')">Mark done</button>
+          <button class="danger" onclick="bulkSetStatus('rejected')">Reject</button>
+          <button class="ghost" onclick="clearSelection()">Clear</button>
+        </div>
+      `;
+    }
+
+    async function bulkSetStatus(status) {
+      if (selected.size === 0) return;
+      const ids = Array.from(selected);
+      // Big bulk actions are easy to fat-finger; ask once.
+      if (ids.length >= 5) {
+        const verb = status === 'done' ? 'mark as done' : 'reject';
+        if (!confirm(`${verb} ${ids.length} skeletons?`)) return;
+      }
+      const results = await Promise.all(ids.map(id =>
+        fetch(`/api/v5/skeleton/${encodeURIComponent(id)}/status`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({status})
+        }).then(r => r.ok).catch(() => false)
+      ));
+      const failed = ids.filter((_, i) => !results[i]);
+      if (failed.length) {
+        alert(`Failed for ${failed.length} of ${ids.length}: ${failed.join(', ')}`);
+        // Keep failed ids selected so the user can see + retry.
+        selected.clear();
+        failed.forEach(id => selected.add(id));
+      } else {
+        selected.clear();
+      }
+      await loadSkeletons();
+    }
+
+    // Walk the rendered sidebar in DOM order (= deck × source_slide order)
+    // and return the next still-pending id strictly AFTER currentId, or
+    // null. Forward-only so an intentionally-left-pending earlier slide
+    // isn't surprise-loaded after the user approves a later one.
+    function findNextPending(currentId) {
+      const lis = Array.from(document.querySelectorAll('.item-list li'));
+      const items = lis.map(li => ({
+        id: li.dataset.id,
+        pending: !!li.querySelector('.pill.pending'),
+      }));
+      const startIdx = items.findIndex(i => i.id === currentId);
+      if (startIdx === -1) return null;
+      for (let i = startIdx + 1; i < items.length; i++) {
+        if (items[i].pending) return items[i].id;
+      }
+      return null;
     }
 
     async function selectSkeleton(id) {
@@ -4949,7 +5050,15 @@ V5_HTML = r"""<!doctype html>
         alert('Status update failed: ' + (await r.text()));
         return;
       }
-      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+      await loadSkeletons();
+      // Auto-advance only when moving AWAY from pending. Corrective
+      // actions (back-to-pending, restore) should keep the user on the
+      // current skeleton so they can keep editing it.
+      if (status === 'done' || status === 'rejected') {
+        const nextId = findNextPending(id);
+        if (nextId) { await selectSkeleton(nextId); return; }
+      }
+      await refreshCurrent(id);
     }
 
     async function setOverlapDecision(id, decision) {
@@ -4959,7 +5068,13 @@ V5_HTML = r"""<!doctype html>
         body: JSON.stringify({decision})
       });
       if (!r.ok) { alert('Overlap decision failed: ' + (await r.text())); return; }
-      await Promise.all([loadSkeletons(), refreshCurrent(id)]);
+      await loadSkeletons();
+      // 'reject' decision flips status to rejected — treat like setStatus(reject).
+      if (decision === 'reject') {
+        const nextId = findNextPending(id);
+        if (nextId) { await selectSkeleton(nextId); return; }
+      }
+      await refreshCurrent(id);
     }
 
     async function promoteShape(id, shape_index, kind) {
