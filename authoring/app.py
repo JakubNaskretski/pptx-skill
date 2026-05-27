@@ -239,11 +239,8 @@ def _assets_for_slide(slide_yaml_path: Path) -> list[Path]:
 
 
 SLIDE_DESCRIPTIVE = ("intent", "feel", "suitable_for", "notes", "interpretation")
-ASSET_DESCRIPTIVE = (
-    "kind", "subject", "depicts", "feel", "composition",
-    "colors", "scope", "suitable_for", "notes", "interpretation",
-)
-_LIST_KEYS = {"suitable_for", "colors", "scope"}
+ASSET_DESCRIPTIVE = ("kind", "tags", "description", "notes")
+_LIST_KEYS = {"suitable_for", "tags"}
 
 
 def _descriptive_yaml(data: dict, kind: str) -> str:
@@ -523,15 +520,9 @@ def _bulk_instructions_slide_with_assets(
         '    "assets": {\n'
         '      "asset_abc12345": {\n'
         '        "kind": "photo",\n'
-        '        "subject": "...",\n'
-        '        "depicts": "...",\n'
-        '        "feel": "warm",\n'
-        '        "composition": "centered",\n'
-        '        "colors": ["navy"],\n'
-        '        "scope": ["generic"],\n'
-        '        "suitable_for": ["team"],\n'
-        '        "notes": "",\n'
-        '        "interpretation": ""\n'
+        '        "tags": ["people", "office"],\n'
+        '        "description": "...",\n'
+        '        "notes": ""\n'
         '      }\n'
         '    }\n'
         '  },\n'
@@ -584,15 +575,9 @@ def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
             '{\n'
             '  "01": {\n'
             '    "kind": "photo",\n'
-            '    "subject": "...",\n'
-            '    "depicts": "...",\n'
-            '    "feel": "warm",\n'
-            '    "composition": "centered",\n'
-            '    "colors": ["navy", "white"],\n'
-            '    "scope": ["generic"],\n'
-            '    "suitable_for": ["team"],\n'
-            '    "notes": "",\n'
-            '    "interpretation": ""\n'
+            '    "tags": ["people", "office"],\n'
+            '    "description": "...",\n'
+            '    "notes": ""\n'
             '  },\n'
             '  "02": { "kind": "photo", "...": "same fields" }\n'
             '}\n'
@@ -1060,7 +1045,7 @@ def preview():
 
 FILTER_DIMENSIONS = {
     "templates": ("feel", "suitable_for"),
-    "assets": ("kind", "feel", "composition", "suitable_for", "scope", "colors"),
+    "assets": ("kind", "tags"),
 }
 
 BRAND_PATH = HERE / "brand.md"
@@ -1584,8 +1569,9 @@ def _stage_compose_bundle(staging: Path) -> None:
         stub = {
             "id": aid,
             "kind": entry.get("kind") or "image",
-            "subject": f"User-supplied {entry.get('kind') or 'asset'} "
-                       f"({entry.get('filename') or '?'})",
+            "tags": [],
+            "description": f"User-supplied {entry.get('kind') or 'asset'} "
+                           f"({entry.get('filename') or '?'})",
             "sources": [],
         }
         (ast_dir / f"{aid}.yaml").write_text(
@@ -1678,7 +1664,15 @@ def api_compose_text():
 
 @app.get("/api/vocab")
 def api_vocab():
-    return jsonify(cli_mod.VOCAB)
+    # Ship the controlled vocab + the editable workspace tag vocabulary
+    # in one payload so the describe UI can render tag chips without a
+    # second round-trip. Build a fresh asset dict so we don't mutate
+    # the module-level VOCAB by adding `tags` to it on every request.
+    payload = dict(cli_mod.VOCAB)
+    asset_vocab = dict(cli_mod.VOCAB.get("asset", {}))
+    asset_vocab["tags"] = cli_mod.load_tag_vocab()
+    payload["asset"] = asset_vocab
+    return jsonify(payload)
 
 
 @app.get("/api/compose/brand")
@@ -2147,7 +2141,7 @@ def _stage_compose_v5_bundle(staging: Path) -> None:
                 encoding="utf-8",
             )
             asset_summary.append({"id": aid, "kind": ad.get("kind"),
-                                  "subject": ad.get("subject", "")})
+                                  "description": ad.get("description", "")})
 
     # User-supplied assets from the last bundle generation — mirror
     # _stage_compose_bundle so v5 plans referencing user assets work too.
@@ -2164,8 +2158,9 @@ def _stage_compose_v5_bundle(staging: Path) -> None:
         stub = {
             "id": aid,
             "kind": entry.get("kind") or "image",
-            "subject": f"User-supplied {entry.get('kind') or 'asset'} "
-                       f"({entry.get('filename') or '?'})",
+            "tags": [],
+            "description": f"User-supplied {entry.get('kind') or 'asset'} "
+                           f"({entry.get('filename') or '?'})",
             "sources": [],
         }
         (ast_dir / f"{aid}.yaml").write_text(
@@ -2674,7 +2669,7 @@ INDEX_HTML = r"""<!doctype html>
              style="display:none;" />
       <button id="addAssetBtn" type="button">+ Add asset</button>
       <span class="ingest-msg" id="addAssetMsg"
-            title="Upload a single image / SVG / XML fragment. It lands as a pending asset YAML — describe it next to fill kind/feel/subject from the controlled vocab.">
+            title="Upload a single image / SVG / XML fragment. It lands as a pending asset YAML — describe it next to fill kind / tags / description.">
         Register a single image without a full deck ingest
       </span>
     </div>
@@ -2742,7 +2737,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="ghost" id="batchRefreshBtn">↻</button>
         <span id="batchTargetLabel" style="color:#888;font-size:12px;"></span>
       </div>
-      <textarea id="batchYaml" placeholder='{&#10;  "01": { "kind": "photo", "subject": "..." },&#10;  "02": { ... }&#10;}'></textarea>
+      <textarea id="batchYaml" placeholder='{&#10;  "01": { "kind": "photo", "tags": ["people"], "description": "..." },&#10;  "02": { ... }&#10;}'></textarea>
       <div class="btnrow" style="margin-top:10px;">
         <button class="primary" id="batchApplyBtn">Apply batch</button>
       </div>
@@ -2792,8 +2787,6 @@ INDEX_HTML = r"""<!doctype html>
 let SLIDE_FEEL = [];
 let SLIDE_TAGS = [];
 let ASSET_KIND = [];
-let ASSET_FEEL = [];
-let ASSET_COMP = [];
 let ASSET_TAGS = [];
 
 async function loadVocab() {
@@ -2803,9 +2796,7 @@ async function loadVocab() {
   SLIDE_FEEL = v.slide.feel;
   SLIDE_TAGS = v.slide.suitable_for;
   ASSET_KIND = v.asset.kind;
-  ASSET_FEEL = v.asset.feel;
-  ASSET_COMP = v.asset.composition;
-  ASSET_TAGS = v.asset.suitable_for;
+  ASSET_TAGS = v.asset.tags || [];
 }
 
 let activeTab = "assets";  // v5: slide tab hidden; describe page owns assets only
@@ -2900,17 +2891,10 @@ function buildForm(item) {
       "model's speculative observations — info only, not filterable");
   } else {
     addSelect(f, "kind", d.kind || "", ASSET_KIND);
-    addText(f, "subject", d.subject || "", "neutral, <25 words");
-    addText(f, "depicts", d.depicts || "", "the concept — 1-5 words; empty for decorative");
-    addSelect(f, "feel", d.feel || "", ASSET_FEEL);
-    addSelect(f, "composition", d.composition || "", ASSET_COMP);
-    addText(f, "colors", (d.colors || []).join(", "), "1-3 words, comma-separated");
-    addText(f, "scope", (d.scope || []).join(", "),
-      "comma-separated; e.g. 'client:acme-bank, industry:finance' or 'generic'");
-    addChips(f, "suitable_for", d.suitable_for || [], ASSET_TAGS);
+    addChips(f, "tags", d.tags || [], ASSET_TAGS);
+    addText(f, "description", d.description || "",
+      "one short sentence, <25 words, what is literally visible");
     addTextarea(f, "notes", d.notes || "", "human reviewer note");
-    addTextarea(f, "interpretation", d.interpretation || "",
-      "model's speculative observations — info only, not filterable");
   }
   document.getElementById("msg").innerHTML = "";
 }
@@ -2958,17 +2942,9 @@ function gatherForm() {
     out.interpretation = document.getElementById("interpretation").value.trim();
   } else {
     out.kind = document.getElementById("kind").value;
-    out.subject = document.getElementById("subject").value.trim();
-    out.depicts = document.getElementById("depicts").value.trim();
-    out.feel = document.getElementById("feel").value;
-    out.composition = document.getElementById("composition").value;
-    out.colors = document.getElementById("colors").value
-      .split(",").map(s => s.trim()).filter(Boolean);
-    out.scope = document.getElementById("scope").value
-      .split(",").map(s => s.trim()).filter(Boolean);
-    out.suitable_for = chipValues("suitable_for");
+    out.tags = chipValues("tags");
+    out.description = document.getElementById("description").value.trim();
     out.notes = document.getElementById("notes").value.trim();
-    out.interpretation = document.getElementById("interpretation").value.trim();
   }
   return out;
 }
@@ -3626,7 +3602,7 @@ COMPOSE_HTML = r"""<!doctype html>
 
 <script>
 const tplFields = ["feel", "suitable_for"];
-const astFields = ["kind", "feel", "composition", "suitable_for", "scope", "colors"];
+const astFields = ["kind", "tags"];
 const state = { templates: {}, assets: {} };
 
 function fieldLabel(f) {
@@ -3634,9 +3610,7 @@ function fieldLabel(f) {
     feel: "feel",
     suitable_for: "suitable for",
     kind: "kind",
-    composition: "composition",
-    scope: "scope",
-    colors: "colors",
+    tags: "tags",
   })[f] || f;
 }
 

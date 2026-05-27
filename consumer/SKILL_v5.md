@@ -102,7 +102,7 @@ yourself — call these instead:
 ```bash
 python reader.py measure-text "Q4 results" --against deckA_03.title
 python reader.py check-asset-fit asset_a1b2 deckA_03 hero
-python reader.py find-asset --kind photo --feel warm --suitable-for team
+python reader.py find-asset --kind photo --tags people --tags office
 ```
 
 `measure-text` returns `{chars, words, lines_est}` and, with
@@ -114,32 +114,41 @@ deterministic shortlist — see "Picking images" below.
 ## Picking images
 
 For every image slot, **call `find-asset` first** — do not scan
-`index.json` and pick by free-text fields. The shortlist is filtered
-purely on controlled-vocab tags (`kind`, `feel`, `composition`,
-`suitable_for`, `scope`, `colors`), so two runs against the same
-library produce the same candidates. Use `subject` / `depicts` only
-to break ties among the returned shortlist.
+`index.json` and pick by `description` text. The shortlist is filtered
+purely on `kind` (required) and `tags` (optional, AND-matched against
+a closed workspace vocabulary), so two runs with the same query
+produce the same candidates in the same order.
+
+The valid tag list ships in `index.json` under `tag_vocab` (and is
+echoed on every `find-asset` response). Don't invent tags — anything
+outside that list cannot match.
 
 ```bash
 python reader.py find-asset \
   --kind photo \
-  --feel warm \
-  --suitable-for team \
+  --tags people --tags office \
   --limit 5
 ```
 
+Each match carries `description` (the one-line summary), `tags`,
+mechanical dimensions (`width`, `height`, `aspect`), and `colors_hex`.
+Use `description` to pick the final 1-of-N by topic fit; use the
+dimensions if you want to pre-filter the shortlist for aspect-friendly
+candidates (or just defer to `check-asset-fit`).
+
 Algorithm:
 
-1. Call `find-asset` with the slot's required `kind` plus the deck's
-   `feel` and the slot's intent (`suitable_for`).
-2. If `matches: []`, drop the constraint named in `suggestion` and
-   retry (broaden order: `--colors`, `--composition`, `--scope`,
-   `--suitable-for`, `--feel`).
-3. From the surviving shortlist, pick one whose `subject` / `depicts`
-   fits the slide topic.
-4. If you exhaust the broadening order and the slot is **not**
-   required, omit the slot from the plan — the build skips it.
-5. If the slot IS required and nothing fits, choose one:
+1. Call `find-asset` with the slot's required `kind` plus 1–3
+   `--tags` that name what should be in the picture (people, office,
+   chart, etc. — read `tag_vocab` for the live list).
+2. If `matches: []`, retry without `--tags` (one broadening step).
+   If still empty, jump to step 4.
+3. From the surviving shortlist, pick by `description` fit to the
+   slide topic. Optionally run `check-asset-fit` against the slot to
+   filter out aspect-incompatible candidates.
+4. If nothing fits and the slot is **not** required, omit it — the
+   build skips the slot.
+5. If the slot IS required and nothing fits:
    - **External source.** Use your own web tools to find an image,
      `POST /api/asset/add` with the file, get back an `asset_id`,
      and use it in the plan. Re-running `find-asset` after the upload
@@ -151,11 +160,9 @@ Algorithm:
      `{"placeholder": true, "label": "Customer logo here"}` for a
      custom hint label.
 
-Don't pick assets by reading `index.json` directly — the free-text
-fields drift between describe passes, so a vibes-based pick gives
-different results on different runs. `find-asset` is the idempotent
-selector; reserve free-text reading for tiebreaks among ≤5 already-
-vetted candidates.
+Don't pick assets by reading `index.json` directly past `find-asset`'s
+shortlist. The deterministic selector is the only place that's
+guaranteed idempotent.
 
 ## Categories
 
@@ -195,8 +202,8 @@ skeletons/<id>/
   skeleton.yaml                 slots, geometry, style, constraints, categories
   preview.png                   source-slide thumbnail (optional)
   background.png                frozen underlay (optional; freeze-as-background skeletons)
-assets/<id>.<ext>               raster / SVG asset binaries
-assets/<id>.yaml                asset descriptions (subject, depicts, feel, colors)
+assets/<id>.<ext>               raster / SVG / XML asset binaries
+assets/<id>.yaml                asset descriptions (kind, tags, description, dimensions)
 ```
 
 No network. No state. No vision required at compose time.

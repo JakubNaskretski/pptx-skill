@@ -1,0 +1,87 @@
+id: standard_templates_08
+source_deck: standard_templates
+source_slide_index: 8
+status: pending
+categories:
+- data
+preview: preview.png
+background_image: null
+slots:
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.0467
+    w: 0.9248
+    h: 0.0933
+  style:
+    font_role: major
+    size_pt: 28.0
+    bold: true
+    color: '#222A35'
+  constraints:
+    max_chars: 51
+    max_lines: 1
+    required: true
+  source_excerpt: Headcount Plan — Next Two Quarters
+  shape_id: 2
+  role: page_title
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.1933
+    w: 0.435
+    h: 0.6933
+  style:
+    font_role: major
+    size_pt: 15.0
+    color: '#222A35'
+  constraints:
+    max_chars: 379
+    max_lines: 1
+    required: true
+  source_excerpt: The plan front-loads engineering hiring to support the Q1 roadmap, then opens G…
+  shape_id: 4
+  role: body
+- id: data_table
+  kind: table
+  geometry:
+    x: 0.5025
+    y: 0.1933
+    w: 0.4598
+    h: 0.6933
+  constraints:
+    max_rows: 5
+    max_cols: 3
+    has_header: true
+    required: true
+  source_excerpt: 5×3 table (header row)
+  shape_id: 5
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    color: '#6B7382'
+  constraints:
+    max_chars: 45
+    max_lines: 1
+    required: false
+  source_excerpt: Template 8 · paragraph + table
+  shape_id: 6
+  role: footnote
+unmapped_shapes:
+- shape_id: 3
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.144
+    w: 0.0525
+    h: 0.0042
+  skipped_reason: 'conscious-drop: freeform / auto-shape'

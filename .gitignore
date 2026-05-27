@@ -1,9 +1,24 @@
-# Authoring working state — transient, regenerated from source decks
+# Authoring working state — transient, regenerated from source decks.
+# Two exceptions: the workspace tag vocab seed, and the predigested
+# example *skeletons* so the agent has a layout vocabulary on a
+# fresh clone. Themes/decks/assets stay per-user and gitignored.
 authoring/workspace/*
 !authoring/workspace/.gitkeep
+!authoring/workspace/tag_vocab.yaml
 
-# Source decks (often sensitive client material) — never tracked
+!authoring/workspace/skeletons/
+authoring/workspace/skeletons/*
+!authoring/workspace/skeletons/standard_templates_*/
+!authoring/workspace/skeletons/standard_templates_*/**
+!authoring/workspace/skeletons/title_and_breaks_*/
+!authoring/workspace/skeletons/title_and_breaks_*/**
+
+# Source decks (often sensitive client material) — never tracked,
+# except the canonical example deck binaries under examples/ so a
+# fresh clone has them on hand to ingest if/when the user wants
+# matching themes/assets in their workspace.
 *.pptx
+!examples/*.pptx
 
 # Built consumer artifacts
 authoring/dist/

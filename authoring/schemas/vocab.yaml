@@ -1,16 +1,12 @@
 # Controlled vocabulary — single source of truth.
 #
-# Anything that enumerates `feel` / `suitable_for` / `kind` /
-# `composition` should read from this file:
-#   - authoring/cli.py            loads at import time
-#   - authoring/app.py            exposes via /api/vocab to the UI
-#   - authoring/prompts/*.md      human-edited; validate checks drift
-#   - consumer/SKILL.md           hand-maintained mirror; keep in sync
-#
-# Slide-feel and asset-feel are deliberately DIFFERENT sets. Slides
-# don't get `playful`/`minimal`/`dramatic`; assets don't get
-# `data-dense`/`celebratory`. Do not merge them — an agent filtering
-# `feel=playful` on slides will silently return zero results.
+# Slide enums are unchanged. The asset side keeps only `kind` here:
+# tag classification for assets is workspace-managed and lives in
+# `authoring/workspace/tag_vocab.yaml` so the user can add or remove
+# tags without editing source schemas. Everything else that used to
+# describe an asset (feel / composition / suitable_for / scope /
+# colors-as-words) has been dropped in favor of a single short
+# `description` field plus mechanical dimension metadata.
 
 slide:
   feel:
@@ -32,49 +28,17 @@ slide:
 
 asset:
   kind:
-    # Raster pictures (v1+)
+    # Raster pictures
     - photo
     - icon
     - logo
     - illustration
     - screenshot
-    # Vector picture (v4) — SVG/EMF, recolourable
+    # Vector picture — SVG/EMF, recolourable
     - vector
-    # Structured atoms (v4) — addressable via compose-mode plans
+    # Structured atoms — addressable via compose-mode plans
     - table
     - chart
     - callout
     - freeform
     - smartart
-  feel:
-    - formal
-    - warm
-    - clinical
-    - punchy
-    - playful
-    - minimal
-    - dramatic
-  composition:
-    - centered
-    - left-weighted
-    - right-weighted
-    - full-bleed
-    - top-heavy
-    - scattered
-  suitable_for:
-    - team
-    - hero
-    - product
-    - data
-    - culture
-    - event
-    - abstract
-    - decorative
-    - closing
-    - quote
-  scope_prefixes:
-    - client
-    - industry
-    - product
-    - program
-    - topic

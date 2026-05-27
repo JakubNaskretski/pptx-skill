@@ -1,0 +1,75 @@
+id: title_and_breaks_03
+source_deck: title_and_breaks
+source_slide_index: 3
+status: pending
+categories:
+- content
+preview: preview.png
+background_image: null
+slots:
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.0875
+    y: 0.32
+    w: 0.825
+    h: 0.06
+  style:
+    font_role: major
+    size_pt: 14.0
+    bold: true
+    alignment: center
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: PART TWO
+  shape_id: 2
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0875
+    y: 0.4067
+    w: 0.825
+    h: 0.24
+  style:
+    font_role: major
+    size_pt: 60.0
+    bold: true
+    alignment: center
+    color: '#222A35'
+  constraints:
+    max_chars: 33
+    max_lines: 1
+    required: true
+  source_excerpt: What changed this year
+  shape_id: 3
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 52
+    max_lines: 1
+    required: false
+  source_excerpt: Template · section break (big text)
+  shape_id: 5
+  role: footnote
+unmapped_shapes:
+- shape_id: 4
+  kind_hint: auto_shape
+  geometry:
+    x: 0.4475
+    y: 0.6467
+    w: 0.105
+    h: 0.0042
+  skipped_reason: 'conscious-drop: freeform / auto-shape'

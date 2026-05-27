@@ -1,0 +1,273 @@
+id: title_and_breaks_02
+source_deck: title_and_breaks
+source_slide_index: 2
+status: pending
+categories:
+- content
+preview: preview.png
+background_image: null
+slots:
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.0733
+    w: 0.9248
+    h: 0.0933
+  style:
+    font_role: major
+    size_pt: 32.0
+    bold: true
+    color: '#222A35'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: Agenda
+  shape_id: 2
+  role: page_title
+- id: heading_2
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.26
+    w: 0.12
+    h: 0.1133
+  style:
+    font_role: major
+    size_pt: 40.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: '01'
+  shape_id: 4
+  role: kpi_value
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.15
+    y: 0.284
+    w: 0.7875
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: Where we are
+  shape_id: 5
+- id: heading_3
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.3867
+    w: 0.12
+    h: 0.1133
+  style:
+    font_role: major
+    size_pt: 40.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: '02'
+  shape_id: 7
+  role: kpi_value
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.15
+    y: 0.4107
+    w: 0.7875
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 33
+    max_lines: 1
+    required: true
+  source_excerpt: What changed this year
+  shape_id: 8
+- id: heading_4
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.5133
+    w: 0.12
+    h: 0.1133
+  style:
+    font_role: major
+    size_pt: 40.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: '03'
+  shape_id: 10
+  role: kpi_value
+- id: body_3
+  kind: paragraph
+  geometry:
+    x: 0.15
+    y: 0.5373
+    w: 0.7875
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 28
+    max_lines: 1
+    required: true
+  source_excerpt: The product roadmap
+  shape_id: 11
+- id: heading_5
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.64
+    w: 0.12
+    h: 0.1133
+  style:
+    font_role: major
+    size_pt: 40.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: '04'
+  shape_id: 13
+  role: kpi_value
+- id: body_4
+  kind: paragraph
+  geometry:
+    x: 0.15
+    y: 0.664
+    w: 0.7875
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 31
+    max_lines: 1
+    required: true
+  source_excerpt: Investment priorities
+  shape_id: 14
+- id: heading_6
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.7667
+    w: 0.12
+    h: 0.1133
+  style:
+    font_role: major
+    size_pt: 40.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: false
+  source_excerpt: '05'
+  shape_id: 16
+  role: kpi_value
+- id: body_5
+  kind: paragraph
+  geometry:
+    x: 0.15
+    y: 0.7907
+    w: 0.7875
+    h: 0.08
+  style:
+    font_role: major
+    size_pt: 22.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: Next 90 days
+  shape_id: 17
+- id: body_6
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 34
+    max_lines: 1
+    required: false
+  source_excerpt: Template · agenda / TOC
+  shape_id: 18
+  role: footnote
+unmapped_shapes:
+- shape_id: 3
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.1667
+    w: 0.0525
+    h: 0.0042
+  skipped_reason: 'conscious-drop: freeform / auto-shape'
+- shape_id: 6
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.38
+    w: 0.9248
+    h: 0.0014
+  skipped_reason: 'conscious-drop: freeform / auto-shape'
+- shape_id: 9
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.5067
+    w: 0.9248
+    h: 0.0014
+  skipped_reason: 'conscious-drop: freeform / auto-shape'
+- shape_id: 12
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.6333
+    w: 0.9248
+    h: 0.0014
+  skipped_reason: 'conscious-drop: freeform / auto-shape'
+- shape_id: 15
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.76
+    w: 0.9248
+    h: 0.0014
+  skipped_reason: 'conscious-drop: freeform / auto-shape'

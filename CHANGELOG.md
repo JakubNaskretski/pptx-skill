@@ -1,6 +1,112 @@
 # Changelog
 
-## Unreleased — idempotent asset selection + single-asset ingest
+## Unreleased — slim asset schema + workspace tag vocab
+
+### Why
+
+The describe-time soft fields (`feel`, `composition`, `suitable_for`,
+`scope`, `colors`-as-words, `subject`, `depicts`, `interpretation`)
+drifted across vision-LLM passes and made `find-asset` queries hard
+to reason about. Six filter dimensions for ~40 assets was overkill.
+
+This pass cuts the agent-facing surface to **kind + tags +
+description**, moves all visual dimension math onto mechanical fields
+(`width`, `height`, `aspect`) the engine reads through
+`check-asset-fit`, and lets the user curate the tag list at runtime
+without editing source schemas.
+
+### Schema (`authoring/schemas/`)
+
+- **`asset.yaml`** rewritten. Dropped: `subject`, `depicts`, `feel`,
+  `composition`, `colors` (word list), `scope`, `suitable_for`,
+  `interpretation`. Added: `tags[]`, `description`, `width`,
+  `height`, `aspect`. Kept: `kind`, `colors_hex`, `recolor_targets`,
+  kind-specific blocks (`table` / `chart` / `shape` / `smartart`),
+  `id` / `sha1` / `sources`, `status`, `notes`.
+- **`vocab.yaml`** asset section trimmed to `kind` only. Slide vocab
+  is unchanged.
+- **`workspace/tag_vocab.yaml`** — new file, ships with a 14-tag seed
+  list (`people`, `office`, `laptop`, `device`, `screen`, `hands`,
+  `document`, `chart`, `logo`, `abstract`, `outdoor`, `nature`,
+  `city`, `workplace`). User-editable; the validator enforces that
+  every tag on every sidecar exists in this file.
+
+### Authoring (`authoring/`)
+
+- **`cli.py migrate-asset-yaml`** — new command. Strips dropped
+  fields, folds `subject` (or `depicts` if `subject` is empty) into
+  `description` only when `description` is empty, seeds `tags: []`,
+  fills `width`/`height`/`aspect` from the binary. Idempotent; default
+  is `--dry-run`; `--apply` writes a backup to
+  `workspace/_migration_backup/<timestamp>/` before mutating.
+- **`cli.py tag-vocab`** — new command group. `list` prints the
+  current vocab; `add <tag>` appends a new tag; `remove <tag>` removes
+  one and rewrites any sidecar using it. Removal of an in-use tag
+  requires `--replace-with <other>` so no asset is left orphaned.
+- **`cli.py redescribe <asset_id>`** / `--all` — new command. Marks
+  an asset (or every asset) pending and clears `tags`. **Preserves
+  `description`** so existing prose survives the round-trip. Use to
+  feed the slim-shape describer over your existing library without
+  re-ingesting.
+- **`cli.py validate`** — rewired. Asset checks now: `kind` in
+  enum, `tags` is a non-empty list of ≤4 entries each present in
+  `tag_vocab.yaml`, `description` non-empty and ≤30 words
+  (recommended ≤25).
+- **`cli.py add-asset`** — unchanged externally. Internally writes
+  the new slim sidecar shape, with `width`/`height`/`aspect` computed
+  from the binary at ingest time.
+- **`cli.py build-v5`** — asset records in `index.json` now ship the
+  new shape; the bundle also carries a top-level `tag_vocab` array so
+  the consuming agent can read the live vocabulary without poking
+  workspace state.
+- **`prompts/describe_asset.md`** — rewritten for the slim shape.
+  Inlines the current tag vocabulary so the vision LLM has the closed
+  list in front of it. The prompt is ~⅓ its previous length.
+
+### Consumer (`consumer/`)
+
+- **`reader.py find-asset`** — argument surface cut from six
+  optional filters to one: `--kind` (required) and `--tags`
+  (repeatable; AND-matched). Broadening reduces to a single step:
+  drop `--tags` and retry. Response payload now ships
+  `description`, `tags`, mechanical dimensions, and `colors_hex`
+  per match, plus the shared `tag_vocab` for reference.
+- **`reader.py check-asset-fit`** — unchanged externally; now reads
+  the mechanical `width`/`height` straight off the sidecar, instead
+  of relying on optional `dimensions` nested under the legacy shape.
+- **`SKILL_v5.md`** — "Picking images" rewritten for the new
+  algorithm. Bundle-layout footer updated.
+
+### Migration
+
+For an existing workspace with described assets:
+
+```bash
+python3 authoring/cli.py migrate-asset-yaml         # dry-run first
+python3 authoring/cli.py migrate-asset-yaml --apply # writes; backs up
+python3 authoring/cli.py validate                   # confirms slim shape
+python3 authoring/cli.py build-v5                   # rebuild bundle
+```
+
+Migrated sidecars land with `tags: []` and `status: pending` — the
+old `feel/composition/scope/...` fields don't map cleanly onto the
+new closed `tag_vocab`, so re-curation is intentional. `validate`
+will flag them as incomplete until a re-tagging pass (manual or via
+`redescribe` + the describer prompt).
+
+To re-describe existing assets against the new tag list without
+losing the migrated `description`:
+
+```bash
+python3 authoring/cli.py redescribe --all
+python3 authoring/cli.py next --kind asset --open   # walk the queue
+# or use the web app's describe page
+```
+
+The migration never overwrites a non-empty `description`. Old
+`subject` content is folded in only when `description` is empty.
+
+## Earlier unreleased — idempotent asset selection + single-asset ingest
 
 Branch: `claude/pptx-pr-review-57WHk` (rebased onto current `main`,
 which already includes `cli.py remove-deck` — see "Interaction with

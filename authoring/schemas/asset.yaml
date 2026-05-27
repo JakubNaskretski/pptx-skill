@@ -5,87 +5,69 @@
 # purely by reading these fields. Optimize for retrieval, not
 # captioning. Use neutral, literal language.
 
-# --- Required descriptive fields ---
+# --- Identity (auto, do not hand-edit) --------------------------------------
 
-# What kind of atom this is. The `kind` controls which kind-specific
-# fields (table:, chart:, shape:, smartart:) apply.
-#
-# Raster pictures (existing):
+# Filled on ingest, e.g. "asset_3e58c8f9".
+id: ""
+
+# Binary content hash; matches the sidecar filename stem.
+sha1: ""
+
+# Which deck/slide(s) this atom came from. Manual uploads carry an
+# `external: manual-upload` entry instead of `deck`/`slide`.
+sources:
+  - deck: ""
+    slide: 0
+
+# --- Type (mechanical at ingest; validated against asset.kind enum) ---------
+
+# Raster pictures:
 #   photo | icon | logo | illustration | screenshot
-# Vector picture (NEW v4):
+# Vector picture:
 #   vector      — SVG or EMF; DPI-independent, recolourable
-# Structured atoms (NEW v4):
+# Structured atoms:
 #   table       — has cell data + style fragment
 #   chart       — has series data + chart XML fragment
 #   callout     — has shape XML fragment + bounding geometry
 #   freeform    — has custom path XML
 #   smartart    — has layout + node text + fragment XML
-#
-# kind is set by ingest. Hand-editing it changes how compose treats
-# the atom — only do so if ingest mis-classified.
 kind: ""
 
-# What is literally visible. One neutral sentence, under 25 words.
-# Bad:  "A team celebrating a successful Q4 launch."
-# Good: "Four people standing around a laptop in an open office."
-subject: ""
+# --- Mechanical visual (auto from binary) -----------------------------------
 
-# The concept this atom is ABOUT — what THING it represents.
-# Most important field for retrieval beyond visual matching.
-# 1-5 words. Leave empty only if purely decorative.
-depicts: ""
+# Pixel dimensions of the binary. For SVG, derived from the viewBox
+# when present, otherwise 0. Powers `check-asset-fit` math; never
+# used as a categorical filter.
+width: 0
+height: 0
+aspect: 0.0           # width / height as a float (16:9 → 1.778)
 
-# Mood / visual style. Pick from the enum:
-#   formal | warm | clinical | punchy | playful | minimal | dramatic
-feel: ""
-
-# Where the focal subject sits in the frame. Pick from the enum:
-#   centered | left-weighted | right-weighted | full-bleed |
-#   top-heavy | scattered
-#
-# REQUIRED for picture kinds (photo/icon/logo/illustration/
-# screenshot/vector). Optional for structured atoms
-# (table/chart/callout/freeform/smartart) — leave empty.
-composition: ""
-
-# 1-3 dominant colors as plain words.
-# Example: [warm white, navy]
-colors: []
-
-# Actual hex codes extracted from binary or XML at ingest. Used by
-# the compose engine for recolouring (when the plan supplies a
-# recolour map). Auto-populated by Phase B ingest; pre-v4 atoms
-# leave empty.
+# Hex codes extracted from binary or XML at ingest. Used by the
+# compose engine for recolouring (when the plan supplies a recolour
+# map). For SVGs: every unique fill/stroke colour. For rasters: the
+# top dominant colours by frequency.
 colors_hex: []        # ["#0A2540", "#F26B38"]
 
-# Where this asset is reusable. List of namespaced tokens telling
-# the downstream agent WHEN this asset is appropriate.
-#
-# Recognized prefixes:
-#   generic                    — bare token; usable in any deck
-#   client:<slug>              — tied to a specific client/account
-#   industry:<slug>            — tied to a sector
-#   product:<slug>             — tied to a specific product/offering
-#   program:<slug>             — tied to an internal program/initiative
-#   topic:<slug>               — tied to a topic
-#
-# Required: at least one entry. If unsure, use [generic].
-scope: []
+# Subset of colors_hex that the compose engine knows how to find and
+# rewrite inside SVG/EMF source. Only set for kind: vector.
+recolor_targets: []   # ["#0A2540", "#F26B38"]
 
-# Slide-content types this asset is appropriate for. 1-4 tags from:
-#   team | hero | product | data | culture | event | abstract |
-#   decorative | closing | quote
-suitable_for: []
+# --- Soft description (vision LLM or human) ---------------------------------
 
-# --- Kind-specific fields (v4, auto-populated by Phase B ingest) ---
+# 1-4 tags from the workspace tag vocabulary
+# (authoring/workspace/tag_vocab.yaml). The vocab is editable via
+# `cli.py tag-vocab` and the web UI.
+tags: []              # [people, office, laptop]
+
+# One short sentence describing what is literally visible. Under
+# 25 words; neutral, factual. Used only for tiebreaks among the
+# `find-asset` shortlist — never a filter input.
+description: ""
+
+# --- Kind-specific structural blocks (auto-populated by Phase B ingest) -----
 #
 # Only the block matching this atom's `kind` is relevant. Others
 # stay empty / are omitted.
-
-# For kind: vector — hex colors that can be remapped at compose time.
-# Subset of colors_hex that the engine knows how to find + rewrite
-# inside the SVG/EMF (e.g. fill / stroke colours in the source).
-recolor_targets: []   # ["#0A2540", "#F26B38"]
 
 # For kind: table
 table:
@@ -112,9 +94,9 @@ smartart:
   layout: ""          # which SmartArt layout (e.g. "process", "hierarchy")
   nodes: []           # text from each node, in reading order
 
-# --- Workflow / optional ---
+# --- Workflow / optional ----------------------------------------------------
 
-# pending  → not yet described
+# pending  → not yet described (tags + description empty)
 # done     → all required fields filled, auto-set by `validate`
 # locked   → frozen against re-ingest changes
 status: pending
@@ -122,21 +104,3 @@ status: pending
 # Free-form reviewer notes — anything that doesn't fit the structured
 # fields. Ignored by the consumer agent's filter logic.
 notes: ""
-
-# Model's speculative observations — soft hunches, plausible-but-
-# uncertain identifications, era guesses, historical / cultural
-# references, things the describing model noticed but isn't willing
-# to assert in `subject`/`depicts`/etc. (e.g. "might be Einstein —
-# 1920s portrait, chalkboard with relativity equations visible").
-# Visible to the consuming agent as INFORMATIONAL context — never a
-# filter target, never used by the engine for any policy decision.
-# Distinct from `notes` (human reviewer free-form).
-interpretation: ""
-
-# --- Auto-populated structural fields (do not hand-edit) ---
-
-id: ""               # filled on ingest
-sha1: ""             # binary hash
-sources:             # which deck/slide(s) this atom came from
-  - deck: ""
-    slide: 0

@@ -1,0 +1,143 @@
+id: standard_templates_10
+source_deck: standard_templates
+source_slide_index: 10
+status: pending
+categories:
+- data
+preview: preview.png
+background_image: null
+slots:
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.0467
+    w: 0.9248
+    h: 0.0933
+  style:
+    font_role: major
+    size_pt: 28.0
+    bold: true
+    color: '#222A35'
+  constraints:
+    max_chars: 21
+    max_lines: 1
+    required: true
+  source_excerpt: By the Numbers
+  shape_id: 2
+  role: page_title
+- id: heading_2
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.2267
+    w: 0.435
+    h: 0.1467
+  style:
+    font_role: major
+    size_pt: 56.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: +38%
+  shape_id: 4
+  role: kpi_value
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.3733
+    w: 0.435
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 14.0
+    color: '#6B7382'
+  constraints:
+    max_chars: 43
+    max_lines: 1
+    required: false
+  source_excerpt: Year-over-year revenue growth
+  shape_id: 5
+  role: kpi_label
+- id: heading_3
+  kind: heading
+  geometry:
+    x: 0.0375
+    y: 0.5067
+    w: 0.435
+    h: 0.1467
+  style:
+    font_role: major
+    size_pt: 56.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: 4.7 / 5
+  shape_id: 6
+  role: kpi_value
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.6533
+    w: 0.435
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 14.0
+    color: '#6B7382'
+  constraints:
+    max_chars: 40
+    max_lines: 1
+    required: false
+  source_excerpt: Customer satisfaction score
+  shape_id: 7
+  role: kpi_label
+- id: data_chart
+  kind: chart
+  geometry:
+    x: 0.5025
+    y: 0.1933
+    w: 0.4598
+    h: 0.6933
+  constraints:
+    chart_type: column_clustered
+    max_series: 1
+    max_categories: 4
+    required: true
+  source_excerpt: column_clustered chart, 1 series × 4 cats
+  shape_id: 8
+- id: body_3
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    color: '#6B7382'
+  constraints:
+    max_chars: 57
+    max_lines: 1
+    required: false
+  source_excerpt: Template 10 · KPI stats + column chart
+  shape_id: 9
+  role: footnote
+unmapped_shapes:
+- shape_id: 3
+  kind_hint: auto_shape
+  geometry:
+    x: 0.0375
+    y: 0.144
+    w: 0.0525
+    h: 0.0042
+  skipped_reason: 'conscious-drop: freeform / auto-shape'

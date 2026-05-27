@@ -1,11 +1,41 @@
-# Standard templates deck
+# Example decks
 
-Ten neutral-brand 16:9 layouts to feed the ingest pipeline, so the
-agent has a known shape vocabulary to compose against. Each slide
-has the same backbone: header at top, text or bullets on the left,
-chart / image / table on the right.
+Two neutral-brand 16:9 builder scripts that emit ready-to-ingest
+`.pptx` files. Together they cover the structural slides every deck
+needs (cover / agenda / dividers / quote / closing) plus the content
+slides that fill in between (header + text + chart/image/table).
 
-## Layouts
+The compiled `.pptx` outputs ship in this directory, and the
+predigested **skeletons** (the slot/geometry/style definitions for
+each example slide) ship under
+`authoring/workspace/skeletons/standard_templates_*` and
+`authoring/workspace/skeletons/title_and_breaks_*` so the agent has a
+ready layout vocabulary on a fresh clone — no `cli.py ingest` step
+required for that.
+
+Themes, assets, and per-deck artifacts are **not** committed. Bring
+your own theme + asset library; `--theme` against your theme when you
+compose, and `find-asset` will draw from your assets. If you want the
+example decks' themes locally, run `cli.py ingest` on the `.pptx`
+files in this directory.
+
+To regenerate the skeletons after editing a builder:
+
+```bash
+python3 examples/build_standard_templates.py
+python3 examples/build_title_and_breaks.py
+python3 authoring/cli.py remove-deck standard_templates
+python3 authoring/cli.py remove-deck title_and_breaks
+python3 authoring/cli.py ingest examples/standard_templates.pptx
+python3 authoring/cli.py ingest examples/title_and_breaks.pptx
+# Commit only the workspace/skeletons/standard_templates_* and
+# workspace/skeletons/title_and_breaks_* changes.
+```
+
+## Standard content templates — `build_standard_templates.py`
+
+Ten content layouts. Each: header at top, text or bullets on the
+left, chart / image / table on the right.
 
 | #  | Left content         | Right content                  |
 |----|----------------------|--------------------------------|
@@ -20,23 +50,41 @@ chart / image / table on the right.
 | 9  | Lead + 4 sub-bullets | Image placeholder              |
 | 10 | 2 KPI stats          | Column chart (quarterly)       |
 
+## Title, breaks, closing — `build_title_and_breaks.py`
+
+Six structural layouts that surround the content slides.
+
+| # | Layout                                                          |
+|---|-----------------------------------------------------------------|
+| 1 | Title cover — deck title, subtitle, author, date                |
+| 2 | Agenda / TOC — numbered sections with hairline dividers         |
+| 3 | Section break (big text) — eyebrow + large phrase + accent rule |
+| 4 | Section break (big number) — giant numeral + section title      |
+| 5 | Pull quote — large quote + attribution                          |
+| 6 | Closing / thank-you — headline + call to action + contact line  |
+
+Shares the same brand constants as the standard templates so the two
+decks look like they belong to the same family.
+
 ## Build
 
 ```
 pip install python-pptx Pillow
-python3 examples/build_standard_templates.py
-# → examples/standard_templates.pptx
+python3 examples/build_standard_templates.py     # → examples/standard_templates.pptx
+python3 examples/build_title_and_breaks.py       # → examples/title_and_breaks.pptx
 python3 authoring/cli.py ingest examples/standard_templates.pptx
+python3 authoring/cli.py ingest examples/title_and_breaks.pptx
 ```
 
-The script builds real `python-pptx` chart / table / picture
-primitives (not stand-in rectangles), so when you `cli.py ingest`
-the resulting deck, the right-side slots categorise as `chart`,
-`image`, and `table` correctly.
+The standard-templates script builds real `python-pptx` chart / table
+/ picture primitives (not stand-in rectangles), so when you
+`cli.py ingest` the resulting deck, the right-side slots categorise
+as `chart`, `image`, and `table` correctly.
 
 ## Re-brand
 
-Edit the colour and font constants at the top of the build script:
+Edit the colour and font constants at the top of both build scripts
+(keep them in sync so the two decks stay a family):
 
 ```python
 ACCENT = RGBColor(0x1F, 0x4E, 0x8C)   # primary accent
@@ -46,7 +94,7 @@ TITLE_FONT = "Calibri"
 BODY_FONT  = "Calibri"
 ```
 
-Re-run the script to regenerate the deck.
+Re-run the scripts to regenerate the decks.
 
 ## Cleanup
 

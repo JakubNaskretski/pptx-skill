@@ -1,0 +1,85 @@
+id: title_and_breaks_05
+source_deck: title_and_breaks
+source_slide_index: 5
+status: pending
+categories:
+- content
+preview: preview.png
+background_image: null
+slots:
+- id: heading
+  kind: heading
+  geometry:
+    x: 0.0675
+    y: 0.2133
+    w: 0.8625
+    h: 0.12
+  style:
+    font_role: major
+    size_pt: 120.0
+    bold: true
+    color: '#1F4E8C'
+  constraints:
+    max_chars: 20
+    max_lines: 1
+    required: true
+  source_excerpt: “
+  shape_id: 2
+  role: kpi_value
+- id: body
+  kind: paragraph
+  geometry:
+    x: 0.1125
+    y: 0.38
+    w: 0.7725
+    h: 0.3467
+  style:
+    font_role: major
+    size_pt: 28.0
+    bold: false
+    color: '#222A35'
+  constraints:
+    max_chars: 178
+    max_lines: 1
+    required: true
+  source_excerpt: We stopped building features to fill a roadmap and started building the three t…
+  shape_id: 3
+  role: body
+- id: body_2
+  kind: paragraph
+  geometry:
+    x: 0.1125
+    y: 0.74
+    w: 0.7725
+    h: 0.0667
+  style:
+    font_role: major
+    size_pt: 14.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 55
+    max_lines: 1
+    required: true
+  source_excerpt: — Internal product review, March 2026
+  shape_id: 4
+- id: body_3
+  kind: paragraph
+  geometry:
+    x: 0.0375
+    y: 0.9333
+    w: 0.9248
+    h: 0.04
+  style:
+    font_role: major
+    size_pt: 9.0
+    bold: false
+    color: '#6B7382'
+  constraints:
+    max_chars: 31
+    max_lines: 1
+    required: false
+  source_excerpt: Template · pull quote
+  shape_id: 5
+  role: footnote
+unmapped_shapes: []
