@@ -200,7 +200,9 @@ slide that's also opening-shaped is `[opening, closing]`).
 Two delivery modes — same SKILL.md, different file inventory:
 
 **A) Authoring brief bundle** (the one most users ship). Text-only.
-Typical size: ~100 KB. Built by the local /compose web app.
+Typical size: ~100 KB. Built by the local /compose web app. Flat
+layout — one YAML per item, no per-item dirs (no binaries means
+no need to group multiple files per item).
 
 ```
 SKILL.md                        you are reading this
@@ -211,8 +213,8 @@ tag_vocab.yaml                  closed tag list for assets
 index.json                      summaries of every theme/skeleton/asset
 brand.md                        (optional) per-org style constraints
 brief.md                        the user's request
-themes/<id>/theme.yaml          palette + fonts
-skeletons/<id>/skeleton.yaml    slots, geometry, style, constraints, categories
+themes/<id>.yaml                palette + fonts
+skeletons/<id>.yaml             slots, geometry, style, constraints, categories
 assets/<id>.yaml                asset descriptions (kind, tags, description,
                                 width, height, aspect, colors_hex)
 user_assets/<id>.<ext>          (optional) low-res previews of images the

@@ -1056,26 +1056,25 @@ def _build_prompt_bundle_zip(skeletons: list[dict], assets: list[dict], brief: s
         # Themes — text-only. theme.yaml carries palette + fonts that the
         # agent reasons about; the master.pptx + preview.png stay on the
         # authoring machine and only get materialized at compose-run time
-        # (server-side), not in the agent's context.
+        # (server-side), not in the agent's context. Flat layout — one
+        # file per theme. (The offline `cli build-v5` zip uses nested
+        # `themes/<id>/theme.yaml` because that dir also holds
+        # master.pptx + preview.png; reader.py supports both.)
         for t in themes:
             tid = t.get("id") or t["_dir"]
-            src_dir = themes_root / t["_dir"]
-            theme_yaml = src_dir / "theme.yaml"
+            theme_yaml = themes_root / t["_dir"] / "theme.yaml"
             if theme_yaml.exists():
-                zf.write(theme_yaml, f"themes/{tid}/theme.yaml")
+                zf.write(theme_yaml, f"themes/{tid}.yaml")
 
-        # Skeletons — text-only. skeleton.yaml is the full structural
-        # description the agent picks against; preview.png + background.png
-        # are render aids that stay on the authoring machine. Sending
-        # rendered slide PNGs to the LLM would bloat the bundle for no
-        # behavioral gain (the YAML carries every slot + geometry the
-        # agent reasons about).
+        # Skeletons — text-only, one file per skeleton (flat). The
+        # offline `cli build-v5` zip uses nested `skeletons/<id>/...`
+        # because that dir also holds preview.png + background.png;
+        # reader.py supports both layouts.
         for sk in skeletons:
             sid = sk["id"]
-            src_dir = skeletons_root / sk["_dir"]
-            sk_yaml = src_dir / "skeleton.yaml"
+            sk_yaml = skeletons_root / sk["_dir"] / "skeleton.yaml"
             if sk_yaml.exists():
-                zf.write(sk_yaml, f"skeletons/{sid}/skeleton.yaml")
+                zf.write(sk_yaml, f"skeletons/{sid}.yaml")
 
         # KB assets — YAML SIDECAR ONLY. The agent picks asset_ids by
         # reading description / tags / dimensions; the binary stays on
