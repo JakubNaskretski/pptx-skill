@@ -1,6 +1,41 @@
 # Changelog
 
-## Unreleased — v5-only: brief alignment, skeleton bulk review, v4 purge
+## Unreleased — unified review page
+
+`/` now serves a single tabbed page (Skeletons | Assets) replacing
+the separate `/v5` and `/` pages. `/v5` 302-redirects to `/` for
+bookmarks. Workspace state is unchanged — no migration needed.
+
+### Why
+
+The two-page split (`/` for asset describe, `/v5` for skeleton
+review) was a historical accident from the v5 redesign — v5 lived
+alongside v4 as an additive layer and never got merged back. After
+the v4 deletion (previous entry), having two pages for two views
+of the same workspace was just friction.
+
+### What changed
+
+- New `UNIFIED_HTML` template; `/` renders it. `/v5` redirects
+  to `/`.
+- Sidebar tab switcher (Skeletons | Assets); default tab is
+  persisted in `localStorage` (`reviewTab`).
+- Skeletons tab keeps everything the old `/v5` page had: list
+  grouped by deck, checkboxes for bulk approve/reject, sticky
+  bulk-action bar, preview + slot overlays, slot/role/kind
+  inspector, overlap banner, auto-advance after status change.
+- Assets tab is a slim port of the old `/` describe page:
+  per-asset form (kind / tags / description / notes), Hide-done
+  filter, save → next-pending auto-advance, `+ Add asset` upload
+  button.
+- Ingest button (`+ Ingest .pptx`) sits at the top of the sidebar
+  on the Skeletons tab; `+ Add asset` on the Assets tab.
+- Old `INDEX_HTML` and `V5_HTML` constants deleted. Batch-describe-
+  via-LLM workflow endpoints (`/api/batch/...`) are still wired
+  server-side but no longer surfaced in the UI — CLI users /
+  scripts can still hit them.
+
+## v5-only: brief alignment, skeleton bulk review, v4 purge
 
 Two PRs combined: [#9](https://github.com/JakubNaskretski/pptx-skill/pull/9)
 (v5 brief + skeleton multi-select) and
