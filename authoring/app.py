@@ -1863,13 +1863,37 @@ def api_compose_run():
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_persisted = persisted / f"deck-{ts}.pptx"
         shutil.copyfile(out_path, out_persisted)
+
+        # Surface per-slot warnings (text/bullets overflow, missing
+        # assets, etc.) into the debug log so the user sees them in
+        # the floater instead of having to inspect the .pptx by hand.
+        # reader.py compose-v5 already drops a warnings.json sidecar
+        # in the staging dir — copy it next to the persisted .pptx
+        # so the user can find it post-hoc.
+        slot_warnings = summary.get("warnings") if isinstance(summary, dict) else None
+        slot_warnings = slot_warnings or []
+        if slot_warnings:
+            sidecar = out_persisted.with_suffix(".warnings.json")
+            sidecar.write_text(
+                json_mod.dumps(slot_warnings, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            first_msg = (slot_warnings[0].get("message") if isinstance(slot_warnings[0], dict) else str(slot_warnings[0]))
+            debug_event(
+                "warn", "compose",
+                f"compose finished with {len(slot_warnings)} warning(s) — "
+                f"first: {(first_msg or '?')[:160]}",
+                file=out_persisted.name, warnings=len(slot_warnings),
+                sidecar=str(sidecar.relative_to(WORKSPACE)),
+            )
         debug_event(
             "info", "compose",
             f"compose finished — {out_persisted.name}, "
             f"{out_persisted.stat().st_size // 1024} KB, "
-            f"{len(plan)} plan entries",
+            f"{len(plan)} plan entries"
+            + (f", {len(slot_warnings)} warning(s)" if slot_warnings else ""),
             file=out_persisted.name, size_bytes=out_persisted.stat().st_size,
-            entries=len(plan),
+            entries=len(plan), warnings=len(slot_warnings),
         )
 
     return send_file(
