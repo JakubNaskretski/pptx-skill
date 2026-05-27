@@ -428,46 +428,6 @@ def _shape_geometry(shape, slide_w: int, slide_h: int) -> dict:
     }
 
 
-def infer_layout(slide, slots: list[dict], renames: dict, slide_w: int, slide_h: int) -> str:
-    """One-line spatial summary of every visually-meaningful shape.
-
-    Walks the slide (descending into groups) and labels each shape by
-    either its slot id (if it became a template slot during
-    ``detect_slots``) or by ``_shape_kind_label`` (otherwise). Skips
-    decorations and hairlines via ``_atom_too_small``.
-
-    Output is a comma-separated list of ``label@region`` tokens, e.g.
-    ``"title@top-center, image@middle-right, callout@bottom-left"``.
-    This is what the compose-time agent reads to understand a slide's
-    *anatomy* — distinct from its descriptive ``intent``.
-    """
-    parts: list[str] = []
-    seen_labels: dict[str, int] = {}  # disambiguate repeats: image, image#2
-    for shape in _iter_shapes_recursive(slide):
-        if shape.shape_id in renames:
-            label = renames[shape.shape_id]
-        else:
-            if _atom_too_small(shape, slide_w, slide_h):
-                continue
-            kind = _shape_kind_label(shape)
-            if not kind:
-                continue
-            label = kind
-        # If we see the same kind twice on one slide (e.g. two pictures),
-        # disambiguate as image, image#2, image#3 — gives the compose
-        # agent a stable way to refer to the n-th instance positionally.
-        count = seen_labels.get(label, 0) + 1
-        seen_labels[label] = count
-        tag = label if count == 1 else f"{label}#{count}"
-        left = shape.left or 0
-        top = shape.top or 0
-        width = shape.width or 0
-        height = shape.height or 0
-        region = position_quadrant(left, top, width, height, slide_w, slide_h)
-        parts.append(f"{tag}@{region}")
-    return ", ".join(parts) if parts else "freeform"
-
-
 def write_slide_fragment(src_path: Path, slide_idx: int, out_path: Path, renames: dict) -> None:
     """Save a single-slide fragment by reopening the deck and dropping others.
 
@@ -734,65 +694,6 @@ def prune_unreachable_parts(pptx_path: Path) -> tuple[int, int]:
 
     tmp_path.replace(pptx_path)
     return len(reachable), len(name_set) - len(reachable)
-
-
-_SLIDE_DESCRIPTIVE_DEFAULTS = {
-    "intent": "",
-    "feel": "",
-    "suitable_for": [],
-    "status": "pending",
-    "notes": "",
-    "interpretation": "",
-}
-
-
-def write_slide_yaml_stub(
-    out_path: Path,
-    slide_id: str,
-    layout: str,
-    slots: list[dict],
-    deck_stem: str,
-    slide_number: int,
-    *,
-    theme_colors: dict | None = None,
-    fonts: dict | None = None,
-    inventory: list | None = None,
-) -> None:
-    """Write a slide sidecar in canonical-order YAML.
-
-    Structural fields (id, layout, theme_colors, fonts, slots, inventory,
-    sources) are always refreshed. Descriptive fields (intent, feel,
-    suitable_for, status, notes) are preserved verbatim if the file
-    already exists — regardless of status. New stubs default
-    descriptive fields to empty + status=pending.
-    """
-    existing: dict = {}
-    if out_path.exists():
-        try:
-            existing = read_yaml(out_path)
-        except Exception:
-            existing = {}
-
-    descriptive = {
-        k: existing.get(k, default) for k, default in _SLIDE_DESCRIPTIVE_DEFAULTS.items()
-    }
-
-    out = {
-        "intent": descriptive["intent"],
-        "feel": descriptive["feel"],
-        "suitable_for": descriptive["suitable_for"],
-        "status": descriptive["status"],
-        "notes": descriptive["notes"],
-        "interpretation": descriptive["interpretation"],
-        "id": slide_id,
-        "layout": layout,
-        "theme_colors": theme_colors or {},
-        "fonts": fonts or {},
-        "slots": slots,
-        "inventory": inventory or [],
-        "sources": [{"deck": deck_stem, "slide": slide_number}],
-    }
-    write_yaml(out_path, out)
 
 
 def _current_deck_stems() -> set[str]:
@@ -1569,7 +1470,6 @@ def extract_deck_theme(prs, deck_stem: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-SLIDE_REQUIRED = ("intent", "feel", "suitable_for")
 # Slim asset contract: kind is the only structural enum check here.
 # tags are checked against the workspace tag vocabulary (TAG_VOCAB),
 # which is editable at runtime. description is free-text.
@@ -1609,8 +1509,6 @@ def save_tag_vocab(tags: list[str]) -> None:
 
 
 VOCAB = _load_vocab()
-SLIDE_FEEL_ENUM = set(VOCAB["slide"]["feel"])
-SLIDE_SUITABLE_ENUM = set(VOCAB["slide"]["suitable_for"])
 ASSET_KIND_ENUM = set(VOCAB["asset"]["kind"])
 
 
@@ -1621,22 +1519,6 @@ def _missing_or_empty(data: dict, keys: Iterable[str]) -> list[str]:
         if v is None or v == "" or v == []:
             missing.append(k)
     return missing
-
-
-def validate_slide(data: dict) -> list[str]:
-    errors = _missing_or_empty(data, SLIDE_REQUIRED)
-    feel = data.get("feel")
-    if feel and feel not in SLIDE_FEEL_ENUM:
-        errors.append(f"feel '{feel}' not in {sorted(SLIDE_FEEL_ENUM)}")
-    sfor = data.get("suitable_for") or []
-    if isinstance(sfor, list):
-        bad = [t for t in sfor if t not in SLIDE_SUITABLE_ENUM]
-        if bad:
-            errors.append(f"suitable_for has unknown tag(s): {bad}")
-    intent = data.get("intent") or ""
-    if intent and len(intent.split()) > 25:
-        errors.append("intent is over 25 words; prefer <=20")
-    return errors
 
 
 def validate_asset(data: dict) -> list[str]:
@@ -1665,13 +1547,6 @@ def validate_asset(data: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # Discovery helpers
 # ---------------------------------------------------------------------------
-
-
-def iter_slide_yamls() -> Iterable[Path]:
-    decks = WORKSPACE / "decks"
-    if not decks.exists():
-        return []
-    return sorted(decks.glob("*/slides/slide_*.yaml"))
 
 
 def iter_asset_yamls() -> Iterable[Path]:
@@ -1740,37 +1615,22 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     slide_w = prs.slide_width or 9144000
     slide_h = prs.slide_height or 6858000
 
-    # v4: per-deck theme.yaml (palette + fonts). Regenerated on every
-    # ingest — it is derived data, no human-edited fields to preserve.
+    # Extract the deck's palette + fonts once. Used both as input to
+    # the v5 theme digest and as the palette argument to slot
+    # detection (so slot color refs resolve to role names).
     theme = extract_deck_theme(prs, deck_stem)
-    write_yaml(deck_dir / "theme.yaml", theme)
 
-    # v5 (additive): write workspace/themes/<deck>/{theme.yaml, master.pptx}
-    # with semantic palette roles + master fragment + auto-classified
-    # decorations for the new build engine. v4 path above is unaffected.
+    # workspace/themes/<deck>/{theme.yaml, master.pptx, preview.png}
+    # — semantic palette roles + master fragment for the v5 engine.
     ingest_v5.digest_theme(prs, original, deck_stem, theme, WORKSPACE / "themes")
 
     # Pre-compute repeated-picture info (sha → median area) across the
     # whole deck so each per-slide digest can either skip a deck-wide
     # brand mark (typical size = decoration) or capture it as a slot
-    # when it's rendered much larger on a specific slide (featured
-    # content, e.g. a logo at hero size on the cover). One pass, used
-    # by all per-slide digests below.
+    # when it's rendered much larger on a specific slide.
     v5_repeated_info = ingest_v5.compute_repeated_picture_info(prs)
 
-    # Resolve slide-level theme_colors via aliases; pass palette into
-    # slot detection so per-run colour refs become hex + role names.
     theme_palette = theme.get("palette") or {}
-    theme_aliases = theme.get("aliases") or {}
-    slide_theme_colors = {
-        role: theme_palette.get(theme_aliases.get(role, ""), "")
-        for role in ("primary", "accent", "text", "background")
-    }
-    # Strip empty entries so the YAML stays terse on fully-resolved
-    # decks but explicit on partial extractions.
-    slide_theme_colors = {k: v for k, v in slide_theme_colors.items() if v}
-    slide_fonts = {k: v for k, v in (theme.get("fonts") or {}).items() if v}
-
     assets_dir = WORKSPACE / "assets"
     all_atom_ids: set[str] = set()
     all_picture_ids: set[str] = set()
@@ -1778,20 +1638,24 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
     n_slides = len(prs.slides)
     for idx in range(n_slides):
         slide = prs.slides[idx]
-        slot_defs, renames = detect_slots(slide, slide_w, slide_h, theme_palette)
-        layout = infer_layout(slide, slot_defs, renames, slide_w, slide_h)
+        # detect_slots returns `renames` — a shape-id rewrite map that
+        # write_slide_fragment applies so each per-slide PPTX has
+        # canonical atom ids. The slot_defs themselves are no longer
+        # serialized (v5 skeletons carry the slot truth), but the
+        # rename map is still needed for atom-id stability.
+        _slot_defs, renames = detect_slots(slide, slide_w, slide_h, theme_palette)
 
         slide_number = idx + 1
-        slide_id = f"{deck_stem}_{slide_number:02d}"
         slide_pptx = slides_dir / f"slide_{slide_number:02d}.pptx"
-        slide_yaml = slides_dir / f"slide_{slide_number:02d}.yaml"
 
+        # Per-slide PPTX fragment — kept so the preview renderer
+        # (qlmanage / LibreOffice / PowerPoint) has a per-slide file
+        # to thumbnail. The matching preview PNG is mirrored into
+        # workspace/skeletons/<id>/preview.png by `cli preview`.
         write_slide_fragment(original, idx, slide_pptx, renames)
-        # Extract atoms BEFORE writing the slide yaml so we can populate
-        # inventory with the per-shape positional info this template
-        # carries (so the agent knows "picking this template gives you
-        # these atoms for free at these positions, or you can address
-        # them individually in compose mode").
+
+        # Asset binary extraction — writes png/jpg/svg/xml binaries
+        # into workspace/assets/ with their sha1-based ids.
         pic_entries = extract_picture_assets(
             slide, deck_stem, slide_number, assets_dir, slide_w, slide_h,
         )
@@ -1799,27 +1663,10 @@ def _ingest_pptx(deck: Path, *, reject_collision: bool = False) -> dict:
             slide, deck_stem, slide_number, assets_dir, slide_w, slide_h,
             slot_shape_ids=set(renames.keys()),
         )
-        # v4.2: inventory unions pictures + structured atoms with
-        # per-shape geometry — gives the compose-time agent slide
-        # anatomy beyond just the (placeholder-only) `slots` field.
-        inventory = pic_entries + atom_entries
         all_picture_ids.update(e["atom"] for e in pic_entries if e.get("atom"))
         all_atom_ids.update(e["atom"] for e in atom_entries if e.get("atom"))
-        write_slide_yaml_stub(
-            slide_yaml,
-            slide_id,
-            layout,
-            slot_defs,
-            deck_stem,
-            slide_number,
-            theme_colors=slide_theme_colors,
-            fonts=slide_fonts,
-            inventory=inventory,
-        )
 
-        # v5 (additive): structural skeleton with fractional geometry,
-        # font_role / color_role, per-kind constraints. v4 path above
-        # is unaffected; v5 writes to workspace/skeletons/<deck>_<NN>/.
+        # Structural skeleton — workspace/skeletons/<deck>_<NN>/.
         v4_preview = slide_pptx.with_suffix(".png")
         ingest_v5.digest_skeleton(
             slide, slide_w, slide_h, deck_stem, slide_number,
@@ -2117,16 +1964,13 @@ def _bucket(paths: Iterable[Path]) -> tuple[list[Path], list[Path], list[Path]]:
 
 @cli.command()
 def status() -> None:
-    """Counts pending/done/locked; lists pending file paths."""
-    slides = list(iter_slide_yamls())
+    """Counts pending/done/locked; lists pending asset file paths."""
     assets = list(iter_asset_yamls())
-    sp, sd, sl = _bucket(slides)
     ap, ad, al = _bucket(assets)
-    click.echo(f"slides:  pending={len(sp)} done={len(sd)} locked={len(sl)} total={len(slides)}")
     click.echo(f"assets:  pending={len(ap)} done={len(ad)} locked={len(al)} total={len(assets)}")
-    if sp or ap:
+    if ap:
         click.echo("\npending:")
-        for p in sp + ap:
+        for p in ap:
             click.echo(f"  {p.relative_to(HERE)}")
 
 
@@ -2134,19 +1978,11 @@ def status() -> None:
 
 
 @cli.command(name="next")
-@click.option("--kind", type=click.Choice(["asset", "slide"]))
 @click.option("--open", "open_editor", is_flag=True, help="Launch $EDITOR on the YAML.")
-def next_cmd(kind, open_editor: bool) -> None:
-    """Print the next pending item path."""
-    if kind == "asset":
-        candidates = list(iter_asset_yamls())
-    elif kind == "slide":
-        candidates = list(iter_slide_yamls())
-    else:
-        candidates = list(iter_slide_yamls()) + list(iter_asset_yamls())
-
+def next_cmd(open_editor: bool) -> None:
+    """Print the next pending asset path."""
     target: Path | None = None
-    for p in candidates:
+    for p in iter_asset_yamls():
         try:
             data = read_yaml(p)
         except Exception:
@@ -2174,10 +2010,9 @@ def next_cmd(kind, open_editor: bool) -> None:
 
 
 @cli.command()
-@click.option("--kind", type=click.Choice(["asset", "slide"]), default="asset")
-def prompt(kind: str) -> None:
-    """Print the bundled describe prompt to stdout for copy/paste."""
-    path = PROMPTS / f"describe_{kind}.md"
+def prompt() -> None:
+    """Print the bundled asset describer prompt to stdout for copy/paste."""
+    path = PROMPTS / "describe_asset.md"
     if not path.exists():
         raise click.ClickException(f"missing prompt file: {path}")
     click.echo(path.read_text(encoding="utf-8"))
@@ -2189,8 +2024,6 @@ def prompt(kind: str) -> None:
 def check_prompt_drift() -> list[str]:
     """Warn if a vocab enum value is missing from its prompt markdown."""
     pairs = [
-        (PROMPTS / "describe_slide.md", "slide.feel", VOCAB["slide"]["feel"]),
-        (PROMPTS / "describe_slide.md", "slide.suitable_for", VOCAB["slide"]["suitable_for"]),
         (PROMPTS / "describe_asset.md", "asset.kind", VOCAB["asset"]["kind"]),
         (PROMPTS / "describe_asset.md", "asset.tags", load_tag_vocab()),
     ]
@@ -2219,22 +2052,6 @@ def validate() -> None:
     drift = check_prompt_drift()
     if drift:
         failures.append((VOCAB_PATH, drift))
-
-    for p in iter_slide_yamls():
-        total += 1
-        try:
-            data = read_yaml(p)
-        except Exception as e:
-            failures.append((p, [f"unreadable: {e}"]))
-            continue
-        errs = validate_slide(data)
-        if errs:
-            failures.append((p, errs))
-            continue
-        if data.get("status") == "pending":
-            data["status"] = "done"
-            write_yaml(p, data)
-            promoted += 1
 
     for p in iter_asset_yamls():
         total += 1
@@ -2879,187 +2696,7 @@ def _ext_for(blob_path: Path) -> str:
     return blob_path.suffix.lstrip(".") or "bin"
 
 
-def _template_index_entry(s: dict) -> dict:
-    out = {
-        "id": s["id"],
-        "intent": s.get("intent", ""),
-        "feel": s.get("feel", ""),
-        "suitable_for": s.get("suitable_for", []),
-        "layout": s.get("layout", ""),
-        "slots": s.get("slots", []),
-    }
-    # v4: include the auto-extracted theme snapshot + atom inventory
-    # when present. Omit empties so v3-era templates stay terse.
-    # v4.1: `interpretation` — model's speculative observations, info-only;
-    # not used for filtering, just surfaced to the compose-time agent.
-    for key in ("theme_colors", "fonts", "inventory", "interpretation"):
-        v = s.get(key)
-        if v:
-            out[key] = v
-    return out
-
-
-def _asset_index_entry(a: dict) -> dict:
-    out = {
-        "id": a["id"],
-        "kind": a.get("kind", ""),
-        "tags": a.get("tags", []),
-        "description": a.get("description", ""),
-    }
-    # Optional structured blocks. Only emit when present so the
-    # index stays focused on retrievable fields. `interpretation` is
-    # the model's speculative observations — info-only, never a
-    # filter target, surfaced to the compose-time agent as context.
-    for key in (
-        "width", "height", "aspect",
-        "colors_hex", "recolor_targets", "table", "chart", "shape", "smartart",
-        "interpretation",
-    ):
-        v = a.get(key)
-        if v:
-            out[key] = v
-    return out
-
-
-def build_index(slides: list[dict], assets: list[dict]) -> dict:
-    return {
-        "templates": [_template_index_entry(s) for s in slides],
-        "assets": [_asset_index_entry(a) for a in assets],
-    }
-
-
-@cli.command()
-@click.option("--allow-pending", is_flag=True, help="Build even if some sidecars are pending.")
-@click.option("--out", "out_path", type=click.Path(path_type=Path), default=None)
-@click.option(
-    "--no-brand",
-    is_flag=True,
-    help="Build a policy-stripped bundle: brand.md is omitted and SKILL.md "
-    "carries a 'policy disabled' notice. Useful for control-test runs "
-    "comparing branded vs un-branded agent behaviour.",
-)
-def build(allow_pending: bool, out_path: Path | None, no_brand: bool) -> None:
-    """Emit dist/skill.zip — the consumer artifact."""
-    slide_yamls = list(iter_slide_yamls())
-    asset_yamls = list(iter_asset_yamls())
-
-    if not slide_yamls and not asset_yamls:
-        raise click.ClickException("workspace is empty; run `ingest` first")
-
-    pending = []
-    slides_meta: list[dict] = []
-    assets_meta: list[dict] = []
-
-    for p in slide_yamls:
-        d = read_yaml(p)
-        if d.get("status", "pending") == "pending":
-            pending.append(p)
-        d["_yaml_path"] = p
-        slides_meta.append(d)
-
-    for p in asset_yamls:
-        d = read_yaml(p)
-        if d.get("status", "pending") == "pending":
-            pending.append(p)
-        d["_yaml_path"] = p
-        assets_meta.append(d)
-
-    if pending and not allow_pending:
-        click.echo(f"refusing to build: {len(pending)} sidecar(s) still pending", err=True)
-        for p in pending:
-            click.echo(f"  {p.relative_to(HERE)}", err=True)
-        click.echo("re-run with --allow-pending to override", err=True)
-        sys.exit(1)
-
-    DIST.mkdir(parents=True, exist_ok=True)
-    zip_path = out_path or (DIST / "skill.zip")
-
-    reader_src = CONSUMER / "reader.py"
-    skill_md = CONSUMER / "SKILL.md"
-    consumer_reqs = CONSUMER / "requirements.txt"
-    brand_md = HERE / "brand.md"
-    if not reader_src.exists() or not skill_md.exists():
-        raise click.ClickException(
-            "consumer/reader.py or SKILL.md missing — cannot build zip"
-        )
-
-    index = build_index(slides_meta, assets_meta)
-
-    skill_text = skill_md.read_text(encoding="utf-8")
-    if no_brand:
-        notice = (
-            "> **Policy disabled.** This bundle was built with "
-            "`build --no-brand` — `brand.md` is intentionally omitted and "
-            "the agent should not assume any deck-style constraints beyond "
-            "what individual templates / assets describe.\n\n"
-        )
-        skill_text = notice + skill_text
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("SKILL.md", skill_text)
-        zf.writestr("reader.py", reader_src.read_text(encoding="utf-8"))
-        if consumer_reqs.exists():
-            zf.writestr("requirements.txt", consumer_reqs.read_text(encoding="utf-8"))
-        zf.writestr("index.json", json.dumps(index, indent=2, ensure_ascii=False))
-        if not no_brand and brand_md.exists():
-            brand_text = brand_md.read_text(encoding="utf-8").strip()
-            if brand_text:
-                zf.writestr("brand.md", brand_text + "\n")
-
-        # v4: per-deck theme.yaml (palette + fonts). Informational for
-        # the agent. Skipped silently for any deck without one (pre-v4
-        # ingest output).
-        for theme_yaml in sorted((WORKSPACE / "decks").glob("*/theme.yaml")):
-            deck_name = theme_yaml.parent.name
-            zf.write(theme_yaml, f"decks/{deck_name}/theme.yaml")
-
-        for sd in slides_meta:
-            tid = sd["id"]
-            yaml_path: Path = sd["_yaml_path"]
-            slide_pptx = yaml_path.with_suffix(".pptx")
-            if not slide_pptx.exists():
-                click.echo(f"warn: missing {slide_pptx} — skipping {tid}", err=True)
-                continue
-            zf.write(slide_pptx, f"templates/{tid}/slide.pptx")
-            clean = {k: v for k, v in sd.items() if not k.startswith("_")}
-            zf.writestr(
-                f"templates/{tid}/meta.yaml",
-                yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
-            )
-            preview_png = yaml_path.with_suffix(".png")
-            if preview_png.exists():
-                zf.write(preview_png, f"templates/{tid}/preview.png")
-
-        for ad in assets_meta:
-            aid = ad["id"]
-            sha = ad.get("sha1", "")
-            yaml_path: Path = ad["_yaml_path"]
-            # Find the binary alongside the yaml — same stem, any extension.
-            blob: Path | None = None
-            for cand in yaml_path.parent.glob(f"{yaml_path.stem}.*"):
-                if cand.suffix == ".yaml":
-                    continue
-                blob = cand
-                break
-            if blob is None:
-                click.echo(f"warn: no binary for asset {aid} ({sha}) — skipping", err=True)
-                continue
-            ext = _ext_for(blob)
-            zf.write(blob, f"assets/{aid}.{ext}")
-            clean = {k: v for k, v in ad.items() if not k.startswith("_")}
-            zf.writestr(
-                f"assets/{aid}.yaml",
-                yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
-            )
-
-    brand_tag = " (no brand)" if no_brand else ""
-    click.echo(
-        f"built {zip_path}{brand_tag} — "
-        f"{len(slides_meta)} template(s), {len(assets_meta)} asset(s)"
-    )
-
-
-# --- v5 build (additive) --------------------------------------------------
+# --- v5 build -------------------------------------------------------------
 
 
 @cli.command(name="build-v5")

@@ -172,18 +172,14 @@ def _yaml_for_rel(rel: str) -> Path:
 
 
 def _kind_of(yaml_path: Path) -> str:
-    return "slide" if yaml_path.parent.name == "slides" else "asset"
+    # All sidecars under workspace/ are now asset records (v4 slide
+    # YAMLs are no longer generated). Function kept as the explicit
+    # kind hook for the describe UI / save path.
+    return "asset"
 
 
 def _items() -> dict:
-    out: dict = {"slides": [], "assets": []}
-    for p in cli_mod.iter_slide_yamls():
-        d = _safe_read(p)
-        out["slides"].append({
-            "id": d.get("id") or p.stem,
-            "yaml": str(p.relative_to(HERE)),
-            "status": d.get("status", "pending"),
-        })
+    out: dict = {"assets": []}
     for p in cli_mod.iter_asset_yamls():
         d = _safe_read(p)
         out["assets"].append({
@@ -194,10 +190,6 @@ def _items() -> dict:
     return out
 
 
-def _ensure_slide_png(slide_pptx: Path) -> Path | None:
-    return cli_mod.render_slide_to_png(slide_pptx)
-
-
 def _asset_binary(yaml_path: Path) -> Path | None:
     for cand in yaml_path.parent.glob(f"{yaml_path.stem}.*"):
         if cand.suffix != ".yaml":
@@ -205,48 +197,13 @@ def _asset_binary(yaml_path: Path) -> Path | None:
     return None
 
 
-def _assets_for_slide(slide_yaml_path: Path) -> list[Path]:
-    """Return asset yaml paths whose `sources` includes this slide.
-
-    Each asset.yaml carries a `sources: [{deck, slide}, ...]` list that
-    ingest populates. We reverse-lookup: scan the workspace's asset pool
-    and pick the ones that mention this deck+slide pair. Used by the
-    slide_with_assets bulk-describe mode so each slide bundle ships
-    with the actual binaries of every picture / atom on it.
-    """
-    # Slide yamls live at workspace/decks/<deck>/slides/slide_NN.yaml — pull
-    # the deck stem from the path and the slide number from the filename.
-    try:
-        deck_stem = slide_yaml_path.parent.parent.name
-        slide_number = int(slide_yaml_path.stem.removeprefix("slide_"))
-    except (ValueError, AttributeError):
-        return []
-    out: list[Path] = []
-    for ap in cli_mod.iter_asset_yamls():
-        try:
-            data = cli_mod.read_yaml(ap)
-        except Exception:
-            continue
-        for src in (data.get("sources") or []):
-            if (
-                isinstance(src, dict)
-                and src.get("deck") == deck_stem
-                and src.get("slide") == slide_number
-            ):
-                out.append(ap)
-                break
-    return out
-
-
-SLIDE_DESCRIPTIVE = ("intent", "feel", "suitable_for", "notes", "interpretation")
 ASSET_DESCRIPTIVE = ("kind", "tags", "description", "notes")
-_LIST_KEYS = {"suitable_for", "tags"}
+_LIST_KEYS = {"tags"}
 
 
 def _descriptive_yaml(data: dict, kind: str) -> str:
-    keys = SLIDE_DESCRIPTIVE if kind == "slide" else ASSET_DESCRIPTIVE
     subset: dict = {}
-    for k in keys:
+    for k in ASSET_DESCRIPTIVE:
         if k in data:
             subset[k] = data[k]
         elif k in _LIST_KEYS:
@@ -274,12 +231,7 @@ def _save_and_validate(p: Path, merge_fields: dict) -> tuple[list, str]:
     existing = _safe_read(p)
     existing.update(merge_fields)
     cli_mod.write_yaml(p, existing)
-    kind = _kind_of(p)
-    errs = (
-        cli_mod.validate_slide(existing)
-        if kind == "slide"
-        else cli_mod.validate_asset(existing)
-    )
+    errs = cli_mod.validate_asset(existing)
     if not errs and existing.get("status") != "locked":
         existing["status"] = "done"
         cli_mod.write_yaml(p, existing)
@@ -469,10 +421,7 @@ def api_parse_yaml():
 
 @app.get("/api/prompt")
 def api_prompt():
-    kind = request.args.get("kind", "asset")
-    if kind not in ("asset", "slide"):
-        abort(400)
-    text = (HERE / "prompts" / f"describe_{kind}.md").read_text(encoding="utf-8")
+    text = (HERE / "prompts" / "describe_asset.md").read_text(encoding="utf-8")
     return jsonify({"text": text})
 
 
@@ -481,123 +430,26 @@ def api_prompt():
 # ---------------------------------------------------------------------------
 
 
-def _bulk_instructions_slide_with_assets(
-    n: int,
-    slide_prompt: str,
-    asset_prompt: str,
-    items: dict,
-) -> str:
-    """Bundled-describe prompt: each numbered folder = one slide + its assets.
-
-    `items` maps "01" → {"slide": rel, "assets": {asset_id: rel}} so the
-    prompt can show the model the exact asset_id keys it should use in
-    each entry's `assets` block (rather than expecting the model to
-    invent or copy them from filenames).
+def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
+    """Wrapper prompt for a bulk-describe batch. Tells the model the
+    expected JSON shape and inlines the per-item schema. kind is always
+    "asset" today — kept as a parameter so the caller stays explicit.
     """
-    # Render a small table of expected asset keys per bundle so the model
-    # knows exactly what to fill in. Keeps the JSON output structured.
-    expected_lines = []
-    for key in sorted(items.keys()):
-        bundle = items[key]
-        asset_ids = list((bundle.get("assets") or {}).keys())
-        if asset_ids:
-            ids_str = ", ".join(f"`{a}`" for a in asset_ids)
-            expected_lines.append(f"- **{key}/** — slide + {len(asset_ids)} asset(s): {ids_str}")
-        else:
-            expected_lines.append(f"- **{key}/** — slide + 0 assets (describe slide only)")
-    expected_block = "\n".join(expected_lines)
-
+    del kind  # currently asset-only; reserved for future kinds
     sample_block = (
         '{\n'
         '  "01": {\n'
-        '    "slide": {\n'
-        '      "intent": "...",\n'
-        '      "feel": "formal",\n'
-        '      "suitable_for": ["opener"],\n'
-        '      "notes": "",\n'
-        '      "interpretation": ""\n'
-        '    },\n'
-        '    "assets": {\n'
-        '      "asset_abc12345": {\n'
-        '        "kind": "photo",\n'
-        '        "tags": ["people", "office"],\n'
-        '        "description": "...",\n'
-        '        "notes": ""\n'
-        '      }\n'
-        '    }\n'
+        '    "kind": "photo",\n'
+        '    "tags": ["people", "office"],\n'
+        '    "description": "...",\n'
+        '    "notes": ""\n'
         '  },\n'
-        '  "02": { "slide": {...}, "assets": { ... } }\n'
+        '  "02": { "kind": "photo", "...": "same fields" }\n'
         '}\n'
     )
     return (
-        f"# Bulk describe batch — {n} slide(s) with their constituent assets\n\n"
-        f"The downstream pipeline picks slides as templates and pulls "
-        f"individual assets (photos, logos, tables, callouts) onto them at "
-        f"compose time. Both need descriptions. Today they're described "
-        f"independently — this batch lets you describe them **together**, "
-        f"so the slide's context can inform asset descriptions (and vice "
-        f"versa).\n\n"
-        f"## Bundle structure\n\n"
-        f"The zip contains {n} numbered folders. Each folder is one slide:\n\n"
-        f"- `<NN>/slide.png` — rendered preview of the slide\n"
-        f"- `<NN>/<asset_id>.<ext>` — the binary of every asset that "
-        f"appears on this slide (photo, logo, icon, table xml, etc.). "
-        f"The filename stem is the asset's stable id — use it verbatim "
-        f"as the JSON key.\n\n"
-        f"### Expected per-bundle contents\n\n"
-        f"{expected_block}\n\n"
-        f"## Output format\n\n"
-        f"Return ONE JSON object. Top-level keys are the 2-digit bundle "
-        f"ids (`\"01\"`, `\"02\"`, ..., `\"{n:02d}\"`). Each value is an "
-        f"object with two sub-keys:\n\n"
-        f"- `slide` — the slide's description fields (see slide schema below)\n"
-        f"- `assets` — a dict keyed by asset id (e.g. `\"asset_abc12345\"`); "
-        f"each value is that asset's description fields (see asset schema "
-        f"below). Include exactly the asset ids listed for that bundle "
-        f"above. If a bundle has 0 assets, output `\"assets\": {{}}`.\n\n"
-        f"```json\n{sample_block}```\n\n"
-        f"Return EXACTLY {n} top-level entries. Use the asset ids as listed "
-        f"above — do NOT rename them. Output ONLY the JSON object. No "
-        f"commentary, no markdown code fences, no prose before or after.\n\n"
-        f"---\n\n"
-        f"## Slide description schema (use under each `slide` key)\n\n"
-        f"{slide_prompt}\n\n"
-        f"---\n\n"
-        f"## Asset description schema (use under each `assets.<id>` key)\n\n"
-        f"{asset_prompt}\n"
-    )
-
-
-def _bulk_instructions(kind: str, n: int, per_item_prompt: str) -> str:
-    item_name = "image" if kind == "asset" else "slide preview"
-    if kind == "asset":
-        sample_block = (
-            '{\n'
-            '  "01": {\n'
-            '    "kind": "photo",\n'
-            '    "tags": ["people", "office"],\n'
-            '    "description": "...",\n'
-            '    "notes": ""\n'
-            '  },\n'
-            '  "02": { "kind": "photo", "...": "same fields" }\n'
-            '}\n'
-        )
-    else:
-        sample_block = (
-            '{\n'
-            '  "01": {\n'
-            '    "intent": "...",\n'
-            '    "feel": "formal",\n'
-            '    "suitable_for": ["opener"],\n'
-            '    "notes": "",\n'
-            '    "interpretation": ""\n'
-            '  },\n'
-            '  "02": { "intent": "...", "...": "same fields" }\n'
-            '}\n'
-        )
-    return (
-        f"# Bulk describe batch — {n} {item_name}s\n\n"
-        f"You will see {n} {item_name}s numbered 01 through {n:02d}. For each, "
+        f"# Bulk describe batch — {n} image(s)\n\n"
+        f"You will see {n} images numbered 01 through {n:02d}. For each, "
         f"produce a description following the schema in the second half of "
         f"this file.\n\n"
         f"## Output format\n\n"
@@ -648,32 +500,23 @@ def _prune_old_batches(keep: int = _KEEP_BATCHES) -> int:
 @app.post("/api/batch/create")
 def api_batch_create():
     body = request.get_json(force=True) or {}
-    kind = body.get("kind", "asset")
     try:
         count = max(1, min(20, int(body.get("count", 10))))
     except (TypeError, ValueError):
         return jsonify({"error": "count must be an integer"}), 400
-    if kind not in ("asset", "slide", "slide_with_assets"):
-        return jsonify({
-            "error": "kind must be 'asset', 'slide', or 'slide_with_assets'",
-        }), 400
 
-    if kind == "asset":
-        candidates = list(cli_mod.iter_asset_yamls())
-    else:
-        # Both 'slide' and 'slide_with_assets' start from pending slides.
-        candidates = list(cli_mod.iter_slide_yamls())
+    candidates = list(cli_mod.iter_asset_yamls())
     pending = [p for p in candidates if _safe_read(p).get("status", "pending") == "pending"]
     selected = pending[:count]
     if not selected:
-        return jsonify({"error": f"no pending {kind}s"}), 400
+        return jsonify({"error": "no pending assets"}), 400
 
     BATCHES_DIR.mkdir(exist_ok=True)
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     batch_dir = BATCHES_DIR / batch_id
     batch_dir.mkdir(exist_ok=True)
 
-    manifest: dict = {"kind": kind, "created": batch_id, "items": {}}
+    manifest: dict = {"kind": "asset", "created": batch_id, "items": {}}
     skipped: list[dict] = []
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -681,103 +524,28 @@ def api_batch_create():
         for ypath in selected:
             rel = str(ypath.relative_to(HERE))
             try:
-                if kind == "asset":
-                    binary = _asset_binary(ypath)
-                    if binary is None:
-                        skipped.append({"yaml": rel, "reason": "asset binary missing"})
-                        continue
-                    if not binary.exists() or binary.stat().st_size == 0:
-                        skipped.append({"yaml": rel, "reason": f"asset binary unreadable: {binary.name}"})
-                        continue
-                    ext = binary.suffix.lstrip(".") or "png"
-                    key = f"{added + 1:02d}"
-                    zf.write(binary, f"{key}.{ext}")
-                    manifest["items"][key] = rel
-                    added += 1
-                elif kind == "slide":
-                    slide_pptx = ypath.with_suffix(".pptx")
-                    if not slide_pptx.exists():
-                        skipped.append({"yaml": rel, "reason": "slide fragment .pptx missing"})
-                        continue
-                    png = _ensure_slide_png(slide_pptx)
-                    if png is None:
-                        available = cli_mod.available_renderers()
-                        if not available:
-                            reason = (
-                                "no slide renderer available — install "
-                                "LibreOffice, or use PowerPoint on Windows"
-                            )
-                        else:
-                            reason = (
-                                f"slide rendering failed (tried: "
-                                f"{', '.join(available)})"
-                            )
-                        skipped.append({"yaml": rel, "reason": reason})
-                        continue
-                    key = f"{added + 1:02d}"
-                    zf.write(png, f"{key}.png")
-                    manifest["items"][key] = rel
-                    added += 1
-                else:
-                    # slide_with_assets: one numbered folder per slide,
-                    # containing slide.png + each asset binary. Manifest
-                    # value is a nested dict so apply can route both
-                    # halves of the LLM response.
-                    slide_pptx = ypath.with_suffix(".pptx")
-                    if not slide_pptx.exists():
-                        skipped.append({"yaml": rel, "reason": "slide fragment .pptx missing"})
-                        continue
-                    png = _ensure_slide_png(slide_pptx)
-                    if png is None:
-                        available = cli_mod.available_renderers()
-                        reason = (
-                            "no slide renderer available — install "
-                            "LibreOffice, or use PowerPoint on Windows"
-                            if not available
-                            else f"slide rendering failed (tried: {', '.join(available)})"
-                        )
-                        skipped.append({"yaml": rel, "reason": reason})
-                        continue
-                    key = f"{added + 1:02d}"
-                    zf.write(png, f"{key}/slide.png")
-                    asset_yamls = _assets_for_slide(ypath)
-                    assets_map: dict[str, str] = {}
-                    for ap in asset_yamls:
-                        a_data = _safe_read(ap)
-                        a_id = a_data.get("id", "")
-                        if not a_id:
-                            continue
-                        a_bin = _asset_binary(ap)
-                        if a_bin is None or not a_bin.exists() or a_bin.stat().st_size == 0:
-                            # Skip this individual asset but keep the bundle.
-                            continue
-                        ext = a_bin.suffix.lstrip(".") or "bin"
-                        zf.write(a_bin, f"{key}/{a_id}.{ext}")
-                        assets_map[a_id] = str(ap.relative_to(HERE))
-                    manifest["items"][key] = {"slide": rel, "assets": assets_map}
-                    added += 1
+                binary = _asset_binary(ypath)
+                if binary is None:
+                    skipped.append({"yaml": rel, "reason": "asset binary missing"})
+                    continue
+                if not binary.exists() or binary.stat().st_size == 0:
+                    skipped.append({"yaml": rel, "reason": f"asset binary unreadable: {binary.name}"})
+                    continue
+                ext = binary.suffix.lstrip(".") or "png"
+                key = f"{added + 1:02d}"
+                zf.write(binary, f"{key}.{ext}")
+                manifest["items"][key] = rel
+                added += 1
             except OSError as e:
                 skipped.append({"yaml": rel, "reason": f"OS error: {e}"})
             except Exception as e:
                 skipped.append({"yaml": rel, "reason": f"unexpected: {type(e).__name__}: {e}"})
 
-        if kind == "slide_with_assets":
-            slide_prompt = (HERE / "prompts" / "describe_slide.md").read_text(encoding="utf-8")
-            asset_prompt = (HERE / "prompts" / "describe_asset.md").read_text(encoding="utf-8")
-            zf.writestr(
-                "instructions.md",
-                _bulk_instructions_slide_with_assets(
-                    added, slide_prompt, asset_prompt, manifest["items"],
-                ),
-            )
-        else:
-            per_item_prompt = (HERE / "prompts" / f"describe_{kind}.md").read_text(
-                encoding="utf-8"
-            )
-            zf.writestr(
-                "instructions.md",
-                _bulk_instructions(kind, added, per_item_prompt),
-            )
+        per_item_prompt = (HERE / "prompts" / "describe_asset.md").read_text(encoding="utf-8")
+        zf.writestr(
+            "instructions.md",
+            _bulk_instructions("asset", added, per_item_prompt),
+        )
 
     if not manifest["items"]:
         shutil.rmtree(batch_dir, ignore_errors=True)
@@ -794,16 +562,16 @@ def api_batch_create():
     pruned = _prune_old_batches()
     debug_event(
         "info", "batch",
-        f"describe batch {batch_id} created — kind={kind}, "
-        f"{added}/{count} items, {len(skipped)} skipped"
+        f"describe batch {batch_id} created — "
+        f"{added}/{count} assets, {len(skipped)} skipped"
         + (f", pruned {pruned} old" if pruned else ""),
-        batch_id=batch_id, kind=kind, count=added, requested=count,
+        batch_id=batch_id, count=added, requested=count,
         skipped=len(skipped),
     )
 
     return jsonify({
         "batch_id": batch_id,
-        "kind": kind,
+        "kind": "asset",
         "count": added,
         "requested": count,
         "items": manifest["items"],
@@ -881,81 +649,11 @@ def api_batch_apply(batch_id):
         if n is not None and isinstance(v, dict):
             by_int[n] = v
 
-    batch_kind = manifest.get("kind", "asset")
     results = []
     for key, manifest_entry in manifest["items"].items():
         n = _normalize_key_to_int(key)
         entry = by_int.get(n) if n is not None else None
 
-        # slide_with_assets: manifest_entry is a dict {slide, assets},
-        # and entry is expected to mirror that nested shape.
-        if batch_kind == "slide_with_assets" and isinstance(manifest_entry, dict):
-            slide_rel = manifest_entry.get("slide", "")
-            assets_map = manifest_entry.get("assets") or {}
-            if entry is None:
-                results.append({
-                    "id": key, "yaml": slide_rel, "status": "no-match",
-                    "errors": ["LLM response missing this bundle key"],
-                })
-                continue
-            slide_fields = entry.get("slide") if isinstance(entry.get("slide"), dict) else None
-            asset_fields = entry.get("assets") if isinstance(entry.get("assets"), dict) else {}
-
-            # Apply slide half.
-            if slide_fields is None:
-                results.append({
-                    "id": key, "yaml": slide_rel, "status": "no-match",
-                    "errors": ["bundle entry missing 'slide' object"],
-                })
-            else:
-                try:
-                    p = _yaml_for_rel(slide_rel)
-                    errs, status = _save_and_validate(p, slide_fields)
-                    results.append({
-                        "id": key, "yaml": slide_rel, "status": status, "errors": errs,
-                    })
-                except Exception as e:
-                    results.append({
-                        "id": key, "yaml": slide_rel, "status": "error",
-                        "errors": [str(e)],
-                    })
-
-            # Apply each asset half. Skip with a notice if already done —
-            # avoids overwriting a description the user already validated
-            # via the regular asset bulk mode or by hand.
-            for asset_id, asset_rel in assets_map.items():
-                sub_key = f"{key}/{asset_id}"
-                af = asset_fields.get(asset_id) if isinstance(asset_fields, dict) else None
-                if not isinstance(af, dict):
-                    results.append({
-                        "id": sub_key, "yaml": asset_rel, "status": "no-match",
-                        "errors": [f"bundle entry missing assets.{asset_id}"],
-                    })
-                    continue
-                try:
-                    ap = _yaml_for_rel(asset_rel)
-                    existing = _safe_read(ap)
-                    if existing.get("status") == "done":
-                        results.append({
-                            "id": sub_key, "yaml": asset_rel, "status": "skipped",
-                            "errors": [
-                                f"asset {asset_id} already described as 'done'; "
-                                f"keeping existing description, skipping bundle override"
-                            ],
-                        })
-                        continue
-                    errs, status = _save_and_validate(ap, af)
-                    results.append({
-                        "id": sub_key, "yaml": asset_rel, "status": status, "errors": errs,
-                    })
-                except Exception as e:
-                    results.append({
-                        "id": sub_key, "yaml": asset_rel, "status": "error",
-                        "errors": [str(e)],
-                    })
-            continue
-
-        # Flat batch kinds (asset, slide): manifest_entry is a path string.
         rel = manifest_entry if isinstance(manifest_entry, str) else str(manifest_entry)
         if entry is None:
             results.append({
@@ -1024,14 +722,6 @@ def api_batches_list():
 def preview():
     rel = request.args.get("yaml", "")
     p = _yaml_for_rel(rel)
-    if _kind_of(p) == "slide":
-        slide_pptx = p.with_suffix(".pptx")
-        if not slide_pptx.exists():
-            abort(404, "slide pptx missing")
-        png = _ensure_slide_png(slide_pptx)
-        if png is None:
-            abort(503, "qlmanage not available — install or run on macOS")
-        return send_file(png, mimetype="image/png")
     binary = _asset_binary(p)
     if binary is None:
         abort(404, "asset binary missing")
@@ -1496,107 +1186,6 @@ def _flat_prompt_text(skeletons: list[dict], assets: list[dict], brief: str) -> 
     return "\n\n".join(sections) + "\n"
 
 
-def _stage_compose_bundle(staging: Path) -> None:
-    """Stage a minimal reader.py-compatible bundle (full KB) under `staging`.
-
-    Produces the same on-disk layout `cli build` does (sans SKILL.md /
-    brand.md, which compose-run doesn't need): reader.py, index.json,
-    templates/<id>/slide.pptx + meta.yaml, assets/<id>.<ext> + .yaml,
-    decks/<deck>/theme.yaml (so D5 cross-deck remap can resolve themes).
-    """
-    slides, assets = _collect_descriptions()
-    (staging / "reader.py").write_text(
-        (cli_mod.CONSUMER / "reader.py").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    tpl_dir = staging / "templates"
-    for sd in slides:
-        tid = sd["id"]
-        yaml_path: Path = sd["_yaml_path"]
-        slide_pptx = yaml_path.with_suffix(".pptx")
-        if not slide_pptx.exists():
-            continue
-        d = tpl_dir / tid
-        d.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(slide_pptx, d / "slide.pptx")
-        clean = {k: v for k, v in sd.items() if not k.startswith("_")}
-        (d / "meta.yaml").write_text(
-            yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-    ast_dir = staging / "assets"
-    ast_dir.mkdir(parents=True, exist_ok=True)
-    for ad in assets:
-        aid = ad["id"]
-        yaml_path: Path = ad["_yaml_path"]
-        binary = _asset_binary(yaml_path)
-        if binary is None:
-            continue
-        ext = binary.suffix.lstrip(".") or "bin"
-        shutil.copyfile(binary, ast_dir / f"{aid}.{ext}")
-        clean = {k: v for k, v in ad.items() if not k.startswith("_")}
-        (ast_dir / f"{aid}.yaml").write_text(
-            yaml.safe_dump(clean, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-
-    # User-supplied assets from the last bundle generation: copy the
-    # full-res originals into staging/assets/ alongside KB assets so
-    # reader.py resolves them transparently. Write a minimal yaml stub
-    # (kind + subject) — compose-mode needs the sidecar to exist; image
-    # slots don't read it but the file being present is harmless.
-    user_meta = _read_user_meta(USER_BUNDLE_DIR)
-    for aid, entry in user_meta.items():
-        ext = entry.get("ext") or "bin"
-        src = USER_BUNDLE_DIR / f"{aid}.{ext}"
-        if not src.exists():
-            continue
-        # Don't overwrite a KB asset with the same id (extremely unlikely
-        # — would mean SHA1 collision on file content — but be defensive).
-        dst = ast_dir / f"{aid}.{ext}"
-        if dst.exists():
-            continue
-        shutil.copyfile(src, dst)
-        stub = {
-            "id": aid,
-            "kind": entry.get("kind") or "image",
-            "tags": [],
-            "description": f"User-supplied {entry.get('kind') or 'asset'} "
-                           f"({entry.get('filename') or '?'})",
-            "sources": [],
-        }
-        (ast_dir / f"{aid}.yaml").write_text(
-            yaml.safe_dump(stub, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-
-    # index.json — required by reader.py's load_index(). Same payload
-    # build_index() produces during `cli build`, minus the _yaml_path
-    # sidecar that's only meaningful inside the workspace.
-    clean_slides = [{k: v for k, v in s.items() if not k.startswith("_")} for s in slides]
-    clean_assets = [{k: v for k, v in a.items() if not k.startswith("_")} for a in assets]
-    index = cli_mod.build_index(clean_slides, clean_assets)
-    (staging / "index.json").write_text(
-        json_mod.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-
-    # Per-deck theme.yaml — needed for D5 cross-deck colour remap +
-    # v4.1 font remap when an atom is pulled from a foreign deck onto
-    # a host. Only ship themes whose deck still has at least one
-    # described template (mirrors _build_prompt_bundle_zip's logic).
-    decks_in_bundle = {
-        (s.get("sources") or [{}])[0].get("deck", "") for s in clean_slides
-    }
-    decks_in_bundle.discard("")
-    decks_dir = staging / "decks"
-    for theme_yaml in sorted((cli_mod.WORKSPACE / "decks").glob("*/theme.yaml")):
-        if theme_yaml.parent.name not in decks_in_bundle:
-            continue
-        deck_out = decks_dir / theme_yaml.parent.name
-        deck_out.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(theme_yaml, deck_out / "theme.yaml")
-
-
 @app.get("/api/compose/options")
 def api_compose_options():
     return jsonify(_collect_filter_options())
@@ -2041,16 +1630,6 @@ def api_user_assets_preview(asset_id):
 _clear_user_staged_on_startup()
 
 
-def _plan_looks_like_v5(plan: list) -> bool:
-    """A v5 plan entry has `skeleton_id`. v4 entries use `template` or
-    `compose: true`. Detect by the *first* entry that's a dict — keeps
-    detection cheap and consistent across the whole plan."""
-    for entry in plan:
-        if isinstance(entry, dict):
-            return "skeleton_id" in entry
-    return False
-
-
 def _stage_compose_v5_bundle(staging: Path) -> None:
     """Stage a v5 skill bundle under `staging` for compose-v5 to read.
 
@@ -2222,36 +1801,26 @@ def api_compose_run():
     if not isinstance(plan, list) or not plan:
         return jsonify({"error": "plan must be a non-empty JSON array"}), 400
 
-    is_v5 = _plan_looks_like_v5(plan)
-
     with tempfile.TemporaryDirectory(prefix="pptx-compose-") as tmpdir:
         staging = Path(tmpdir) / "bundle"
         staging.mkdir(parents=True, exist_ok=True)
 
-        if is_v5:
-            _stage_compose_v5_bundle(staging)
-            theme_id, theme_reason = _pick_v5_theme(plan, staging)
-            if theme_id is None:
-                return jsonify({"error": f"v5 compose blocked: {theme_reason}"}), 400
-            # Strip the optional "theme" key so reader's plan validator
-            # (which doesn't know about envelope fields) stays happy.
-            cleaned = [{k: v for k, v in e.items() if k != "theme"}
-                       if isinstance(e, dict) else e for e in plan]
-            plan_path = staging / "plan.json"
-            plan_path.write_text(
-                json_mod.dumps(cleaned, ensure_ascii=False), encoding="utf-8",
-            )
-            cmd = [sys.executable, "reader.py", "compose-v5",
-                   "plan.json", "out.pptx", "--theme", theme_id]
-            debug_event("info", "compose",
-                        f"v5 compose: {theme_reason}, {len(plan)} slide(s)")
-        else:
-            _stage_compose_bundle(staging)
-            plan_path = staging / "plan.json"
-            plan_path.write_text(
-                json_mod.dumps(plan, ensure_ascii=False), encoding="utf-8",
-            )
-            cmd = [sys.executable, "reader.py", "compose", "plan.json", "out.pptx"]
+        _stage_compose_v5_bundle(staging)
+        theme_id, theme_reason = _pick_v5_theme(plan, staging)
+        if theme_id is None:
+            return jsonify({"error": f"v5 compose blocked: {theme_reason}"}), 400
+        # Strip the optional "theme" key so reader's plan validator
+        # (which doesn't know about envelope fields) stays happy.
+        cleaned = [{k: v for k, v in e.items() if k != "theme"}
+                   if isinstance(e, dict) else e for e in plan]
+        plan_path = staging / "plan.json"
+        plan_path.write_text(
+            json_mod.dumps(cleaned, ensure_ascii=False), encoding="utf-8",
+        )
+        cmd = [sys.executable, "reader.py", "compose-v5",
+               "plan.json", "out.pptx", "--theme", theme_id]
+        debug_event("info", "compose",
+                    f"v5 compose: {theme_reason}, {len(plan)} slide(s)")
 
         out_path = staging / "out.pptx"
         try:

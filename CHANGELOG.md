@@ -1,6 +1,107 @@
 # Changelog
 
-## Unreleased — slim asset schema + workspace tag vocab
+## Unreleased — v5-only: brief alignment, skeleton bulk review, v4 purge
+
+Two PRs combined: [#9](https://github.com/JakubNaskretski/pptx-skill/pull/9)
+(v5 brief + skeleton multi-select) and
+[#10](https://github.com/JakubNaskretski/pptx-skill/pull/10) (v4
+deletion). Net result: the entire system is v5-native; v4 commands,
+v4 SKILL.md, v4 helpers, v4 slide YAMLs, and v4 compose-run paths
+are gone.
+
+### Why
+
+After the slim-asset and structural-skeleton work landed, the v4
+slide path (`decks/<deck>/slides/slide_NN.yaml` + the v4
+`templates`/`assets` index shape) became a parallel dead universe.
+The `/compose` brief page was still emitting that v4 catalog — so
+the agent never saw any skeletons even though the user reviewed +
+approved them via `/v5`. PR #9 closes that gap; PR #10 cleans up
+what's left behind.
+
+### `/compose` brief is now v5-native (PR #9)
+
+- **`/api/compose/bundle`** and **`/api/compose/text`** ship the v5
+  layout: `SKILL_v5.md` as `SKILL.md`, `reader.py`,
+  `skeletons/<id>/{skeleton.yaml,preview.png,background.png}`,
+  `themes/<id>/{theme.yaml,master.pptx,preview.png}` (trimmed to
+  decks-in-bundle), `assets/<id>.{yaml,bin}`, `tag_vocab.yaml`, plus
+  `brand.md` / `brief.md` / user-attached low-res previews. The
+  `index.json` is `{version: 5, themes, skeletons, assets, tag_vocab}`.
+- **`brief.md` slimmed** — the long v4 four-pass preamble + helper
+  docs + slot-polymorphism notes were dropped; `SKILL_v5.md` is now
+  the canonical contract.
+- **Compose page filter UI** renames `Templates` → `Skeletons`;
+  filter dimensions become skeleton `categories` and asset `kind` /
+  `tags`. `KB summary` and match-count text updated.
+- **Same workspace** drives both review (`/v5`) and brief (`/compose`).
+  Skeletons approved in `/v5` are immediately picked up by the brief
+  unless their status flips to `rejected`.
+
+### `/v5` skeleton review (PR #9)
+
+- **Multi-select** — every sidebar item gets a checkbox. Selecting
+  any reveals a sticky bulk-action bar (Mark done / Reject / Clear).
+  ≥5 selected prompts a confirm.
+- **Auto-advance** — after a single Mark-done or Reject (or
+  overlap-Reject) the panel jumps to the next pending skeleton in
+  list order. Corrective actions (Back-to-pending, Restore) stay put
+  so the user can keep editing.
+- Selection state survives sidebar reloads; stale ids are pruned.
+
+### v4 deletion (PR #10)
+
+Net: 14 files, +96 / -2,730 lines. Nothing left calls any of these.
+
+- **`cli.py`** — removed `build` command, `build_index`,
+  `_template_index_entry`, `_asset_index_entry`, `iter_slide_yamls`
+  + every caller, `validate_slide` + `SLIDE_*` enums, `infer_layout`,
+  `write_slide_yaml_stub`. `cli next` / `prompt` / `status` no longer
+  take `--kind`.
+- **`_ingest_pptx`** stops writing `decks/<deck>/slides/slide_NN.yaml`
+  and the v4 `decks/<deck>/theme.yaml`. Per-slide `.pptx` fragments
+  are still written — the preview renderer still needs them.
+- **`app.py`** — removed `_stage_compose_bundle`,
+  `_plan_looks_like_v5`, the else-branch of `/api/compose/run`,
+  `_bulk_instructions_slide_with_assets`, `_assets_for_slide`,
+  `_ensure_slide_png`, slide branches in `/api/batch/create` and
+  `/api/batch/apply`, `/preview` slide branch, `SLIDE_DESCRIPTIVE`.
+- **`schemas/vocab.yaml`** — dropped the `slide:` block.
+- **`prompts/describe_slide.md`** — deleted.
+- **`consumer/SKILL.md`** + **`consumer/helpers/`** — deleted.
+  `SKILL_v5.md` is the canonical contract.
+- **`consumer/reader.py`** — removed `cmd_list` / `cmd_get` /
+  `cmd_compose` + argparse wiring. v4 path helpers
+  (`template_dir`, `asset_path`, `asset_meta_path`, `parse_filter`,
+  `matches_filter`) and the v4 compose engine internals (`_fill_slot`
+  family, compose-mode shape placer) are still in the file but
+  unreferenced from the CLI — a deeper consumer-side cleanup is a
+  separate workstream.
+
+### Migration from pre-#9 workspace
+
+If you've been using the local app pre-#9, nothing on disk needs to
+change. The first compose bundle you generate after pulling will be
+v5-shaped automatically. If you're using the `cli build` zip in
+production: it's gone — switch to `cli build-v5` which produces
+`dist/skill-v5.zip` with the v5 contract.
+
+Stale `decks/<deck>/slides/*.yaml` files left over from old ingests
+sit on disk but are no longer read by anything. Safe to `rm -rf`;
+no auto-purge tool ships in this PR.
+
+### Known gap
+
+Two of the four decks in the test workspace
+(`standard_templates`, `title_and_breaks`) don't have
+`workspace/themes/<deck>/theme.yaml` registered. The brief bundle
+correctly trims themes to decks-in-bundle, but if the agent picks a
+skeleton from one of those decks, compose-run will fail. Workaround:
+re-ingest those decks, or restrict the brief filter to decks with
+themes. A proper "missing-theme" warning surface is on the TODO
+list.
+
+## Earlier unreleased — slim asset schema + workspace tag vocab
 
 ### Why
 
