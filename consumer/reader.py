@@ -1557,24 +1557,40 @@ def _v5_load_yaml(path: Path) -> dict | None:
 
 
 def _v5_iter_skeletons() -> list[dict]:
+    """Walk every skeleton in the bundle. Supports both layouts:
+      flat:   skeletons/<id>.yaml         (brief bundle — text only)
+      nested: skeletons/<id>/skeleton.yaml (offline build-v5 bundle — has
+                                            siblings like preview.png)
+    """
     root = _v5_skeletons_dir()
     if not root.exists():
         return []
     out: list[dict] = []
-    for d in sorted(root.iterdir()):
-        if not d.is_dir():
+    for entry in sorted(root.iterdir()):
+        if entry.is_file() and entry.suffix == ".yaml":
+            sk = _v5_load_yaml(entry)
+        elif entry.is_dir():
+            sk = _v5_load_yaml(entry / "skeleton.yaml")
+        else:
             continue
-        sk = _v5_load_yaml(d / "skeleton.yaml")
         if sk:
             out.append(sk)
     return out
 
 
 def _v5_load_skeleton(skeleton_id: str) -> dict | None:
+    # Flat layout (brief bundle) first; nested fallback (offline build-v5).
+    flat = _v5_skeletons_dir() / f"{skeleton_id}.yaml"
+    if flat.exists():
+        return _v5_load_yaml(flat)
     return _v5_load_yaml(_v5_skeletons_dir() / skeleton_id / "skeleton.yaml")
 
 
 def _v5_load_theme(theme_id: str) -> dict | None:
+    # Flat layout (brief bundle) first; nested fallback (offline build-v5).
+    flat = _v5_themes_dir() / f"{theme_id}.yaml"
+    if flat.exists():
+        return _v5_load_yaml(flat)
     return _v5_load_yaml(_v5_themes_dir() / theme_id / "theme.yaml")
 
 
