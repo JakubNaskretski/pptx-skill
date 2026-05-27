@@ -44,7 +44,15 @@ consumer builds the deck on the chosen host theme.
    Returns `{ok, errors, warnings}`. Hard errors block the build.
    `overflow:shrink` violations land as warnings, not errors.
 
-5. **Build the deck**
+5. **Hand off (or build, if you have the binaries)**
+
+   In the typical authoring brief flow your job ends here: emit the
+   validated `plan.json` and stop. The user runs compose-v5 in the
+   local app where the asset binaries live.
+
+   If you're working from a full `skill-v5.zip` (binaries present —
+   see "What's in the bundle" below), you can also build the deck
+   yourself:
    ```bash
    python reader.py compose-v5 plan.json out.pptx --theme <theme_id>
    ```
@@ -189,21 +197,51 @@ slide that's also opening-shaped is `[opening, closing]`).
 
 ## What's in the bundle
 
+Two delivery modes — same SKILL.md, different file inventory:
+
+**A) Authoring brief bundle** (the one most users ship). Text-only.
+Typical size: ~100 KB. Built by the local /compose web app.
+
 ```
 SKILL.md                        you are reading this
-reader.py                       the consumer; ~2000 LOC; pure stdlib + python-pptx + yaml
-requirements.txt                python-pptx, pyyaml
+reader.py                       used for read-only queries (find-asset,
+                                check-asset-fit, match-skeletons,
+                                validate-plan, list-themes, list-skeletons)
+tag_vocab.yaml                  closed tag list for assets
 index.json                      summaries of every theme/skeleton/asset
-themes/<id>/
-  theme.yaml                    palette, fonts, decorations, master_pptx ref
-  master.pptx                   host master for compose-v5 to build on
-  preview.png                   blank-layout thumbnail (optional)
-skeletons/<id>/
-  skeleton.yaml                 slots, geometry, style, constraints, categories
-  preview.png                   source-slide thumbnail (optional)
-  background.png                frozen underlay (optional; freeze-as-background skeletons)
-assets/<id>.<ext>               raster / SVG / XML asset binaries
-assets/<id>.yaml                asset descriptions (kind, tags, description, dimensions)
+brand.md                        (optional) per-org style constraints
+brief.md                        the user's request
+themes/<id>/theme.yaml          palette + fonts
+skeletons/<id>/skeleton.yaml    slots, geometry, style, constraints, categories
+assets/<id>.yaml                asset descriptions (kind, tags, description,
+                                width, height, aspect, colors_hex)
+user_assets/<id>.<ext>          (optional) low-res previews of images the
+                                user attached to THIS request
+user_assets/manifest.json       (optional) original dimensions + filenames
 ```
+
+In this mode your job ends at producing the plan — the user runs
+compose-v5 locally where the full-res asset binaries live. **Do
+NOT try to run compose-v5 yourself; the binaries aren't present.**
+
+**B) Static skill-v5.zip** (built via `cli build-v5`). Self-contained.
+
+```
+... everything from (A), plus:
+themes/<id>/master.pptx         host master for compose-v5
+themes/<id>/preview.png         optional
+skeletons/<id>/preview.png      optional source-slide thumbnail
+skeletons/<id>/background.png   optional frozen underlay
+assets/<id>.<ext>               actual raster / SVG / XML binaries
+```
+
+In this mode you can additionally run:
+```bash
+python reader.py compose-v5 plan.json out.pptx --theme <theme_id>
+```
+
+How to tell which mode you're in: check whether `assets/<id>.<ext>`
+binaries exist (a quick `ls assets/` shows `.yaml` files always; the
+sibling binaries are present only in mode B).
 
 No network. No state. No vision required at compose time.
