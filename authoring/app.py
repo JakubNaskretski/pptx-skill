@@ -888,15 +888,16 @@ def _format_user_assets_section(user_meta: dict) -> str:
         "The user attached the following assets to THIS request. They "
         "are the primary intent and SHOULD be used in the deck wherever "
         "they fit. Each file lives at `user_assets/<id>.<ext>` in this "
-        "bundle as a LOW-RES preview; the user's machine holds the "
-        "original at full resolution and will splice the original in at "
-        "compose time. The dimensions below are the originals'.",
+        "bundle as a LOW-RES preview (KB asset binaries are NOT shipped "
+        "— only these user-supplied ones, because they have no written "
+        "description for you to pick from). The user's machine holds "
+        "the full-res original and will splice it in at compose time. "
+        "The dimensions below are the originals'.",
         "",
-        "Reference them in the plan exactly the same way you reference "
-        "any catalog asset — `\"<slot>\": \"<id>\"` for image slots, or "
-        "`{\"atom\": \"<id>\", ...}` inside a compose-mode shape. The id "
-        "format matches catalog assets on purpose so the compose "
-        "pipeline resolves them transparently.",
+        "Reference them in a v5 plan the same way you reference any "
+        "catalog asset — `\"<slot>\": \"<asset_id>\"` for image slots in "
+        "a skeleton. The id format matches catalog assets on purpose so "
+        "the compose pipeline resolves them transparently.",
         "",
     ]
     for aid, entry in sorted(user_meta.items()):
@@ -918,23 +919,25 @@ def _format_user_assets_section(user_meta: dict) -> str:
         "",
         "- The user expects these assets to appear in the output. Treat "
         "them as a stronger signal than KB catalog matches.",
-        "- If a user asset fits a slot, use it — even if a KB asset "
-        "would score better on `feel` / `colors`. The user's intent "
-        "trumps the descriptive index here.",
-        "- If a user asset CANNOT fit any slot in your plan (wrong "
-        "aspect, no semantic match, etc.), prefer in this order:",
-        "  1. Pick a different template whose layout exposes a slot "
-        "this asset fits.",
-        "  2. Use compose-mode (free-form atoms) to place the user "
-        "asset alongside other shapes you control.",
-        "  3. Fall back to a similar KB catalog asset and explicitly "
-        "explain in the brief response that the user asset didn't fit.",
-        "  4. Last resort: omit the user asset, but flag it.",
+        "- If a user asset fits an image slot on a skeleton, use it — "
+        "even if a KB asset would tag-match better. User intent trumps "
+        "the descriptive index here.",
+        "- If a user asset CANNOT fit any image slot in your plan "
+        "(wrong aspect, no semantic match, etc.), prefer in this order:",
+        "  1. Pick a different skeleton whose slot inventory exposes a "
+        "slot this asset fits (use `reader.py match-skeletons` to find "
+        "candidates).",
+        "  2. Fall back to a similar KB catalog asset (found via "
+        "`reader.py find-asset`) and explicitly explain in your "
+        "response that the user asset didn't fit.",
+        "  3. Last resort: omit the user asset, but flag it.",
         "- The previews are LOW-RES (max 800px long side, possibly "
         "re-encoded). Judge subject / composition / colors from them, "
         "but don't reason about pixel-level detail.",
-        "- These assets do NOT carry descriptions. You see the file "
-        "itself plus the brief — combine the two to infer intent.",
+        "- These user assets do NOT carry written descriptions (kind / "
+        "tags / description). You see the preview itself plus the "
+        "brief — combine the two to infer intent. KB assets are the "
+        "opposite: descriptions only, no images.",
         "",
     ]
     return "\n".join(lines)
